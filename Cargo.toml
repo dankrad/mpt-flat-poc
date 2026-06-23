@@ -1,0 +1,19 @@
+[package]
+name = "mpt-flat-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+sha3 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "insert"
+harness = false
