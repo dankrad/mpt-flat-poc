@@ -32,7 +32,7 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
    store: FlatFile  ──────────────────────  values: rocksdb::DB
    ┌──────────────────────────────┐         ┌──────────────────────┐
    │ flat file of DiskSubtree      │         │  key → value bytes    │
-   │ records  [len][bincode(...)]  │         │  (the trie only ever  │
+   │ records  [len][compact bytes] │         │  (the trie only ever  │
    │ + FreeList (reuse of holes)   │         │   stores value_hash)  │
    └──────────────────────────────┘         └──────────────────────┘
 ```
@@ -51,8 +51,10 @@ represented by a single `RamChild::Disk` pointer. `ram_nodes()` reports the
 current frontier size, and several tests assert it stays bounded.
 
 ### 2. The flat file (`FlatFile` / `store`)
-Disk subtrees are bincode-serialized `DiskSubtree` records appended to one flat
-file as `[len: u32][payload]`. A `DiskPtr { offset, len }` addresses a record.
+Disk subtrees are compact-encoded `DiskSubtree` records appended to one flat file
+as `[len: u32][payload]`. A `DiskPtr { offset, len }` addresses a record. The
+payload keeps the subtree's cached Merkle hashes, but avoids bincode's enum,
+`Vec`, `Option`, and `Box` overhead for the hot disk records.
 
 Crucially, the file is **not** purely append-only: a `FreeList` tracks regions
 vacated by rewritten/split subtrees. New writes prefer a best-fit free region
@@ -86,7 +88,8 @@ writable trie (cached hashes and all). `create()` remains the from-scratch path
 
 `FlatMpt::insert(key, value)`:
 
-1. `value_hash = hash_leaf_value(value)`, then `values.put(key, value)` into RocksDB.
+1. `value_hash = hash_leaf_value(value)`, then buffer `key -> value` in the RAM
+   overlay (flushed to RocksDB in `WriteBatch` chunks).
 2. `insert_ram` walks/mutates the RAM frontier down to the relevant branch slot:
    - **Empty slot** → create a single-entry `DiskSubtree`, write it, install a `RamChild::Disk`.
    - **`RamChild::Disk`** → read the subtree, **incrementally insert** the new
@@ -127,6 +130,7 @@ genuinely new (≈ path length), not a count that scales with subtree size. The
 | [`examples/hashcount.rs`](examples/hashcount.rs) | Diagnostic: prints keccak calls per individual insert, showing how hashing scales. `cargo run --release --example hashcount --features profiling`. |
 | [`examples/hashaudit.rs`](examples/hashaudit.rs) | Diagnostic: classifies each keccak call of an insert as essential / recomputed-unchanged / duplicate, to prove hashing is minimal. `cargo run --release --example hashaudit --features profiling`. |
 | [`examples/diskusage.rs`](examples/diskusage.rs) | Diagnostic: reports the flat-file index footprint (bytes/entry) for N inserts. `cargo run --release --example diskusage [N]`. |
+| [`examples/sizecheck.rs`](examples/sizecheck.rs) | Diagnostic: reports flat-file length/free bytes/RAM nodes for the three benchmark key distributions. `cargo run --release --example sizecheck`. |
 | [`Cargo.toml`](Cargo.toml) | Dependencies and the `profiling` feature flag. |
 
 ### `src/lib.rs` component map
@@ -153,15 +157,16 @@ Public API and types:
 Internal storage:
 - **`FreeList`** — coalescing, best-fit allocator over freed flat-file regions.
 - **`FlatFile`** — the flat file plus its `FreeList` and high-water `end`;
-  `write` / `read` / `free` / `flush` / `sync` of `DiskSubtree` records.
+  `write_payload` / `read` / `free` / `flush` / `sync` of `DiskSubtree` records.
 - **`Manifest` / `ManifestRef`** — the serialized checkpoint (`cfg` + `upper` +
   `free` + `end`) read/written by `open` / `persist` via the `.meta` sidecar.
 
 Internal trie:
 - **`Node`** (`Empty` / `Leaf` / `Extension` / `Branch`) — a disk subtree's
   Merkle structure; each non-trivial variant caches its `hash`. Serialized.
-- **`DiskSubtree`** — `{ prefix, node, entries }`: the node plus a flat list of
-  `(Key, value_hash)` entries (kept for cheap splits and membership checks).
+- **`DiskSubtree`** — `{ prefix, node }`: the compact-encoded node plus the
+  nibble prefix it is rooted at. Splits derive `(Key, value_hash)` entries from
+  the node on demand.
 - **`RamChild`** — `Ram(Box<RamNode>)` or `Disk { ptr, root, bytes }`.
 - **`RamNode`** (`Empty` / `Extension` / `Branch`) — RAM frontier nodes with a
   `Cell`-cached hash.
@@ -202,9 +207,9 @@ the hot path carries no measurement overhead.
   is no write-ahead log for the trie index.
 - **Per-insert `flush()` is not an `fsync`** (only `persist()` fsyncs the flat
   file). Crash durability between checkpoints is not provided.
-- **Write amplification.** Each insert into a disk leaf re-serializes and
-  rewrites the whole subtree record; serialization is now the dominant per-insert
-  cost (see the `profile` bench).
+- **Write amplification.** Each insert into a disk leaf rewrites the whole compact
+  subtree record. The compact format keeps this cheaper than bincode, but the
+  single-record rewrite remains the central cost of the design.
 - **Splits rebuild.** An overflowing leaf is rebuilt from its entries (its hashes
   recomputed) — incremental hashing covers ordinary inserts, not splits.
 - **PoC value model.** Keys must be 32 bytes; values are duplicated between the

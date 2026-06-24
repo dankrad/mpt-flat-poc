@@ -13,6 +13,8 @@ use std::{
 /// Number of buffered values before the overlay is flushed to RocksDB as one
 /// `WriteBatch`, amortizing per-`put` overhead.
 const VALUE_BATCH: usize = 256;
+const SUBTREE_MAGIC: &[u8; 4] = b"FMPC";
+const SUBTREE_VERSION: u8 = 1;
 
 pub type Hash = [u8; 32];
 pub type Key = [u8; 32];
@@ -31,8 +33,8 @@ pub mod prof {
     /// Human-readable labels, indexed by `Cat as usize`.
     pub const CATS: [&str; 8] = [
         "keccak (hashing)",
-        "bincode serialize",
-        "bincode deserialize",
+        "subtree serialize",
+        "subtree deserialize",
         "flat-file read (syscall)",
         "flat-file write (syscall)",
         "flat-file flush",
@@ -262,7 +264,7 @@ impl FreeList {
     }
 }
 
-/// Append-mostly flat file of serialized [`DiskSubtree`] records, with a
+/// Append-mostly flat file of compact-serialized [`DiskSubtree`] records, with a
 /// [`FreeList`] so that space freed by rewrites can be reused.
 #[derive(Debug)]
 struct FlatFile {
@@ -281,7 +283,7 @@ impl FlatFile {
         }
     }
 
-    /// Store an already-serialized subtree payload, preferring a reclaimed free
+    /// Store an already-encoded subtree payload, preferring a reclaimed free
     /// region over extending the file. Record layout is `[len: u32 LE][payload]`.
     /// Callers serialize once (via [`serialize_subtree`]) and reuse the size for
     /// their rewrite-vs-split decision, so the blob is never serialized twice.
@@ -318,7 +320,7 @@ impl FlatFile {
             payload
         };
         let _g = prof::scope(prof::Cat::Deserialize);
-        Ok(bincode::deserialize(&payload)?)
+        deserialize_subtree(&payload)
     }
 
     fn free(&mut self, ptr: DiskPtr) {
@@ -422,6 +424,30 @@ enum RamNode {
 impl Default for RamNode {
     fn default() -> Self {
         Self::Empty
+    }
+}
+
+/// Breakdown of the in-RAM index footprint (see [`FlatMpt::ram_report`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RamReport {
+    /// Branch/Extension nodes in the trie frontier.
+    pub frontier_nodes: usize,
+    /// Heap bytes for those frontier nodes (accurate: allocation size + paths).
+    pub frontier_bytes: usize,
+    /// Free regions tracked by the flat-file allocator.
+    pub free_regions: usize,
+    /// Stored-data bytes for the free list (excludes BTree container overhead).
+    pub free_list_bytes: usize,
+    /// Values buffered but not yet flushed to RocksDB.
+    pub overlay_entries: usize,
+    /// Heap bytes held by the value overlay (keys + value buffers).
+    pub overlay_bytes: usize,
+}
+
+impl RamReport {
+    /// Estimated total in-RAM index bytes.
+    pub fn total_bytes(&self) -> usize {
+        self.frontier_bytes + self.free_list_bytes + self.overlay_bytes
     }
 }
 
@@ -620,6 +646,33 @@ impl FlatMpt {
     /// Number of distinct free regions tracked in the flat file.
     pub fn free_regions(&self) -> usize {
         self.store.free.region_count()
+    }
+
+    /// Heap held by the in-RAM index — the part of the database that is *not*
+    /// on disk: the trie frontier, the free list, and the unflushed value
+    /// overlay. Excludes the OS page cache and RocksDB's own (C++) memory.
+    pub fn ram_report(&self) -> RamReport {
+        let frontier_nodes = count_ram_nodes(&self.upper);
+        let frontier_bytes = frontier_bytes(&self.upper);
+        let free_regions = self.store.free.region_count();
+        // by_offset (u64->u32) and by_size ((u32,u64)) both hold one entry per
+        // region; this is the stored-data size and omits BTree node overhead.
+        let free_list_bytes = free_regions
+            * (std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<(u32, u64)>());
+        let overlay_entries = self.overlay.len();
+        let overlay_bytes: usize = self
+            .overlay
+            .iter()
+            .map(|(k, v)| k.len() + v.capacity())
+            .sum();
+        RamReport {
+            frontier_nodes,
+            frontier_bytes,
+            free_regions,
+            free_list_bytes,
+            overlay_entries,
+            overlay_bytes,
+        }
     }
 
     pub fn disk_accesses_for_key(&mut self, key: &Key) -> Result<usize> {
@@ -1058,11 +1111,194 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
 /// rewrite-vs-split and pass the same payload to [`FlatFile::write_payload`].
 fn serialize_subtree(subtree: &DiskSubtree) -> Result<(Vec<u8>, usize)> {
     let _g = prof::scope(prof::Cat::Serialize);
-    let payload = bincode::serialize(subtree)?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(SUBTREE_MAGIC);
+    payload.push(SUBTREE_VERSION);
+    write_nibble_path(&mut payload, &subtree.prefix)?;
+    write_node(&mut payload, &subtree.node)?;
     let total = payload.len() + 4;
     Ok((payload, total))
 }
 
+fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
+    if payload.get(..SUBTREE_MAGIC.len()) != Some(SUBTREE_MAGIC.as_slice()) {
+        // Backward compatibility for databases written before the compact
+        // subtree format was introduced.
+        return Ok(bincode::deserialize(payload)?);
+    }
+
+    let mut reader = CompactReader::new(payload);
+    let magic = reader.read_bytes(SUBTREE_MAGIC.len())?;
+    if magic != SUBTREE_MAGIC {
+        bail!("invalid compact subtree magic");
+    }
+    let version = reader.read_u8()?;
+    if version != SUBTREE_VERSION {
+        bail!("unsupported compact subtree version {version}");
+    }
+    let prefix = reader.read_nibble_path()?;
+    let node = reader.read_node()?;
+    if !reader.is_finished() {
+        bail!("trailing bytes in compact subtree record");
+    }
+    Ok(DiskSubtree { prefix, node })
+}
+
+fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
+    match node {
+        Node::Empty => out.push(0),
+        Node::Leaf {
+            key,
+            value_hash,
+            hash,
+        } => {
+            out.push(1);
+            out.extend_from_slice(key);
+            out.extend_from_slice(value_hash);
+            out.extend_from_slice(hash);
+        }
+        Node::Extension { path, child, hash } => {
+            out.push(2);
+            write_nibble_path(out, path)?;
+            out.extend_from_slice(hash);
+            write_node(out, child)?;
+        }
+        Node::Branch {
+            children,
+            value,
+            hash,
+        } => {
+            debug_assert!(value.is_none(), "disk branches never carry values");
+            out.push(3);
+            let mut bitmap = 0u16;
+            for (idx, child) in children.iter().enumerate() {
+                if child.is_some() {
+                    bitmap |= 1 << idx;
+                }
+            }
+            out.extend_from_slice(&bitmap.to_le_bytes());
+            out.extend_from_slice(hash);
+            for child in children.iter().flatten() {
+                write_node(out, child)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_nibble_path(out: &mut Vec<u8>, path: &[u8]) -> Result<()> {
+    if path.len() > u8::MAX as usize {
+        bail!("nibble path too long");
+    }
+    if path.iter().any(|&nibble| nibble > 0x0f) {
+        bail!("invalid nibble path");
+    }
+    out.push(path.len() as u8);
+    for pair in path.chunks(2) {
+        let high = pair[0] << 4;
+        let low = pair.get(1).copied().unwrap_or(0);
+        out.push(high | low);
+    }
+    Ok(())
+}
+
+struct CompactReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CompactReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("compact subtree offset overflow"))?;
+        if end > self.bytes.len() {
+            bail!("truncated compact subtree record");
+        }
+        let bytes = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        let bytes = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_hash(&mut self) -> Result<Hash> {
+        let bytes = self.read_bytes(32)?;
+        let mut hash = [0; 32];
+        hash.copy_from_slice(bytes);
+        Ok(hash)
+    }
+
+    fn read_nibble_path(&mut self) -> Result<Vec<u8>> {
+        let len = self.read_u8()? as usize;
+        if len > 64 {
+            bail!("compact subtree nibble path too long");
+        }
+        let mut path = Vec::with_capacity(len);
+        for _ in 0..len.div_ceil(2) {
+            let byte = self.read_u8()?;
+            path.push(byte >> 4);
+            if path.len() < len {
+                path.push(byte & 0x0f);
+            }
+        }
+        Ok(path)
+    }
+
+    fn read_node(&mut self) -> Result<Node> {
+        match self.read_u8()? {
+            0 => Ok(Node::Empty),
+            1 => {
+                let key = self.read_hash()?;
+                let value_hash = self.read_hash()?;
+                let hash = self.read_hash()?;
+                Ok(Node::Leaf {
+                    key,
+                    value_hash,
+                    hash,
+                })
+            }
+            2 => {
+                let path = self.read_nibble_path()?;
+                let hash = self.read_hash()?;
+                let child = Box::new(self.read_node()?);
+                Ok(Node::Extension { path, child, hash })
+            }
+            3 => {
+                let bitmap = self.read_u16()?;
+                let hash = self.read_hash()?;
+                let mut children = empty_box_children();
+                for (idx, slot) in children.iter_mut().enumerate() {
+                    if bitmap & (1 << idx) != 0 {
+                        *slot = Some(Box::new(self.read_node()?));
+                    }
+                }
+                Ok(Node::Branch {
+                    children,
+                    value: None,
+                    hash,
+                })
+            }
+            tag => bail!("invalid compact subtree node tag {tag}"),
+        }
+    }
+}
 
 fn group_by_next_nibble(entries: &[(Key, Hash)], depth: usize) -> [Vec<(Key, Hash)>; 16] {
     let mut groups: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
@@ -1227,6 +1463,29 @@ fn count_ram_nodes(node: &RamNode) -> usize {
                 .sum::<usize>()
         }
     }
+}
+
+/// Heap bytes of the frontier rooted at `node`. Each node occupies
+/// `size_of::<RamNode>()` (the enum is sized to its largest variant, so this is
+/// the real allocation size of every boxed node); `Disk` children are inline in
+/// their parent branch's array, so only `Ram` children add a recursive cost.
+fn frontier_bytes(node: &RamNode) -> usize {
+    let mut total = std::mem::size_of::<RamNode>();
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { path, child, .. } => {
+            total += path.capacity();
+            total += frontier_bytes(child);
+        }
+        RamNode::Branch { children, .. } => {
+            for child in children.iter().flatten() {
+                if let RamChild::Ram(node) = child {
+                    total += frontier_bytes(node);
+                }
+            }
+        }
+    }
+    total
 }
 
 pub fn hashed_key(input: impl AsRef<[u8]>) -> Key {

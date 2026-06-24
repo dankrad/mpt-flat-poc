@@ -10,11 +10,52 @@
 
 use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, prof};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 const SAMPLE: usize = 1000;
 const ROUNDS: usize = 20;
+
+/// Global allocator that tracks live Rust-heap bytes, so we can read the true
+/// in-RAM footprint of the database (RocksDB's own C++ memory is not counted).
+struct Counting;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            LIVE.fetch_add(new_size, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+fn live_heap() -> usize {
+    LIVE.load(Ordering::Relaxed)
+}
+
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / 1_048_576.0
+}
 
 fn key_at(i: u64) -> Key {
     hashed_key(i.to_le_bytes())
@@ -73,24 +114,66 @@ fn main() {
     let mut db = FlatMpt::create(tmp.path(), cfg).unwrap();
 
     // ---- preload ----
+    // Log running stats every PROGRESS_EVERY keys so a long (1B-key) run can be
+    // tracked live: per-chunk insert rate, on-disk size, fragmentation, and the
+    // in-RAM index footprint.
+    const PROGRESS_EVERY: u64 = 10_000_000;
+    let heap_before = live_heap();
     let t = Instant::now();
+    let mut chunk_start = Instant::now();
     for i in 0..preload {
         db.insert(key_at(i), vec![0u8; 32]).unwrap();
+        let done = i + 1;
+        if done % PROGRESS_EVERY == 0 && done < preload {
+            let chunk = chunk_start.elapsed();
+            let live = live_heap().saturating_sub(heap_before);
+            println!(
+                "  [{:>4}M] {:>6.0}s | last {}M @ {:.2} µs/key | flat {:.1} GiB | free_regions {} | RAM {:.1} MiB",
+                done / 1_000_000,
+                t.elapsed().as_secs_f64(),
+                PROGRESS_EVERY / 1_000_000,
+                chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
+                db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                db.free_regions(),
+                mib(live),
+            );
+            std::io::stdout().flush().ok();
+            chunk_start = Instant::now();
+        }
     }
     db.flush().unwrap();
     let elapsed = t.elapsed();
+    let heap_after = live_heap();
+
     println!(
         "preloaded {preload} keys in {:.2}s  ({:.2} µs/key)",
         elapsed.as_secs_f64(),
         us_per(elapsed, preload as usize),
     );
     println!(
-        "  flat file: {:.1} MiB,  ram_nodes: {},  free_regions: {},  free: {:.1} MiB\n",
+        "  flat file: {:.1} MiB,  free_regions: {},  free: {:.1} MiB",
         db.flat_file_len() as f64 / 1_048_576.0,
-        db.ram_nodes(),
         db.free_regions(),
         db.free_bytes() as f64 / 1_048_576.0,
     );
+
+    // In-RAM index footprint: ground truth (live heap delta) + structural breakdown.
+    let r = db.ram_report();
+    let live = heap_after.saturating_sub(heap_before);
+    println!(
+        "  in-RAM index (live heap): {:.1} MiB total  ({:.1} B/key)",
+        mib(live),
+        live as f64 / preload as f64,
+    );
+    println!(
+        "    frontier: {:.1} MiB ({} nodes),  free list: ~{:.1} MiB ({} regions),  overlay: {:.1} MiB",
+        mib(r.frontier_bytes),
+        r.frontier_nodes,
+        mib(r.free_list_bytes),
+        r.free_regions,
+        mib(r.overlay_bytes),
+    );
+    println!();
 
     // ---- phase 1: brand-new inserts ----
     let mut next_new = preload;
