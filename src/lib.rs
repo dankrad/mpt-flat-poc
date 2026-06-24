@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -182,27 +182,41 @@ pub struct DiskPtr {
 /// holes left by rewritten/split subtrees instead of always extending the file.
 ///
 /// Regions are kept non-overlapping and coalesced (adjacent free regions are
-/// merged on `free`), and allocation is best-fit to limit fragmentation.
+/// merged on `free`). Two indexes are maintained in lock-step: `by_offset` for
+/// coalescing with neighbours, and `by_size` (keyed by `(len, offset)`) so that
+/// best-fit allocation is O(log n) rather than a linear scan — this matters a
+/// lot once fragmentation grows the list to tens of thousands of regions.
+///
+/// Only `by_offset` is serialized; `by_size` is rebuilt via [`reindex`] on load.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct FreeList {
     /// offset -> length of each free region.
-    regions: BTreeMap<u64, u32>,
+    by_offset: BTreeMap<u64, u32>,
+    /// (length, offset) of each free region, for size-ordered best-fit lookup.
+    #[serde(skip)]
+    by_size: BTreeSet<(u32, u64)>,
 }
 
 impl FreeList {
+    fn insert_region(&mut self, offset: u64, len: u32) {
+        self.by_offset.insert(offset, len);
+        self.by_size.insert((len, offset));
+    }
+
+    fn remove_region(&mut self, offset: u64, len: u32) {
+        self.by_offset.remove(&offset);
+        self.by_size.remove(&(len, offset));
+    }
+
     /// Reserve `need` bytes from a free region if one is large enough.
     /// Returns the offset of the allocation, leaving any remainder free.
     fn alloc(&mut self, need: u32) -> Option<u64> {
-        // Best fit: smallest region that still satisfies the request.
-        let (&offset, &len) = self
-            .regions
-            .iter()
-            .filter(|(_, len)| **len >= need)
-            .min_by_key(|(_, len)| **len)?;
-        self.regions.remove(&offset);
+        // Best fit: smallest region with len >= need, in O(log n).
+        let (len, offset) = self.by_size.range((need, 0)..).next().copied()?;
+        self.remove_region(offset, len);
         let remainder = len - need;
         if remainder > 0 {
-            self.regions.insert(offset + need as u64, remainder);
+            self.insert_region(offset + need as u64, remainder);
         }
         Some(offset)
     }
@@ -213,24 +227,38 @@ impl FreeList {
         let mut size = len as u64;
 
         // Merge with the region immediately preceding this one.
-        if let Some((&prev_off, &prev_len)) = self.regions.range(..start).next_back() {
+        let pred = self
+            .by_offset
+            .range(..start)
+            .next_back()
+            .map(|(&off, &len)| (off, len));
+        if let Some((prev_off, prev_len)) = pred {
             if prev_off + prev_len as u64 == start {
                 start = prev_off;
                 size += prev_len as u64;
-                self.regions.remove(&prev_off);
+                self.remove_region(prev_off, prev_len);
             }
         }
         // Merge with the region immediately following this one.
-        if let Some(&next_len) = self.regions.get(&(start + size)) {
-            self.regions.remove(&(start + size));
+        if let Some(next_len) = self.by_offset.get(&(start + size)).copied() {
+            self.remove_region(start + size, next_len);
             size += next_len as u64;
         }
 
-        self.regions.insert(start, size as u32);
+        self.insert_region(start, size as u32);
     }
 
     fn total(&self) -> u64 {
-        self.regions.values().map(|&len| len as u64).sum()
+        self.by_offset.values().map(|&len| len as u64).sum()
+    }
+
+    fn region_count(&self) -> usize {
+        self.by_offset.len()
+    }
+
+    /// Rebuild the size index from `by_offset` (after deserialization).
+    fn reindex(&mut self) {
+        self.by_size = self.by_offset.iter().map(|(&off, &len)| (len, off)).collect();
     }
 }
 
@@ -474,9 +502,11 @@ impl FlatMpt {
         let Manifest {
             cfg,
             upper,
-            free,
+            mut free,
             end,
         } = bincode::deserialize(&bytes)?;
+        // The size index isn't serialized; rebuild it from the offset map.
+        free.reindex();
 
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut opts = Options::default();
@@ -589,7 +619,7 @@ impl FlatMpt {
 
     /// Number of distinct free regions tracked in the flat file.
     pub fn free_regions(&self) -> usize {
-        self.store.free.regions.len()
+        self.store.free.region_count()
     }
 
     pub fn disk_accesses_for_key(&mut self, key: &Key) -> Result<usize> {

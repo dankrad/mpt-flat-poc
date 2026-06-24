@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "profile"
 harness = false
+
+[[bench]]
+name = "large"
+harness = false
