@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 bincode = "1"
+rocksdb = "0.22"
 serde = { version = "1", features = ["derive"] }
 sha3 = "0.10"
 tempfile = "3"
@@ -14,6 +15,15 @@ tempfile = "3"
 criterion = "0.5"
 rand = "0.8"
 
+[features]
+# Opt-in wall-clock attribution (hashing vs IO vs serialization vs ...).
+# Off by default so the throughput benchmark carries no instrumentation cost.
+profiling = []
+
 [[bench]]
 name = "insert"
+harness = false
+
+[[bench]]
+name = "profile"
 harness = false

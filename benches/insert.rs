@@ -32,6 +32,7 @@ fn bench_inserts(c: &mut Criterion) {
                 for key in keys {
                     db.insert(key, vec![1; 32]).unwrap();
                 }
+                db.flush().unwrap();
                 db.root()
             },
             BatchSize::SmallInput,
@@ -45,6 +46,7 @@ fn bench_inserts(c: &mut Criterion) {
                 for i in range {
                     db.insert(hashed_key(i.to_le_bytes()), vec![1; 32]).unwrap();
                 }
+                db.flush().unwrap();
                 db.root()
             },
             BatchSize::SmallInput,
@@ -67,6 +69,7 @@ fn bench_inserts(c: &mut Criterion) {
                 for key in keys {
                     db.insert(key, vec![1; 32]).unwrap();
                 }
+                db.flush().unwrap();
                 db.ram_nodes()
             },
             BatchSize::SmallInput,
