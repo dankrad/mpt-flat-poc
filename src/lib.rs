@@ -26,6 +26,62 @@ const PAGE: u64 = 4096;
 pub type Hash = [u8; 32];
 pub type Key = [u8; 32];
 
+/// Debug instrumentation for the split/write path (cheap relaxed atomics).
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static WRITES: AtomicU64 = AtomicU64::new(0);
+    pub static SPLITS: AtomicU64 = AtomicU64::new(0);
+    pub static MAX_RECORD: AtomicU64 = AtomicU64::new(0);
+    pub static MIN_SPLIT_TRIGGER: AtomicU64 = AtomicU64::new(u64::MAX);
+    pub static MAX_SPLIT_TRIGGER: AtomicU64 = AtomicU64::new(0);
+    /// Histogram of written-record sizes, bucketed by page count (index 0..=16).
+    pub static PAGE_HIST: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+
+    pub fn on_write(total: usize) {
+        WRITES.fetch_add(1, Relaxed);
+        MAX_RECORD.fetch_max(total as u64, Relaxed);
+        let pages = total.div_ceil(super::PAGE as usize).min(16);
+        PAGE_HIST[pages].fetch_add(1, Relaxed);
+    }
+
+    pub fn on_split(trigger: usize) {
+        SPLITS.fetch_add(1, Relaxed);
+        MIN_SPLIT_TRIGGER.fetch_min(trigger as u64, Relaxed);
+        MAX_SPLIT_TRIGGER.fetch_max(trigger as u64, Relaxed);
+    }
+
+    pub fn reset() {
+        WRITES.store(0, Relaxed);
+        SPLITS.store(0, Relaxed);
+        MAX_RECORD.store(0, Relaxed);
+        MIN_SPLIT_TRIGGER.store(u64::MAX, Relaxed);
+        MAX_SPLIT_TRIGGER.store(0, Relaxed);
+        for a in &PAGE_HIST {
+            a.store(0, Relaxed);
+        }
+    }
+
+    pub fn dump() -> String {
+        let min_trig = MIN_SPLIT_TRIGGER.load(Relaxed);
+        let mut s = format!(
+            "writes={} splits={} max_record={}B split_trigger=[{}..{}]B  pages:",
+            WRITES.load(Relaxed),
+            SPLITS.load(Relaxed),
+            MAX_RECORD.load(Relaxed),
+            if min_trig == u64::MAX { 0 } else { min_trig },
+            MAX_SPLIT_TRIGGER.load(Relaxed),
+        );
+        for (p, a) in PAGE_HIST.iter().enumerate() {
+            let c = a.load(Relaxed);
+            if c > 0 {
+                s += &format!(" {p}p={c}");
+            }
+        }
+        s
+    }
+}
+
 /// Opt-in wall-clock profiler.
 ///
 /// Each [`Cat`] is a *leaf* primitive — none of the instrumented regions nests
@@ -306,6 +362,7 @@ impl FlatFile {
     /// occupies `ceil((len+4)/PAGE)` whole pages.
     fn write_payload(&mut self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32 + 4;
+        stats::on_write(total as usize);
         let pages = pages_for(total);
         let page = match self.free.alloc(pages) {
             Some(page) => page,
@@ -846,6 +903,7 @@ fn insert_ram(
                         *ptr = new_ptr;
                         *root = hash_node(&subtree.node);
                     } else {
+                        stats::on_split(new_bytes);
                         children[idx] = Some(split_subtree(store, cfg, subtree)?);
                     }
                     Ok(())
@@ -883,6 +941,7 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
         let child_subtree = subtree_from_entries(child_prefix, entries);
         let (payload, child_bytes) = serialize_subtree(&child_subtree)?;
         if child_bytes > cfg.max_leaf_bytes {
+            stats::on_split(child_bytes);
             children[idx] = Some(split_subtree(store, cfg, child_subtree)?);
         } else if child_bytes >= cfg.min_promote_bytes {
             let ptr = store.write_payload(&payload)?;

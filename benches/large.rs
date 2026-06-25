@@ -111,7 +111,7 @@ fn main() {
     let max_kib: usize = std::env::var("LARGE_MAX_LEAF_KIB")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(8);
     let max = max_kib * 1024;
     let cfg = Config {
         target_leaf_bytes: max / 2,
@@ -127,6 +127,7 @@ fn main() {
     // tracked live: per-chunk insert rate, on-disk size, fragmentation, and the
     // in-RAM index footprint.
     const PROGRESS_EVERY: u64 = 10_000_000;
+    mpt_flat_poc::stats::reset();
     let heap_before = live_heap();
     let t = Instant::now();
     let mut chunk_start = Instant::now();
@@ -182,6 +183,7 @@ fn main() {
         r.free_regions,
         mib(r.overlay_bytes),
     );
+    println!("  split/write stats: {}", mpt_flat_poc::stats::dump());
     println!();
 
     // ---- phase 1: brand-new inserts ----
