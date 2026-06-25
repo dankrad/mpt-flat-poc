@@ -157,13 +157,14 @@ fn main() {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
             println!(
-                "  [{:>4}M] {:>6.0}s | last {}M @ {:.2} µs/key | flat {:.1} GiB | free_regions {} | RAM {:.1} MiB",
+                "  [{:>4}M] {:>6.0}s | {:.2} µs/key | flat {:.1} GiB | leaves {} | free_reg {} | writes {} | RAM {:.1} MiB",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
-                PROGRESS_EVERY / 1_000_000,
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
                 db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                db.disk_leaves(),
                 db.free_regions(),
+                mpt_flat_poc::stats::WRITES.load(std::sync::atomic::Ordering::Relaxed),
                 mib(live),
             );
             std::io::stdout().flush().ok();

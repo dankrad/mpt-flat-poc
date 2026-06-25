@@ -833,6 +833,11 @@ impl FlatMpt {
         count_ram_nodes(&self.upper)
     }
 
+    /// Number of disk leaves (`RamChild::Disk`) the frontier points at.
+    pub fn disk_leaves(&self) -> usize {
+        count_disk_leaves(&self.upper)
+    }
+
     /// Logical size of the flat file (high-water mark). Stays flat across
     /// rewrites when freed space is reused.
     pub fn flat_file_len(&self) -> u64 {
@@ -1819,6 +1824,21 @@ fn empty_children() -> [Option<RamChild>; 16] {
 
 fn empty_box_children() -> [Option<Box<Node>>; 16] {
     std::array::from_fn(|_| None)
+}
+
+fn count_disk_leaves(node: &RamNode) -> usize {
+    match node {
+        RamNode::Empty => 0,
+        RamNode::Extension { child, .. } => count_disk_leaves(child),
+        RamNode::Branch { children, .. } => children
+            .iter()
+            .flatten()
+            .map(|c| match c {
+                RamChild::Disk { .. } => 1,
+                RamChild::Ram(n) => count_disk_leaves(n),
+            })
+            .sum(),
+    }
 }
 
 fn count_ram_nodes(node: &RamNode) -> usize {
