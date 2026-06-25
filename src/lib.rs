@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::FileExt,
@@ -385,21 +385,7 @@ impl FlatFile {
     }
 
     fn read(&mut self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        let payload = {
-            let _g = prof::scope(prof::Cat::FileRead);
-            // The whole record is contiguous and its length is known from the
-            // pointer, so read it in one positioned `pread` (one I/O request).
-            let mut record = vec![0u8; ptr.len as usize];
-            self.file.read_exact_at(&mut record, ptr.offset)?;
-            let len = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
-            if len + 4 != ptr.len as usize {
-                bail!("flat-file record length mismatch");
-            }
-            record.drain(..4);
-            record
-        };
-        let _g = prof::scope(prof::Cat::Deserialize);
-        deserialize_subtree(&payload)
+        read_record(&self.file, ptr)
     }
 
     fn free(&mut self, ptr: DiskPtr) {
@@ -418,6 +404,49 @@ impl FlatFile {
         self.file.sync_all()?;
         Ok(())
     }
+}
+
+/// Read and decode one record by pointer, using only `&File` (a positioned
+/// `pread` + decode) so it can run on any thread. `read_exact_at` is a `pread`,
+/// which is safe to call concurrently on the same file from multiple threads.
+fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
+    let mut record = vec![0u8; ptr.len as usize];
+    {
+        let _g = prof::scope(prof::Cat::FileRead);
+        file.read_exact_at(&mut record, ptr.offset)?;
+    }
+    let len = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
+    if len + 4 != ptr.len as usize {
+        bail!("flat-file record length mismatch");
+    }
+    let _g = prof::scope(prof::Cat::Deserialize);
+    deserialize_subtree(&record[4..])
+}
+
+/// Read+decode many records, fanning the work across threads. Each record is a
+/// contiguous extent at a known offset, so concurrent `pread`s don't interfere;
+/// the decode (CPU) is parallelized too. Returns subtrees in `ptrs` order.
+fn read_records(file: &File, ptrs: &[DiskPtr]) -> Result<Vec<DiskSubtree>> {
+    // Thread setup isn't worth it for a handful of records.
+    if ptrs.len() < 64 {
+        return ptrs.iter().map(|&p| read_record(file, p)).collect();
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    let chunk = ptrs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = ptrs
+            .chunks(chunk)
+            .map(|c| scope.spawn(|| c.iter().map(|&p| read_record(file, p)).collect::<Result<Vec<_>>>()))
+            .collect();
+        let mut out = Vec::with_capacity(ptrs.len());
+        for h in handles {
+            out.extend(h.join().expect("read thread panicked")?);
+        }
+        Ok(out)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,8 +746,34 @@ impl FlatMpt {
         self.flush_values()?;
         let leaves: Vec<(Key, Hash)> = leaves.into_iter().collect();
 
+        // Phase A: route every key to discover which disk leaves we'll touch.
+        // Phase B: read them all up front, in parallel. Phase C: apply from the
+        // prefetched leaves so the recursive update does no blocking reads.
+        let mut seen = HashSet::new();
+        let mut to_read = Vec::new();
+        for (key, _) in &leaves {
+            if let Some(ptr) = find_disk_ptr_key(&self.upper, key, 0) {
+                if seen.insert(ptr.offset) {
+                    to_read.push(ptr);
+                }
+            }
+        }
+        let subtrees = read_records(&self.store.file, &to_read)?;
+        let mut prefetched: HashMap<u64, DiskSubtree> = to_read
+            .iter()
+            .map(|p| p.offset)
+            .zip(subtrees)
+            .collect();
+
         let cfg = self.cfg.clone();
-        insert_ram_batch(&mut self.store, &cfg, &mut self.upper, Vec::new(), &leaves)?;
+        insert_ram_batch(
+            &mut self.store,
+            &cfg,
+            &mut self.upper,
+            Vec::new(),
+            &leaves,
+            &mut prefetched,
+        )?;
         self.store.flush()?;
         Ok(self.root())
     }
@@ -1052,6 +1107,7 @@ fn insert_ram_batch(
     node: &mut RamNode,
     prefix: Vec<u8>,
     batch: &[(Key, Hash)],
+    prefetched: &mut HashMap<u64, DiskSubtree>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1082,7 +1138,7 @@ fn insert_ram_batch(
             if common == path.len() {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram_batch(store, cfg, child, next_prefix, batch)
+                insert_ram_batch(store, cfg, child, next_prefix, batch, prefetched)
             } else {
                 let old = std::mem::replace(node, RamNode::Empty);
                 let RamNode::Extension {
@@ -1115,7 +1171,7 @@ fn insert_ram_batch(
                     if idx == old_idx {
                         // Diverges into the slot the old continuation occupies; fold in.
                         if let Some(RamChild::Ram(c)) = &mut children[idx] {
-                            insert_ram_batch(store, cfg, c, child_prefix, group)?;
+                            insert_ram_batch(store, cfg, c, child_prefix, group, prefetched)?;
                         }
                     } else {
                         children[idx] =
@@ -1149,14 +1205,17 @@ fn insert_ram_batch(
                 child_prefix.push(nib);
                 match &mut children[idx] {
                     Some(RamChild::Ram(child)) => {
-                        insert_ram_batch(store, cfg, child, child_prefix, group)?;
+                        insert_ram_batch(store, cfg, child, child_prefix, group, prefetched)?;
                     }
                     Some(RamChild::Disk { ptr, .. }) => {
-                        // Read once; apply all the batch's keys for this leaf
-                        // incrementally (only touched paths re-hashed), then
-                        // write/split once — instead of K read/serialize/write
-                        // cycles or a full rebuild that re-hashes untouched entries.
-                        let mut leaf = store.read(*ptr)?;
+                        // Use the prefetched leaf (read in parallel up front);
+                        // fall back to a blocking read if it wasn't prefetched.
+                        // Apply all the batch's keys for this leaf incrementally
+                        // (only touched paths re-hashed), then write/split once.
+                        let mut leaf = match prefetched.remove(&ptr.offset) {
+                            Some(leaf) => leaf,
+                            None => store.read(*ptr)?,
+                        };
                         store.free(*ptr);
                         let depth = leaf.prefix.len();
                         for (k, vh) in group {
@@ -1585,6 +1644,33 @@ fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr
             let idx = *nibbles.get(depth)? as usize;
             match children[idx].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr(child, nibbles, depth + 1),
+                RamChild::Disk { ptr, .. } => Some(*ptr),
+            }
+        }
+    }
+}
+
+/// Route `key` to the disk leaf it currently lives in (or `None` if it would
+/// land on an empty/absent slot). Allocation-free variant of [`find_disk_ptr`],
+/// used to collect leaves for parallel prefetch.
+fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr> {
+    match node {
+        RamNode::Empty => None,
+        RamNode::Extension { path, child, .. } => {
+            if depth + path.len() <= 64
+                && path.iter().enumerate().all(|(i, &p)| nibble_at(key, depth + i) == p)
+            {
+                find_disk_ptr_key(child, key, depth + path.len())
+            } else {
+                None
+            }
+        }
+        RamNode::Branch { children, .. } => {
+            if depth >= 64 {
+                return None;
+            }
+            match children[nibble_at(key, depth) as usize].as_ref()? {
+                RamChild::Ram(child) => find_disk_ptr_key(child, key, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
             }
         }
