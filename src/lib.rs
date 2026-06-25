@@ -416,11 +416,9 @@ struct DiskSubtree {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RamChild {
     Ram(Box<RamNode>),
-    Disk {
-        ptr: DiskPtr,
-        root: Hash,
-        bytes: usize,
-    },
+    // `root` is the subtree's Merkle hash; the on-disk record size is recoverable
+    // from `ptr.len`, so it isn't stored here.
+    Disk { ptr: DiskPtr, root: Hash },
 }
 
 // RAM-frontier nodes cache their hash in an interior-mutable `Cell` so that
@@ -428,6 +426,10 @@ enum RamChild {
 // the path it touches (`invalidate_ram`), so recomputing the root re-hashes
 // just that path — every other node returns its cached value, and disk children
 // contribute their already-cached `root`.
+//
+// Children are an inline 16-slot array: frontier branches are dense in practice
+// (a near-complete 16-ary tree over the disk leaves), so a sparse representation
+// would only add per-branch heap allocations without shrinking anything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RamNode {
     Empty,
@@ -436,9 +438,10 @@ enum RamNode {
         child: Box<RamNode>,
         hash: Cell<Option<Hash>>,
     },
+    // No `value`: keys are full 64-nibble paths, so none ever terminates at a
+    // (necessarily shallower) frontier branch.
     Branch {
         children: [Option<RamChild>; 16],
-        value: Option<Hash>,
         hash: Cell<Option<Hash>>,
     },
 }
@@ -745,20 +748,14 @@ fn insert_ram(
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
             let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
-            let (payload, bytes) = serialize_subtree(&subtree)?;
+            let (payload, _) = serialize_subtree(&subtree)?;
             let ptr = store.write_payload(&payload)?;
+            let mut children = empty_children();
+            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
             *node = RamNode::Branch {
-                children: empty_children(),
-                value: None,
+                children,
                 hash: Cell::new(None),
             };
-            if let RamNode::Branch { children, .. } = node {
-                children[idx] = Some(RamChild::Disk {
-                    ptr,
-                    root: hash_node(&subtree.node),
-                    bytes,
-                });
-            }
             Ok(())
         }
         RamNode::Extension { path, child, .. } => {
@@ -773,37 +770,32 @@ fn insert_ram(
                 else {
                     unreachable!();
                 };
-                let mut branch = RamNode::Branch {
-                    children: empty_children(),
-                    value: None,
+                let mut children = empty_children();
+                let old_idx = old_path[common] as usize;
+                let old_remainder = old_path[common + 1..].to_vec();
+                children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
+                    old_child
+                } else {
+                    Box::new(RamNode::Extension {
+                        path: old_remainder,
+                        child: old_child,
+                        hash: Cell::new(None),
+                    })
+                }));
+
+                let new_idx = nibbles[prefix.len() + common] as usize;
+                let mut new_prefix = prefix.clone();
+                new_prefix.extend_from_slice(&old_path[..common]);
+                new_prefix.push(new_idx as u8);
+                let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
+                let (payload, _) = serialize_subtree(&subtree)?;
+                let ptr = store.write_payload(&payload)?;
+                children[new_idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+
+                let branch = RamNode::Branch {
+                    children,
                     hash: Cell::new(None),
                 };
-                if let RamNode::Branch { children, .. } = &mut branch {
-                    let old_idx = old_path[common] as usize;
-                    let old_remainder = old_path[common + 1..].to_vec();
-                    children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
-                        old_child
-                    } else {
-                        Box::new(RamNode::Extension {
-                            path: old_remainder,
-                            child: old_child,
-                            hash: Cell::new(None),
-                        })
-                    }));
-
-                    let new_idx = nibbles[prefix.len() + common] as usize;
-                    let mut new_prefix = prefix.clone();
-                    new_prefix.extend_from_slice(&old_path[..common]);
-                    new_prefix.push(new_idx as u8);
-                    let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
-                    let (payload, bytes) = serialize_subtree(&subtree)?;
-                    let ptr = store.write_payload(&payload)?;
-                    children[new_idx] = Some(RamChild::Disk {
-                        ptr,
-                        root: hash_node(&subtree.node),
-                        bytes,
-                    });
-                }
                 *node = if common == 0 {
                     branch
                 } else {
@@ -820,12 +812,9 @@ fn insert_ram(
                 insert_ram(store, cfg, child, next_prefix, key, value_hash)
             }
         }
-        RamNode::Branch {
-            children, value, ..
-        } => {
+        RamNode::Branch { children, .. } => {
             if prefix.len() == nibbles.len() {
-                *value = Some(value_hash);
-                return Ok(());
+                bail!("key terminates at a frontier branch; keys must be distinct and fixed-length");
             }
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
@@ -834,7 +823,7 @@ fn insert_ram(
                 Some(RamChild::Ram(child)) => {
                     insert_ram(store, cfg, child, child_prefix, key, value_hash)
                 }
-                Some(RamChild::Disk { ptr, root, bytes }) => {
+                Some(RamChild::Disk { ptr, root }) => {
                     let mut subtree = store.read(*ptr)?;
                     let old_ptr = *ptr;
                     // Incremental: re-hash only the path from this leaf's root down
@@ -856,7 +845,6 @@ fn insert_ram(
                         let new_ptr = store.write_payload(&payload)?;
                         *ptr = new_ptr;
                         *root = hash_node(&subtree.node);
-                        *bytes = new_bytes;
                     } else {
                         children[idx] = Some(split_subtree(store, cfg, subtree)?);
                     }
@@ -864,13 +852,9 @@ fn insert_ram(
                 }
                 None => {
                     let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
-                    let (payload, bytes) = serialize_subtree(&subtree)?;
+                    let (payload, _) = serialize_subtree(&subtree)?;
                     let ptr = store.write_payload(&payload)?;
-                    children[idx] = Some(RamChild::Disk {
-                        ptr,
-                        root: hash_node(&subtree.node),
-                        bytes,
-                    });
+                    children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
                     Ok(())
                 }
             }
@@ -902,29 +886,20 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
             children[idx] = Some(split_subtree(store, cfg, child_subtree)?);
         } else if child_bytes >= cfg.min_promote_bytes {
             let ptr = store.write_payload(&payload)?;
-            children[idx] = Some(RamChild::Disk {
-                ptr,
-                root: hash_node(&child_subtree.node),
-                bytes: child_bytes,
-            });
+            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&child_subtree.node) });
         } else {
             remainder.push((idx, child_subtree));
         }
     }
 
     for (idx, rem_subtree) in remainder {
-        let (payload, bytes) = serialize_subtree(&rem_subtree)?;
+        let (payload, _) = serialize_subtree(&rem_subtree)?;
         let ptr = store.write_payload(&payload)?;
-        children[idx] = Some(RamChild::Disk {
-            ptr,
-            root: hash_node(&rem_subtree.node),
-            bytes,
-        });
+        children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&rem_subtree.node) });
     }
 
     let branch = RamNode::Branch {
         children,
-        value: None,
         hash: Cell::new(None),
     };
     if shared.is_empty() {
@@ -1371,11 +1346,7 @@ fn hash_ram(node: &RamNode) -> Hash {
             hash.set(Some(computed));
             computed
         }
-        RamNode::Branch {
-            children,
-            value,
-            hash,
-        } => {
+        RamNode::Branch { children, hash } => {
             if let Some(cached) = hash.get() {
                 return cached;
             }
@@ -1387,9 +1358,6 @@ fn hash_ram(node: &RamNode) -> Hash {
                     None => empty_hash(),
                 };
                 bytes.extend_from_slice(&h);
-            }
-            if let Some(v) = value {
-                bytes.extend_from_slice(v);
             }
             let computed = keccak(&bytes);
             hash.set(Some(computed));

@@ -105,11 +105,20 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
 
+    // Disk-leaf size in KiB (max). target = max/2, min_promote = max/4.
+    // Larger leaves => fewer leaves => smaller frontier and less page padding,
+    // at the cost of more bytes rewritten per insert.
+    let max_kib: usize = std::env::var("LARGE_MAX_LEAF_KIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let max = max_kib * 1024;
     let cfg = Config {
-        target_leaf_bytes: 4 * 1024,
-        max_leaf_bytes: 8 * 1024,
-        min_promote_bytes: 2 * 1024,
+        target_leaf_bytes: max / 2,
+        max_leaf_bytes: max,
+        min_promote_bytes: max / 4,
     };
+    println!("config: max_leaf={} KiB (target {}, min {})\n", max_kib, max / 2, max / 4);
     let tmp = NamedTempFile::new().unwrap();
     let mut db = FlatMpt::create(tmp.path(), cfg).unwrap();
 
