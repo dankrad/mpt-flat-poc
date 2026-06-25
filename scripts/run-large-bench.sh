@@ -57,12 +57,14 @@ df -h "$tmp" 2>/dev/null || true
 echo "config: PRELOAD=$PRELOAD  BATCH=$BATCH  MAX_LEAF_KIB=$MAX_LEAF_KIB"
 echo
 
-features=()
+# Plain string (not an array) so it works on bash 3.2 (macOS) under `set -u`.
+features=""
 if [ "${PROFILE:-0}" = "1" ]; then
-    features=(--features profiling)
+    features="--features profiling"
 fi
 
+# shellcheck disable=SC2086  # intentional word-splitting of $features
 LARGE_PRELOAD="$PRELOAD" \
 LARGE_BATCH="$BATCH" \
 LARGE_MAX_LEAF_KIB="$MAX_LEAF_KIB" \
-    cargo bench --bench large "${features[@]}"
+    cargo bench --bench large $features
