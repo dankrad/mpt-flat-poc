@@ -6,7 +6,8 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
@@ -15,6 +16,12 @@ use std::{
 const VALUE_BATCH: usize = 256;
 const SUBTREE_MAGIC: &[u8; 4] = b"FMPC";
 const SUBTREE_VERSION: u8 = 1;
+
+/// Flat-file allocation granularity. Records are page-aligned and occupy a whole
+/// number of pages, so each leaf read/write is a single positioned I/O over a
+/// contiguous page-aligned extent, and the free list only ever deals in whole
+/// pages (which collapses the size distribution and curbs fragmentation).
+const PAGE: u64 = 4096;
 
 pub type Hash = [u8; 32];
 pub type Key = [u8; 32];
@@ -183,18 +190,23 @@ pub struct DiskPtr {
 /// Tracks reclaimed regions of the flat file so new records can be placed into
 /// holes left by rewritten/split subtrees instead of always extending the file.
 ///
+/// The unit is **pages**, not bytes: `by_offset` maps a free region's first page
+/// index to its length in pages. (The structure itself is unit-agnostic; the
+/// caller — [`FlatFile`] — works exclusively in pages.) Quantizing to pages keeps
+/// the size distribution tiny, so freed holes match new requests far more often
+/// and fragmentation stays low.
+///
 /// Regions are kept non-overlapping and coalesced (adjacent free regions are
 /// merged on `free`). Two indexes are maintained in lock-step: `by_offset` for
 /// coalescing with neighbours, and `by_size` (keyed by `(len, offset)`) so that
-/// best-fit allocation is O(log n) rather than a linear scan — this matters a
-/// lot once fragmentation grows the list to tens of thousands of regions.
+/// best-fit allocation is O(log n) rather than a linear scan.
 ///
 /// Only `by_offset` is serialized; `by_size` is rebuilt via [`reindex`] on load.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct FreeList {
-    /// offset -> length of each free region.
+    /// first page index -> length in pages of each free region.
     by_offset: BTreeMap<u64, u32>,
-    /// (length, offset) of each free region, for size-ordered best-fit lookup.
+    /// (length, first page) of each free region, for size-ordered best-fit lookup.
     #[serde(skip)]
     by_size: BTreeSet<(u32, u64)>,
 }
@@ -270,8 +282,13 @@ impl FreeList {
 struct FlatFile {
     file: File,
     free: FreeList,
-    /// High-water mark: logical end of the file, where fresh appends land.
-    end: u64,
+    /// High-water mark in pages: the next page index where fresh appends land.
+    end_page: u64,
+}
+
+/// Pages needed to hold a record of `record_bytes` (length prefix + payload).
+fn pages_for(record_bytes: u32) -> u32 {
+    record_bytes.div_ceil(PAGE as u32)
 }
 
 impl FlatFile {
@@ -279,52 +296,57 @@ impl FlatFile {
         Self {
             file,
             free: FreeList::default(),
-            end: 0,
+            end_page: 0,
         }
     }
 
-    /// Store an already-encoded subtree payload, preferring a reclaimed free
-    /// region over extending the file. Record layout is `[len: u32 LE][payload]`.
-    /// Callers serialize once (via [`serialize_subtree`]) and reuse the size for
-    /// their rewrite-vs-split decision, so the blob is never serialized twice.
+    /// Store an already-encoded subtree payload in a page-aligned record,
+    /// preferring a reclaimed free region over extending the file. The record
+    /// `[len: u32 LE][payload]` is written in a single positioned `pwrite`, and
+    /// occupies `ceil((len+4)/PAGE)` whole pages.
     fn write_payload(&mut self, payload: &[u8]) -> Result<DiskPtr> {
-        let len = payload.len() as u32;
-        let total = len + 4;
-        let offset = match self.free.alloc(total) {
-            Some(offset) => offset,
+        let total = payload.len() as u32 + 4;
+        let pages = pages_for(total);
+        let page = match self.free.alloc(pages) {
+            Some(page) => page,
             None => {
-                let offset = self.end;
-                self.end += total as u64;
-                offset
+                let page = self.end_page;
+                self.end_page += pages as u64;
+                page
             }
         };
+        let offset = page * PAGE;
+
+        // One contiguous buffer => one positioned write (one I/O request).
+        let mut record = Vec::with_capacity(total as usize);
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        record.extend_from_slice(payload);
+
         let _g = prof::scope(prof::Cat::FileWrite);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(payload)?;
+        self.file.write_all_at(&record, offset)?;
         Ok(DiskPtr { offset, len: total })
     }
 
     fn read(&mut self, ptr: DiskPtr) -> Result<DiskSubtree> {
         let payload = {
             let _g = prof::scope(prof::Cat::FileRead);
-            self.file.seek(SeekFrom::Start(ptr.offset))?;
-            let mut len_bytes = [0; 4];
-            self.file.read_exact(&mut len_bytes)?;
-            let len = u32::from_le_bytes(len_bytes) as usize;
+            // The whole record is contiguous and its length is known from the
+            // pointer, so read it in one positioned `pread` (one I/O request).
+            let mut record = vec![0u8; ptr.len as usize];
+            self.file.read_exact_at(&mut record, ptr.offset)?;
+            let len = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
             if len + 4 != ptr.len as usize {
                 bail!("flat-file record length mismatch");
             }
-            let mut payload = vec![0; len];
-            self.file.read_exact(&mut payload)?;
-            payload
+            record.drain(..4);
+            record
         };
         let _g = prof::scope(prof::Cat::Deserialize);
         deserialize_subtree(&payload)
     }
 
     fn free(&mut self, ptr: DiskPtr) {
-        self.free.free(ptr.offset, ptr.len);
+        self.free.free(ptr.offset / PAGE, pages_for(ptr.len));
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -475,7 +497,7 @@ struct ManifestRef<'a> {
     cfg: &'a Config,
     upper: &'a RamNode,
     free: &'a FreeList,
-    end: u64,
+    end_page: u64,
 }
 
 #[derive(Deserialize)]
@@ -483,7 +505,7 @@ struct Manifest {
     cfg: Config,
     upper: RamNode,
     free: FreeList,
-    end: u64,
+    end_page: u64,
 }
 
 impl FlatMpt {
@@ -529,7 +551,7 @@ impl FlatMpt {
             cfg,
             upper,
             mut free,
-            end,
+            end_page,
         } = bincode::deserialize(&bytes)?;
         // The size index isn't serialized; rebuild it from the offset map.
         free.reindex();
@@ -541,7 +563,7 @@ impl FlatMpt {
 
         Ok(Self {
             cfg,
-            store: FlatFile { file, free, end },
+            store: FlatFile { file, free, end_page },
             upper,
             values,
             overlay: HashMap::new(),
@@ -583,7 +605,7 @@ impl FlatMpt {
             cfg: &self.cfg,
             upper: &self.upper,
             free: &self.store.free,
-            end: self.store.end,
+            end_page: self.store.end_page,
         };
         let bytes = bincode::serialize(&manifest)?;
 
@@ -635,12 +657,12 @@ impl FlatMpt {
     /// Logical size of the flat file (high-water mark). Stays flat across
     /// rewrites when freed space is reused.
     pub fn flat_file_len(&self) -> u64 {
-        self.store.end
+        self.store.end_page * PAGE
     }
 
     /// Total bytes currently held in the flat file's free list.
     pub fn free_bytes(&self) -> u64 {
-        self.store.free.total()
+        self.store.free.total() * PAGE
     }
 
     /// Number of distinct free regions tracked in the flat file.
