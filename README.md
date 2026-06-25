@@ -127,10 +127,12 @@ genuinely new (≈ path length), not a count that scales with subtree size. The
 | [`src/lib.rs`](src/lib.rs) | The entire engine. See the component map below. |
 | [`benches/insert.rs`](benches/insert.rs) | Criterion throughput benchmark — 1000 inserts under random, sequential-hashed, and shared-prefix key distributions. Run with `cargo bench --bench insert`. |
 | [`benches/profile.rs`](benches/profile.rs) | Wall-clock **attribution** benchmark: splits insert/read time across hashing, (de)serialization, file IO, flush, and RocksDB. Run with `cargo bench --bench profile --features profiling`. |
+| [`benches/large.rs`](benches/large.rs) | Steady-state benchmark: preload N keys (`LARGE_PRELOAD`, optional `LARGE_BATCH`/`LARGE_MAX_LEAF_KIB`), then time new inserts + overwrites, logging per-10M stats. Easiest via the script below. |
 | [`examples/hashcount.rs`](examples/hashcount.rs) | Diagnostic: prints keccak calls per individual insert, showing how hashing scales. `cargo run --release --example hashcount --features profiling`. |
 | [`examples/hashaudit.rs`](examples/hashaudit.rs) | Diagnostic: classifies each keccak call of an insert as essential / recomputed-unchanged / duplicate, to prove hashing is minimal. `cargo run --release --example hashaudit --features profiling`. |
 | [`examples/diskusage.rs`](examples/diskusage.rs) | Diagnostic: reports the flat-file index footprint (bytes/entry) for N inserts. `cargo run --release --example diskusage [N]`. |
 | [`examples/sizecheck.rs`](examples/sizecheck.rs) | Diagnostic: reports flat-file length/free bytes/RAM nodes for the three benchmark key distributions. `cargo run --release --example sizecheck`. |
+| [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` with env knobs (`PRELOAD`, `BATCH`, `MAX_LEAF_KIB`, `PROFILE`); documents prereqs and the `TMPDIR`-must-be-a-real-disk caveat for large runs. |
 | [`Cargo.toml`](Cargo.toml) | Dependencies and the `profiling` feature flag. |
 
 ### `src/lib.rs` component map
