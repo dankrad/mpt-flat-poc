@@ -697,6 +697,32 @@ impl FlatMpt {
         Ok(self.root())
     }
 
+    /// Insert/overwrite many key/value pairs at once. Equivalent in result to
+    /// calling [`insert`](Self::insert) for each pair (last value wins on a
+    /// duplicate key within the batch), but far cheaper: values are written to
+    /// RocksDB in one batch, and the trie is updated by grouping keys per route
+    /// so every touched disk leaf is read/rebuilt/written exactly once and every
+    /// node is re-hashed at most once. Returns the new root.
+    pub fn insert_batch(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<Hash> {
+        if entries.is_empty() {
+            return Ok(self.root());
+        }
+        // Dedup (last write wins) and sort by key; compute leaf value-hashes.
+        let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
+        for (key, value) in entries {
+            let value_hash = hash_leaf_value(&value);
+            self.overlay.insert(key, value);
+            leaves.insert(key, value_hash);
+        }
+        self.flush_values()?;
+        let leaves: Vec<(Key, Hash)> = leaves.into_iter().collect();
+
+        let cfg = self.cfg.clone();
+        insert_ram_batch(&mut self.store, &cfg, &mut self.upper, Vec::new(), &leaves)?;
+        self.store.flush()?;
+        Ok(self.root())
+    }
+
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
         let _g = prof::scope(prof::Cat::ValueGet);
         // Buffered writes win over what's already in RocksDB.
@@ -975,6 +1001,186 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
 fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Hash)>) -> DiskSubtree {
     let node = build_node(&entries, prefix.len());
     DiskSubtree { prefix, node }
+}
+
+/// The `i`-th nibble of a key (i in 0..64), without allocating.
+fn nibble_at(key: &Key, i: usize) -> u8 {
+    let byte = key[i / 2];
+    if i % 2 == 0 { byte >> 4 } else { byte & 0x0f }
+}
+
+/// Partition a key-sorted batch into contiguous runs sharing `nibble_at(.., depth)`.
+fn group_by_nibble(batch: &[(Key, Hash)], depth: usize) -> Vec<(u8, &[(Key, Hash)])> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < batch.len() {
+        let nib = nibble_at(&batch[i].0, depth);
+        let start = i;
+        while i < batch.len() && nibble_at(&batch[i].0, depth) == nib {
+            i += 1;
+        }
+        groups.push((nib, &batch[start..i]));
+    }
+    groups
+}
+
+/// Build a disk leaf from `entries`; if it exceeds `max_leaf_bytes`, split it
+/// into a RAM-frontier branch instead.
+fn make_disk_or_split(
+    store: &mut FlatFile,
+    cfg: &Config,
+    prefix: Vec<u8>,
+    entries: Vec<(Key, Hash)>,
+) -> Result<RamChild> {
+    let subtree = subtree_from_entries(prefix, entries);
+    let (payload, bytes) = serialize_subtree(&subtree)?;
+    if bytes <= cfg.max_leaf_bytes {
+        let ptr = store.write_payload(&payload)?;
+        Ok(RamChild::Disk { ptr, root: hash_node(&subtree.node) })
+    } else {
+        stats::on_split(bytes);
+        split_subtree(store, cfg, subtree)
+    }
+}
+
+/// Insert a key-sorted batch of `(key, value_hash)` into the frontier. Keys are
+/// grouped by route so each touched disk leaf is read, merged, rebuilt, and
+/// written exactly once, and each frontier node is re-hashed at most once.
+fn insert_ram_batch(
+    store: &mut FlatFile,
+    cfg: &Config,
+    node: &mut RamNode,
+    prefix: Vec<u8>,
+    batch: &[(Key, Hash)],
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    invalidate_ram(node);
+    match node {
+        RamNode::Empty => {
+            let mut children = empty_children();
+            for (nib, group) in group_by_nibble(batch, prefix.len()) {
+                let mut child_prefix = prefix.clone();
+                child_prefix.push(nib);
+                children[nib as usize] =
+                    Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+            }
+            *node = RamNode::Branch {
+                children,
+                hash: Cell::new(None),
+            };
+            Ok(())
+        }
+        RamNode::Extension { path, child, .. } => {
+            // Earliest point any batch key diverges from the shared path.
+            let common = batch
+                .iter()
+                .map(|(k, _)| common_prefix(path, &key_nibbles(k)[prefix.len()..]))
+                .min()
+                .unwrap();
+            if common == path.len() {
+                let mut next_prefix = prefix;
+                next_prefix.extend_from_slice(path);
+                insert_ram_batch(store, cfg, child, next_prefix, batch)
+            } else {
+                let old = std::mem::replace(node, RamNode::Empty);
+                let RamNode::Extension {
+                    path: old_path,
+                    child: old_child,
+                    ..
+                } = old
+                else {
+                    unreachable!();
+                };
+                let mut children = empty_children();
+                let old_idx = old_path[common] as usize;
+                let old_remainder = old_path[common + 1..].to_vec();
+                children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
+                    old_child
+                } else {
+                    Box::new(RamNode::Extension {
+                        path: old_remainder,
+                        child: old_child,
+                        hash: Cell::new(None),
+                    })
+                }));
+
+                let split_depth = prefix.len() + common;
+                for (nib, group) in group_by_nibble(batch, split_depth) {
+                    let idx = nib as usize;
+                    let mut child_prefix = prefix.clone();
+                    child_prefix.extend_from_slice(&old_path[..common]);
+                    child_prefix.push(nib);
+                    if idx == old_idx {
+                        // Diverges into the slot the old continuation occupies; fold in.
+                        if let Some(RamChild::Ram(c)) = &mut children[idx] {
+                            insert_ram_batch(store, cfg, c, child_prefix, group)?;
+                        }
+                    } else {
+                        children[idx] =
+                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+                    }
+                }
+
+                let branch = RamNode::Branch {
+                    children,
+                    hash: Cell::new(None),
+                };
+                *node = if common == 0 {
+                    branch
+                } else {
+                    RamNode::Extension {
+                        path: old_path[..common].to_vec(),
+                        child: Box::new(branch),
+                        hash: Cell::new(None),
+                    }
+                };
+                Ok(())
+            }
+        }
+        RamNode::Branch { children, .. } => {
+            if prefix.len() >= 64 {
+                bail!("key terminates at a frontier branch; keys must be distinct and fixed-length");
+            }
+            for (nib, group) in group_by_nibble(batch, prefix.len()) {
+                let idx = nib as usize;
+                let mut child_prefix = prefix.clone();
+                child_prefix.push(nib);
+                match &mut children[idx] {
+                    Some(RamChild::Ram(child)) => {
+                        insert_ram_batch(store, cfg, child, child_prefix, group)?;
+                    }
+                    Some(RamChild::Disk { ptr, .. }) => {
+                        // Read once; apply all the batch's keys for this leaf
+                        // incrementally (only touched paths re-hashed), then
+                        // write/split once — instead of K read/serialize/write
+                        // cycles or a full rebuild that re-hashes untouched entries.
+                        let mut leaf = store.read(*ptr)?;
+                        store.free(*ptr);
+                        let depth = leaf.prefix.len();
+                        for (k, vh) in group {
+                            node_insert(&mut leaf.node, depth, *k, *vh);
+                        }
+                        let (payload, bytes) = serialize_subtree(&leaf)?;
+                        if bytes <= cfg.max_leaf_bytes {
+                            let new_ptr = store.write_payload(&payload)?;
+                            children[idx] =
+                                Some(RamChild::Disk { ptr: new_ptr, root: hash_node(&leaf.node) });
+                        } else {
+                            stats::on_split(bytes);
+                            children[idx] = Some(split_subtree(store, cfg, leaf)?);
+                        }
+                    }
+                    None => {
+                        children[idx] =
+                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Collect every `(key, value_hash)` leaf in a node, in ascending key order.
@@ -1560,6 +1766,42 @@ mod tests {
 
     fn db(cfg: Config) -> FlatMpt {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
+    }
+
+    #[test]
+    fn batch_insert_matches_one_by_one() {
+        let cfg = Config {
+            target_leaf_bytes: 512,
+            max_leaf_bytes: 768,
+            min_promote_bytes: 192,
+        };
+        let pairs: Vec<(Key, Vec<u8>)> = (0..3000u64)
+            .map(|i| (hashed_key(i.to_le_bytes()), vec![i as u8; 40]))
+            .collect();
+
+        // Reference: one-by-one inserts.
+        let mut one = db(cfg.clone());
+        for (k, v) in &pairs {
+            one.insert(*k, v.clone()).unwrap();
+        }
+
+        // Batched in uneven chunks (crosses leaf/split boundaries).
+        let mut batched = db(cfg.clone());
+        for chunk in pairs.chunks(137) {
+            batched.insert_batch(chunk.to_vec()).unwrap();
+        }
+
+        assert_eq!(one.root(), batched.root(), "batch root must equal one-by-one");
+        for (k, v) in &pairs {
+            assert_eq!(batched.get_value(k).unwrap(), Some(v.clone()));
+        }
+
+        // Within-batch duplicate: last value wins.
+        let key = hashed_key("dup");
+        batched
+            .insert_batch(vec![(key, b"first".to_vec()), (key, b"second".to_vec())])
+            .unwrap();
+        assert_eq!(batched.get_value(&key).unwrap(), Some(b"second".to_vec()));
     }
 
     #[test]

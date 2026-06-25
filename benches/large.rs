@@ -118,7 +118,18 @@ fn main() {
         max_leaf_bytes: max,
         min_promote_bytes: max / 4,
     };
-    println!("config: max_leaf={} KiB (target {}, min {})\n", max_kib, max / 2, max / 4);
+    // Batch size for preload inserts; 0 = one-by-one. Must divide PROGRESS_EVERY.
+    let batch: usize = std::env::var("LARGE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    println!(
+        "config: max_leaf={} KiB (target {}, min {}), batch={}\n",
+        max_kib,
+        max / 2,
+        max / 4,
+        if batch == 0 { "off".into() } else { batch.to_string() },
+    );
     let tmp = NamedTempFile::new().unwrap();
     let mut db = FlatMpt::create(tmp.path(), cfg).unwrap();
 
@@ -131,8 +142,16 @@ fn main() {
     let heap_before = live_heap();
     let t = Instant::now();
     let mut chunk_start = Instant::now();
+    let mut buf: Vec<(Key, Vec<u8>)> = Vec::new();
     for i in 0..preload {
-        db.insert(key_at(i), vec![0u8; 32]).unwrap();
+        if batch == 0 {
+            db.insert(key_at(i), vec![0u8; 32]).unwrap();
+        } else {
+            buf.push((key_at(i), vec![0u8; 32]));
+            if buf.len() >= batch {
+                db.insert_batch(std::mem::take(&mut buf)).unwrap();
+            }
+        }
         let done = i + 1;
         if done % PROGRESS_EVERY == 0 && done < preload {
             let chunk = chunk_start.elapsed();
@@ -150,6 +169,9 @@ fn main() {
             std::io::stdout().flush().ok();
             chunk_start = Instant::now();
         }
+    }
+    if !buf.is_empty() {
+        db.insert_batch(buf).unwrap();
     }
     db.flush().unwrap();
     let elapsed = t.elapsed();
