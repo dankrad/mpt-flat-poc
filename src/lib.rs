@@ -430,9 +430,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            target_leaf_bytes: 16 * 1024,
-            max_leaf_bytes: 32 * 1024,
-            min_promote_bytes: 8 * 1024,
+            target_leaf_bytes: 4 * 1024,
+            max_leaf_bytes: 8 * 1024,
+            min_promote_bytes: 2 * 1024,
         }
     }
 }
