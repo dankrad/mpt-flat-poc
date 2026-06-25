@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::FileExt,
@@ -423,27 +423,63 @@ fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
     deserialize_subtree(&record[4..])
 }
 
-/// Read+decode many records, fanning the work across threads. Each record is a
-/// contiguous extent at a known offset, so concurrent `pread`s don't interfere;
-/// the decode (CPU) is parallelized too. Returns subtrees in `ptrs` order.
-fn read_records(file: &File, ptrs: &[DiskPtr]) -> Result<Vec<DiskSubtree>> {
-    // Thread setup isn't worth it for a handful of records.
-    if ptrs.len() < 64 {
-        return ptrs.iter().map(|&p| read_record(file, p)).collect();
+/// A leaf's update computed off the write path: the updated subtree, its
+/// serialized payload, encoded size, and root hash — everything except the
+/// flat-file write itself (which must stay serial, as the allocator is shared).
+struct LeafUpdate {
+    offset: u64,
+    subtree: DiskSubtree,
+    payload: Vec<u8>,
+    bytes: usize,
+    root: Hash,
+}
+
+/// The per-leaf work for one update: read the leaf, apply its keys
+/// (`node_insert` — the hashing), and serialize. No flat-file mutation, so this
+/// is pure CPU+read and runs on any thread.
+fn compute_leaf_update(file: &File, ptr: DiskPtr, group: &[(Key, Hash)]) -> Result<LeafUpdate> {
+    let mut subtree = read_record(file, ptr)?;
+    let depth = subtree.prefix.len();
+    for (key, value_hash) in group {
+        node_insert(&mut subtree.node, depth, *key, *value_hash);
+    }
+    let (payload, bytes) = serialize_subtree(&subtree)?;
+    let root = hash_node(&subtree.node);
+    Ok(LeafUpdate {
+        offset: ptr.offset,
+        subtree,
+        payload,
+        bytes,
+        root,
+    })
+}
+
+/// Compute all touched-leaf updates in parallel: each task `(ptr, keys)` is read,
+/// hashed (`node_insert`), and serialized independently across scoped threads.
+/// This moves the dominant per-leaf CPU (keccak + bincode) off the serial path;
+/// only the writes/splits remain serial. `pread` and the decode/encode are
+/// thread-safe, and each task owns its own subtree, so there's no sharing.
+fn precompute_leaves(
+    file: &File,
+    tasks: &[(DiskPtr, Vec<(Key, Hash)>)],
+) -> Result<Vec<LeafUpdate>> {
+    let work = |(ptr, group): &(DiskPtr, Vec<(Key, Hash)>)| compute_leaf_update(file, *ptr, group);
+    if tasks.len() < 64 {
+        return tasks.iter().map(work).collect();
     }
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(8);
-    let chunk = ptrs.len().div_ceil(threads);
+    let chunk = tasks.len().div_ceil(threads);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = ptrs
+        let handles: Vec<_> = tasks
             .chunks(chunk)
-            .map(|c| scope.spawn(|| c.iter().map(|&p| read_record(file, p)).collect::<Result<Vec<_>>>()))
+            .map(|c| scope.spawn(|| c.iter().map(work).collect::<Result<Vec<_>>>()))
             .collect();
-        let mut out = Vec::with_capacity(ptrs.len());
+        let mut out = Vec::with_capacity(tasks.len());
         for h in handles {
-            out.extend(h.join().expect("read thread panicked")?);
+            out.extend(h.join().expect("precompute thread panicked")?);
         }
         Ok(out)
     })
@@ -746,25 +782,27 @@ impl FlatMpt {
         self.flush_values()?;
         let leaves: Vec<(Key, Hash)> = leaves.into_iter().collect();
 
-        // Phase A: route every key to discover which disk leaves we'll touch.
-        // Phase B: read them all up front, in parallel. Phase C: apply from the
-        // prefetched leaves so the recursive update does no blocking reads.
-        let mut seen = HashSet::new();
-        let mut to_read = Vec::new();
-        for (key, _) in &leaves {
-            if let Some(ptr) = find_disk_ptr_key(&self.upper, key, 0) {
-                if seen.insert(ptr.offset) {
-                    to_read.push(ptr);
-                }
+        // Phase A (serial, cheap): route every key to the disk leaf it lands in,
+        // grouping keys per leaf. Keys with no existing leaf (None) create new
+        // structure and are handled by the serial apply below.
+        let mut groups: HashMap<u64, Vec<(Key, Hash)>> = HashMap::new();
+        let mut ptrs: HashMap<u64, DiskPtr> = HashMap::new();
+        for &(key, value_hash) in &leaves {
+            if let Some(ptr) = find_disk_ptr_key(&self.upper, &key, 0) {
+                groups.entry(ptr.offset).or_default().push((key, value_hash));
+                ptrs.entry(ptr.offset).or_insert(ptr);
             }
         }
-        let subtrees = read_records(&self.store.file, &to_read)?;
-        let mut prefetched: HashMap<u64, DiskSubtree> = to_read
-            .iter()
-            .map(|p| p.offset)
-            .zip(subtrees)
-            .collect();
+        // Phase B (parallel): read + apply keys (hash) + serialize each touched
+        // leaf — all the per-leaf CPU, off the write path.
+        let tasks: Vec<(DiskPtr, Vec<(Key, Hash)>)> =
+            groups.into_iter().map(|(off, g)| (ptrs[&off], g)).collect();
+        let updates = precompute_leaves(&self.store.file, &tasks)?;
+        let mut precomputed: HashMap<u64, LeafUpdate> =
+            updates.into_iter().map(|u| (u.offset, u)).collect();
 
+        // Phase C (serial): install precomputed leaves (free + write/split) and
+        // build any brand-new leaves; recompute the frontier hashes once.
         let cfg = self.cfg.clone();
         insert_ram_batch(
             &mut self.store,
@@ -772,7 +810,7 @@ impl FlatMpt {
             &mut self.upper,
             Vec::new(),
             &leaves,
-            &mut prefetched,
+            &mut precomputed,
         )?;
         self.store.flush()?;
         Ok(self.root())
@@ -1107,7 +1145,7 @@ fn insert_ram_batch(
     node: &mut RamNode,
     prefix: Vec<u8>,
     batch: &[(Key, Hash)],
-    prefetched: &mut HashMap<u64, DiskSubtree>,
+    precomputed: &mut HashMap<u64, LeafUpdate>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1138,7 +1176,7 @@ fn insert_ram_batch(
             if common == path.len() {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram_batch(store, cfg, child, next_prefix, batch, prefetched)
+                insert_ram_batch(store, cfg, child, next_prefix, batch, precomputed)
             } else {
                 let old = std::mem::replace(node, RamNode::Empty);
                 let RamNode::Extension {
@@ -1171,7 +1209,7 @@ fn insert_ram_batch(
                     if idx == old_idx {
                         // Diverges into the slot the old continuation occupies; fold in.
                         if let Some(RamChild::Ram(c)) = &mut children[idx] {
-                            insert_ram_batch(store, cfg, c, child_prefix, group, prefetched)?;
+                            insert_ram_batch(store, cfg, c, child_prefix, group, precomputed)?;
                         }
                     } else {
                         children[idx] =
@@ -1205,30 +1243,23 @@ fn insert_ram_batch(
                 child_prefix.push(nib);
                 match &mut children[idx] {
                     Some(RamChild::Ram(child)) => {
-                        insert_ram_batch(store, cfg, child, child_prefix, group, prefetched)?;
+                        insert_ram_batch(store, cfg, child, child_prefix, group, precomputed)?;
                     }
                     Some(RamChild::Disk { ptr, .. }) => {
-                        // Use the prefetched leaf (read in parallel up front);
-                        // fall back to a blocking read if it wasn't prefetched.
-                        // Apply all the batch's keys for this leaf incrementally
-                        // (only touched paths re-hashed), then write/split once.
-                        let mut leaf = match prefetched.remove(&ptr.offset) {
-                            Some(leaf) => leaf,
-                            None => store.read(*ptr)?,
+                        // The leaf's update (read + node_insert + serialize) was
+                        // computed in parallel; here we only do the serial write.
+                        let update = match precomputed.remove(&ptr.offset) {
+                            Some(update) => update,
+                            // Fallback (shouldn't happen): compute inline.
+                            None => compute_leaf_update(&store.file, *ptr, group)?,
                         };
                         store.free(*ptr);
-                        let depth = leaf.prefix.len();
-                        for (k, vh) in group {
-                            node_insert(&mut leaf.node, depth, *k, *vh);
-                        }
-                        let (payload, bytes) = serialize_subtree(&leaf)?;
-                        if bytes <= cfg.max_leaf_bytes {
-                            let new_ptr = store.write_payload(&payload)?;
-                            children[idx] =
-                                Some(RamChild::Disk { ptr: new_ptr, root: hash_node(&leaf.node) });
+                        if update.bytes <= cfg.max_leaf_bytes {
+                            let new_ptr = store.write_payload(&update.payload)?;
+                            children[idx] = Some(RamChild::Disk { ptr: new_ptr, root: update.root });
                         } else {
-                            stats::on_split(bytes);
-                            children[idx] = Some(split_subtree(store, cfg, leaf)?);
+                            stats::on_split(update.bytes);
+                            children[idx] = Some(split_subtree(store, cfg, update.subtree)?);
                         }
                     }
                     None => {
