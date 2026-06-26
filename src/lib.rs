@@ -1271,11 +1271,30 @@ fn make_extension(path: Vec<u8>, child: Node) -> Node {
 /// hash). An `Overflow` child contributes its `root` via `hash_node`, so a branch
 /// hashes identically whether a child is inline or overflowed.
 fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
+    // RLP-style sparse encoding: a 16-bit presence bitmap followed by only the
+    // present children's hashes, so an absent slot costs ~0 bytes instead of a
+    // 32-byte `empty_hash`. The bitmap + ordered hashes still uniquely determine
+    // the branch, so this stays collision-resistant; it just shrinks the keccak
+    // input (513 bytes fixed -> 3 + 32*popcount) for the sparse branches that
+    // dominate, cutting the path-rehash work.
     let mut bytes = vec![5];
-    for child in children {
-        bytes.extend_from_slice(&child.as_ref().map(|c| hash_node(c)).unwrap_or_else(empty_hash));
+    let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
+    bytes.extend_from_slice(&bitmap.to_le_bytes());
+    for child in children.iter().flatten() {
+        bytes.extend_from_slice(&hash_node(child));
     }
     keccak(&bytes)
+}
+
+/// Pack a child-presence iterator (16 slots) into a little-endian bitmap.
+fn branch_bitmap(present: impl Iterator<Item = bool>) -> u16 {
+    let mut bitmap = 0u16;
+    for (i, p) in present.enumerate() {
+        if p {
+            bitmap |= 1 << i;
+        }
+    }
+    bitmap
 }
 
 fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
@@ -2263,13 +2282,17 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            // Tag 5 == the disk-side branch tag (`make_branch`); see above.
+            // Tag 5 == the disk-side branch tag (`make_branch`); see above. Same
+            // sparse encoding as `branch_hash`: bitmap + present children's hashes
+            // only, so RAM and disk branches with the same structure still hash
+            // identically (storage-independent root).
             let mut bytes = vec![5];
-            for child in children {
+            let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
+            bytes.extend_from_slice(&bitmap.to_le_bytes());
+            for child in children.iter().flatten() {
                 let h = match child {
-                    Some(RamChild::Ram(node)) => hash_ram(node),
-                    Some(RamChild::Disk { root, .. }) => *root,
-                    None => empty_hash(),
+                    RamChild::Ram(node) => hash_ram(node),
+                    RamChild::Disk { root, .. } => *root,
                 };
                 bytes.extend_from_slice(&h);
             }
