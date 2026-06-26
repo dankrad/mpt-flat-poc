@@ -83,6 +83,33 @@ The split that matters:
 - **Child digests (authentication within a record)** → disk header (1), read
   on demand when we touch the record.
 
+### Where the RAM/disk boundary falls — adaptive, via `min_promote`
+
+There is **no fixed-depth knob.** The boundary is the same kind of adaptive,
+data-driven boundary the engine already uses, refined by one rule:
+
+> A branch lives in the **RAM frontier iff all its children are "fat"
+> (≥ `min_promote`)** — each child then deserves its own record, so the branch is
+> a RAM node whose children are records. A branch that has any **small** children
+> (< `min_promote`) is instead **packed into one disk record** (small children
+> inline; fat children as `Overflow` pointers).
+
+Consequences, all desirable and all adaptive:
+- The frontier covers the **upper tree** (where subtrees are big → fat children)
+  and stops exactly where subtrees shrink below `min_promote` — which is *where
+  the old design's swarm began*. Instead of fanning that level into 16 tiny RAM
+  disk-leaves, we pack it into one record.
+- **Bounded RAM:** packed records hold ~`max/leaf` keys (~80 at 8 KiB) instead of
+  ~3, so ~15–25× fewer records ⇒ ~15–25× smaller frontier (~0.75 GB at 1B vs
+  11.8 GB). The frontier stays adaptive but small *because the leaves are fat*.
+- **~1 read** for the common case (RAM navigation down to the boundary record,
+  then one read). An overflow hop is added only for a fat child *below* the
+  boundary, and the chain there is short — its length is set by the
+  `min_promote : max_leaf` ratio (~1–2), and tunable.
+- `min_promote` is the single dial: bigger ⇒ frontier stops higher (less RAM,
+  slightly deeper disk chains); smaller ⇒ frontier reaches deeper (more RAM,
+  shallower chains).
+
 ## 5. The sibling-hash flow (the question that drove this design)
 
 When we update one child and must recompute the record's branch hash, we need
@@ -137,12 +164,13 @@ Two distinct triggers (do **not** conflate them):
     keys diverge within a few nibbles, and key length (64 nibbles) + extension
     compression bound the chain.
 
-So `min_promote` is a *preference* for voluntary promotion, not a hard floor that
-can block a full record.
 - **Depth comes from overflow chains, not header splits.** The header branch is
   always 16-way; a child that keeps growing becomes its own page node with its
   own (1)/(2)/(3), recursively. No 16-at-once cascade — migration is incremental
   (a few children per insert), spread over time.
+
+So `min_promote` is a *preference* for voluntary promotion, not a hard floor that
+can block a full record.
 
 This means we can **keep page-alignment** for low fragmentation: records are now
 either packed-full (inline) or ≥ `min_promote` (overflow), so padding is a small
@@ -194,14 +222,22 @@ the (logical) trie. Gates on every phase:
 
 ## 11. Phased plan
 
-1. **(this doc)** — format + invariants.
-2. **Format + single-key path.** Serialize/deserialize the (1)/(2)/(3) record;
-   `insert`/`get` on it; **root-equivalence green** (batchcheck + cross-check).
-   No migration yet — one record per subtree, all-inline.
-3. **Migration.** Inline↔overflow via `min_promote`/`target`/`max`; overflow
-   chains for depth. Add `migrations` / `overflow_records` stats. Root stays green.
-4. **Batch + parallel.** Re-integrate `insert_batch` + parallel precompute over
-   the new format.
+1. **(this doc)** — format + invariants. ✔
+2a. **Storage-independent root.** Unify hash tags so the root doesn't depend on
+   the RAM/disk boundary. ✔ (`c05d971`, `root_is_independent_of_leaf_size`)
+2b. **`Node::Overflow` foundation.** Wire format + hash contract + round-trip
+   test. ✔ (`c35cb0c`)
+2c. **Record-crossing insert + adaptive boundary** — *next*. At a split, promote
+   a branch to RAM only if all children are fat (≥ `min_promote`); otherwise keep
+   it as a packed disk record and shed fat children to `Overflow`. Record-level
+   insert traverses overflow edges (read → recurse → rewrite → re-hash up).
+   **Gate:** all-inline build (huge `min_promote`) == forced-overflow build (tiny
+   `min_promote`) — same root; plus `batchcheck` + `root_is_independent_of_leaf_size`.
+3. **Migration tuning + stats.** Forced/proactive shedding to `target`; add
+   `overflow_records` / `migrations` stats and a read-depth probe.
+4. **Batch + parallel.** Re-integrate `insert_batch` over the new format (note the
+   constraint: parallel precompute may *read* overflow records but writes stay
+   serial).
 5. **Scale.** Run `benches/large.rs` through the old cascade points (40M, 560M);
    confirm `avg_leaf`/`split`/`free_reg`/RAM stay healthy and track the
-   ~150 GB / ~0.5 GB ideal. Compare head-to-head with `ram-optimization`.
+   ~150 GB / ~0.5 GB ideal.
