@@ -43,6 +43,22 @@ pub mod stats {
     pub static SPLIT_LEAVES: AtomicU64 = AtomicU64::new(0);
     pub static SPLIT_LEAF_BYTES: AtomicU64 = AtomicU64::new(0);
 
+    /// Cumulative wall-time (ns) in each `insert_batch` phase, plus the number of
+    /// batches — sample the delta between milestones to see where batch time goes.
+    /// Phase A = dedup + value-hash + flush + routing, B = parallel per-record
+    /// work, C = frontier install + fresh keys + root recompute + flush.
+    pub static PHASE_A_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PHASE_B_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PHASE_C_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on_batch(a_ns: u64, b_ns: u64, c_ns: u64) {
+        PHASE_A_NS.fetch_add(a_ns, Relaxed);
+        PHASE_B_NS.fetch_add(b_ns, Relaxed);
+        PHASE_C_NS.fetch_add(c_ns, Relaxed);
+        BATCHES.fetch_add(1, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
@@ -70,6 +86,10 @@ pub mod stats {
         MAX_SPLIT_TRIGGER.store(0, Relaxed);
         SPLIT_LEAVES.store(0, Relaxed);
         SPLIT_LEAF_BYTES.store(0, Relaxed);
+        PHASE_A_NS.store(0, Relaxed);
+        PHASE_B_NS.store(0, Relaxed);
+        PHASE_C_NS.store(0, Relaxed);
+        BATCHES.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -769,6 +789,7 @@ impl FlatMpt {
         if entries.is_empty() {
             return Ok(self.root());
         }
+        let t_a = std::time::Instant::now();
         // Dedup (last write wins) and compute leaf value-hashes; buffer values.
         let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
         for (key, value) in entries {
@@ -797,6 +818,8 @@ impl FlatMpt {
             }
         }
         let groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
+        let a_ns = t_a.elapsed().as_nanos() as u64;
+        let t_b = std::time::Instant::now();
 
         // Phase B (parallel): each group reads its record, applies its keys
         // (record_node_insert + migrate + possible promotion), and produces the
@@ -827,6 +850,9 @@ impl FlatMpt {
             })?
         };
 
+        let b_ns = t_b.elapsed().as_nanos() as u64;
+        let t_c = std::time::Instant::now();
+
         // Phase C (serial): splice each group's result into the frontier, then
         // create structure for the brand-new keys. Recompute the root once.
         for (rep, new_child) in results {
@@ -836,7 +862,9 @@ impl FlatMpt {
             insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash)?;
         }
         self.store.flush()?;
-        Ok(self.root())
+        let root = self.root();
+        stats::on_batch(a_ns, b_ns, t_c.elapsed().as_nanos() as u64);
+        Ok(root)
     }
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {

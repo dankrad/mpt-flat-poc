@@ -130,8 +130,17 @@ fn main() {
         max / 4,
         if batch == 0 { "off".into() } else { batch.to_string() },
     );
+    // With LARGE_PERSIST=1 the DB is built at a fixed, non-temporary path under
+    // $TMPDIR (so the flat file + .values + .meta survive process exit and can be
+    // reopened with FlatMpt::open). Otherwise a NamedTempFile auto-cleans on exit.
+    let persist = std::env::var("LARGE_PERSIST").ok().as_deref() == Some("1");
     let tmp = NamedTempFile::new().unwrap();
-    let mut db = FlatMpt::create(tmp.path(), cfg).unwrap();
+    let db_path = if persist {
+        std::env::temp_dir().join("mpt-checkpoint.flat")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    let mut db = FlatMpt::create(&db_path, cfg).unwrap();
 
     // ---- preload ----
     // Log running stats every PROGRESS_EVERY keys so a long (1B-key) run can be
@@ -146,7 +155,9 @@ fn main() {
     // Previous-milestone split-leaf totals, to report the per-interval average
     // size of leaves freshly created by splitting.
     use std::sync::atomic::Ordering::Relaxed;
-    let (mut prev_split_leaves, mut prev_split_bytes) = (0u64, 0u64);
+    // Previous-milestone insert_batch phase totals (ns) + batch count, to report
+    // the per-interval per-batch wall time in each phase.
+    let (mut prev_a, mut prev_b, mut prev_c, mut prev_nb) = (0u64, 0u64, 0u64, 0u64);
     for i in 0..preload {
         if batch == 0 {
             db.insert(key_at(i), vec![0u8; 32]).unwrap();
@@ -161,25 +172,31 @@ fn main() {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
             let ls = db.leaf_stats();
-            // Split-created leaves in this interval (delta), and their avg size.
-            let sl = mpt_flat_poc::stats::SPLIT_LEAVES.load(Relaxed);
-            let sb = mpt_flat_poc::stats::SPLIT_LEAF_BYTES.load(Relaxed);
-            let d_leaves = sl - prev_split_leaves;
-            let d_bytes = sb - prev_split_bytes;
-            let split_avg = if d_leaves > 0 { d_bytes / d_leaves } else { 0 };
-            prev_split_leaves = sl;
-            prev_split_bytes = sb;
+            // Per-interval insert_batch phase wall-time: A=route, B=parallel, C=install.
+            let pa = mpt_flat_poc::stats::PHASE_A_NS.load(Relaxed);
+            let pb = mpt_flat_poc::stats::PHASE_B_NS.load(Relaxed);
+            let pc = mpt_flat_poc::stats::PHASE_C_NS.load(Relaxed);
+            let nb = mpt_flat_poc::stats::BATCHES.load(Relaxed);
+            let (da, db_ns, dc) = (pa - prev_a, pb - prev_b, pc - prev_c);
+            let dnb = (nb - prev_nb).max(1);
+            let tot = (da + db_ns + dc).max(1);
+            let per = |ns: u64| ns as f64 / 1e6 / dnb as f64; // ms/batch
+            prev_a = pa;
+            prev_b = pb;
+            prev_c = pc;
+            prev_nb = nb;
             println!(
-                "  [{:>4}M] {:>6.0}s | {:.1} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | split: {} new @ {} B | free_reg {} | RAM {:.0} MiB",
+                "  [{:>4}M] {:>6.0}s | {:.1} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | A/B/C {:.1}/{:.1}/{:.1} ms/batch (B={:.0}%) | RAM {:.0} MiB",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
                 db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
                 ls.count,
                 ls.avg_bytes(),
-                d_leaves,
-                split_avg,
-                db.free_regions(),
+                per(da),
+                per(db_ns),
+                per(dc),
+                db_ns as f64 / tot as f64 * 100.0,
                 mib(live),
             );
             std::io::stdout().flush().ok();
@@ -192,6 +209,19 @@ fn main() {
     db.flush().unwrap();
     let elapsed = t.elapsed();
     let heap_after = live_heap();
+
+    // Optional checkpoint: LARGE_PERSIST=1 writes the .meta manifest so the built
+    // database can be reopened with FlatMpt::open (e.g. to time phases at scale
+    // without rebuilding). The flat file persists in $TMPDIR — don't delete it.
+    if persist {
+        let pt = Instant::now();
+        db.persist().unwrap();
+        println!(
+            "  persisted checkpoint to {} in {:.1}s (reopen with FlatMpt::open)",
+            db_path.display(),
+            pt.elapsed().as_secs_f64(),
+        );
+    }
 
     println!(
         "preloaded {preload} keys in {:.2}s  ({:.2} µs/key)",
