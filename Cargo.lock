@@ -570,6 +570,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "criterion",
+ "libc",
  "rand",
  "rocksdb",
  "serde",

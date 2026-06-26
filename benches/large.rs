@@ -12,7 +12,7 @@ use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, prof};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
@@ -51,6 +51,27 @@ static GLOBAL: Counting = Counting;
 
 fn live_heap() -> usize {
     LIVE.load(Ordering::Relaxed)
+}
+
+/// Set by the SIGINT/SIGTERM handler; the preload loop checks it and persists the
+/// database (flushing any buffered batch first) before exiting, so a killed run
+/// leaves a reopenable checkpoint instead of losing the in-RAM frontier.
+/// `kill -9` (SIGKILL) cannot be caught, so it still loses the frontier.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    // Async-signal-safe: only flip a flag; the main thread does the real work.
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // Cast through a fn pointer (not the fn item) to get a valid sighandler_t.
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only performs an atomic store, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -141,6 +162,7 @@ fn main() {
         tmp.path().to_path_buf()
     };
     let mut db = FlatMpt::create(&db_path, cfg).unwrap();
+    install_signal_handlers();
 
     // ---- preload ----
     // Log running stats every PROGRESS_EVERY keys so a long (1B-key) run can be
@@ -159,6 +181,23 @@ fn main() {
     // the per-interval per-batch wall time in each phase.
     let (mut prev_a, mut prev_b, mut prev_c, mut prev_nb) = (0u64, 0u64, 0u64, 0u64);
     for i in 0..preload {
+        // Caught a SIGINT/SIGTERM: flush any buffered batch, persist a reopenable
+        // checkpoint, and exit. (`std::process::exit` skips the NamedTempFile
+        // drop, so even the temp-path flat file survives.)
+        if INTERRUPTED.load(Relaxed) {
+            eprintln!("\n[signal] persisting {i} keys before exit...");
+            if !buf.is_empty() {
+                db.insert_batch(std::mem::take(&mut buf)).unwrap();
+            }
+            db.flush().unwrap();
+            db.persist().unwrap();
+            println!(
+                "persisted {i} keys to {} (reopen with FlatMpt::open)",
+                db_path.display(),
+            );
+            std::io::stdout().flush().ok();
+            std::process::exit(0);
+        }
         if batch == 0 {
             db.insert(key_at(i), vec![0u8; 32]).unwrap();
         } else {

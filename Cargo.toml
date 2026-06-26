@@ -14,6 +14,7 @@ tempfile = "3"
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
+libc = "0.2"
 
 [features]
 # Opt-in wall-clock attribution (hashing vs IO vs serialization vs ...).
