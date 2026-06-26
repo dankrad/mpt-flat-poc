@@ -538,6 +538,16 @@ enum Node {
         value: Option<Hash>,
         hash: Hash,
     },
+    /// A child subtree that lives in its *own* flat-file record rather than
+    /// inline in this one (the "(3) overflow" of the paged-node design). `root`
+    /// is that subtree's Merkle hash — identical to what an inline node's `hash`
+    /// would be — so a branch hashes the same whether a child is inline or
+    /// overflowed. The bytes at `ptr` are themselves a [`DiskSubtree`] record,
+    /// which may recursively contain further `Overflow` children.
+    Overflow {
+        ptr: DiskPtr,
+        root: Hash,
+    },
 }
 
 // A subtree is fully described by its `node`; the flat list of entries it holds
@@ -1317,6 +1327,10 @@ fn node_entries(node: &Node) -> Vec<(Key, Hash)> {
                     walk(child, out);
                 }
             }
+            // Entries inside an overflow record can't be enumerated without a
+            // store read; the splitter sheds children individually rather than
+            // re-fanning, so it never asks for entries across an overflow edge.
+            Node::Overflow { .. } => unreachable!("node_entries crossed an overflow child"),
         }
     }
     let mut out = Vec::new();
@@ -1333,6 +1347,7 @@ fn node_contains(node: &Node, key: &Key) -> bool {
         Node::Branch { children, .. } => {
             children.iter().flatten().any(|c| node_contains(c, key))
         }
+        Node::Overflow { .. } => unreachable!("node_contains crossed an overflow child"),
     }
 }
 
@@ -1484,6 +1499,10 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
             }
             make_branch(children)
         }
+        // Crossing into an overflow record needs a store read+write, which the
+        // pure in-memory `node_insert` can't do — the record-level insert
+        // (Phase 2c) handles overflow edges before recursing here.
+        Node::Overflow { .. } => unreachable!("node_insert crossed an overflow child"),
     };
     *node = updated;
 }
@@ -1564,6 +1583,12 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
                 write_node(out, child)?;
             }
         }
+        Node::Overflow { ptr, root } => {
+            out.push(4);
+            out.extend_from_slice(&ptr.offset.to_le_bytes());
+            out.extend_from_slice(&ptr.len.to_le_bytes());
+            out.extend_from_slice(root);
+        }
     }
     Ok(())
 }
@@ -1618,6 +1643,14 @@ impl<'a> CompactReader<'a> {
     fn read_u16(&mut self) -> Result<u16> {
         let bytes = self.read_bytes(2)?;
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap()))
     }
 
     fn read_hash(&mut self) -> Result<Hash> {
@@ -1675,6 +1708,15 @@ impl<'a> CompactReader<'a> {
                     children,
                     value: None,
                     hash,
+                })
+            }
+            4 => {
+                let offset = self.read_u64()?;
+                let len = self.read_u32()?;
+                let root = self.read_hash()?;
+                Ok(Node::Overflow {
+                    ptr: DiskPtr { offset, len },
+                    root,
                 })
             }
             tag => bail!("invalid compact subtree node tag {tag}"),
@@ -1790,6 +1832,9 @@ fn hash_node(node: &Node) -> Hash {
         Node::Leaf { hash, .. } | Node::Extension { hash, .. } | Node::Branch { hash, .. } => {
             *hash
         }
+        // The overflowed subtree's root is exactly the hash the inline node would
+        // have had — that equivalence is what keeps the root storage-independent.
+        Node::Overflow { root, .. } => *root,
     }
 }
 
@@ -2042,6 +2087,49 @@ mod tests {
         );
         // Sanity: the two really did take different storage paths.
         assert_ne!(a.disk_leaves(), b.disk_leaves());
+    }
+
+    #[test]
+    fn overflow_node_round_trips_and_hashes_as_its_root() {
+        // A branch with one inline leaf child and one Overflow child must:
+        //  (a) survive serialize -> deserialize unchanged, and
+        //  (b) hash identically whether that child is inline or overflowed
+        //      (the Overflow.root equals the inline node's hash).
+        let key = hashed_key("x");
+        let inline_child = make_leaf(key, [9u8; 32]);
+        let inline_hash = hash_node(&inline_child);
+
+        // Build branch B1 with the child inline at slot 3.
+        let mut c1 = empty_box_children();
+        c1[3] = Some(Box::new(inline_child));
+        let branch_inline = make_branch(c1);
+
+        // Build branch B2 with the same child as an Overflow pointer at slot 3.
+        let mut c2 = empty_box_children();
+        c2[3] = Some(Box::new(Node::Overflow {
+            ptr: DiskPtr { offset: 4096, len: 200 },
+            root: inline_hash,
+        }));
+        let branch_overflow = make_branch(c2);
+
+        // (b) Same branch hash regardless of where the child lives.
+        assert_eq!(hash_node(&branch_inline), hash_node(&branch_overflow));
+
+        // (a) Round-trip the overflow-bearing subtree.
+        let sub = DiskSubtree { prefix: vec![1, 2], node: branch_overflow };
+        let (payload, _) = serialize_subtree(&sub).unwrap();
+        let back = deserialize_subtree(&payload[..payload.len()]).unwrap();
+        assert_eq!(hash_node(&back.node), hash_node(&sub.node));
+        match back.node {
+            Node::Branch { children, .. } => match children[3].as_deref() {
+                Some(Node::Overflow { ptr, root }) => {
+                    assert_eq!(*ptr, DiskPtr { offset: 4096, len: 200 });
+                    assert_eq!(*root, inline_hash);
+                }
+                other => panic!("slot 3 not an Overflow: {other:?}"),
+            },
+            other => panic!("not a branch: {other:?}"),
+        }
     }
 
     #[test]
