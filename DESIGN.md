@@ -240,10 +240,22 @@ the (logical) trie. Gates on every phase:
    children (now ~`min_promote`) are written out. Root-preserving. At 200k:
    `ram_nodes` 1 → 273 (= 1+16+256, the complete top 3 levels) ⇒ lookups are RAM
    nav + 1 read. The read-perf half of the boundary.
-3. **Migration tuning + stats.** `overflow_records` / `migrations` stats, read-
-   depth probe; tune `min_promote : max` for the RAM/reads balance.
-4. **Batch + parallel.** Re-integrate `insert_batch` over the overflow-aware path
-   (parallel precompute may *read* overflow records; writes stay serial).
-5. **Scale.** Run `benches/large.rs` through the old cascade points (40M, 560M);
-   confirm `avg_leaf`/`split`/`free_reg`/RAM stay healthy and track the
-   ~150 GB / ~0.5 GB ideal.
+4a. **Hot-path speedup.** ✔ (`7d66a96`) Non-allocating size pass in
+   `migrate_record` (no per-insert throwaway serialization). One-by-one 26 → 18
+   µs/key at 10M.
+4b. **Thread-safe FlatFile + parallel `insert_batch`.** ✔ (`95c04c2`) Free list
+   behind `Mutex`, `end_page` atomic, I/O via shared `&File`. Batch groups keys
+   by frontier leaf and runs each group's insert+migrate+promote on scoped
+   threads (disjoint subtrees), then splices results into the frontier. Verified
+   batch == one-by-one root at 1M; ~3× faster (15.6 → 5.1 µs/key).
+
+**Validated at 50M (one-by-one, 8 KiB):** the cascade is gone — vs the old design
+at the same point, flat 11.3 GiB (was 35.5), RAM 62 MiB (was 541), leaves stay at
+16⁵ and fatten instead of multiplying, `split: 0`, steady-state ops ~2× faster.
+
+5. **Scale (next).** With batch at ~5 µs/key a 1B run is ~1.4 h. Run
+   `benches/large.rs` through the old cascade points and confirm RAM stays bounded
+   (~1 GB predicted at 1B) and reads shallow.
+6. **Cleanup.** Delete the superseded serial machinery (`node_insert`,
+   `node_contains`, `split_subtree`, old batch fns) once Phase 5 confirms the new
+   path; they linger as dead-code warnings today.
