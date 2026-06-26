@@ -18,10 +18,12 @@ use std::{
 const VALUE_BATCH: usize = 256;
 
 /// Flat-file allocation granularity. Records are page-aligned and occupy a whole
-/// number of pages, so each leaf read/write is a single positioned I/O over a
-/// contiguous page-aligned extent, and the free list only ever deals in whole
-/// pages (which collapses the size distribution and curbs fragmentation).
-const PAGE: u64 = 4096;
+/// number of pages, and `write_payload` zero-pads each record to its full page
+/// extent, so every write is a whole, page-aligned device write. 16 KiB matches
+/// this SSD's write indirection unit (and the Apple-Silicon OS page): sub-16 KiB
+/// writes incur a read-modify-write penalty (~47k IOPS) while full 16 KiB-aligned
+/// writes do not (~168k IOPS) — so the page size directly sets the write ceiling.
+const PAGE: u64 = 16384;
 
 pub type Hash = [u8; 32];
 pub type Key = [u8; 32];
@@ -469,9 +471,15 @@ impl FlatFile {
         }
         let page = page as u32;
 
+        // Write the full page extent (payload + zero padding) so the device sees
+        // a whole, aligned write and avoids the sub-page read-modify-write penalty.
+        // Reads still fetch exactly `len` bytes, ignoring the padding.
+        let mut record = vec![0u8; pages as usize * PAGE as usize];
+        record[..payload.len()].copy_from_slice(payload);
+
         let _g = prof::scope(prof::Cat::FileWrite);
         let wt = std::time::Instant::now();
-        (&self.file).write_all_at(payload, page as u64 * PAGE)?;
+        (&self.file).write_all_at(&record, page as u64 * PAGE)?;
         stats::on_pwrite(wt.elapsed().as_nanos() as u64);
         Ok(DiskPtr { page, len: total })
     }
@@ -533,9 +541,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            target_leaf_bytes: 4 * 1024,
-            max_leaf_bytes: 8 * 1024,
-            min_promote_bytes: 2 * 1024,
+            target_leaf_bytes: 8 * 1024,
+            max_leaf_bytes: 16 * 1024,
+            min_promote_bytes: 4 * 1024,
         }
     }
 }
