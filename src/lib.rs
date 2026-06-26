@@ -250,10 +250,25 @@ pub mod prof {
     pub use imp::{ENABLED, Guard, audit_start, audit_take, record, reset, scope, snapshot};
 }
 
+/// A `u32` first-page index (16 TiB of addressable file at 4 KiB pages) plus the
+/// record's exact byte length — eight bytes instead of the twelve a `{u64, u32}`
+/// byte offset would take. It appears per frontier leaf (RAM) and per overflow
+/// child (disk), so the four bytes matter at scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskPtr {
-    pub offset: u64,
+    pub page: u32,
     pub len: u32,
+}
+
+impl DiskPtr {
+    /// Byte offset of the record in the flat file.
+    fn offset(&self) -> u64 {
+        self.page as u64 * PAGE
+    }
+    /// Whole pages the record occupies.
+    fn pages(&self) -> u32 {
+        pages_for(self.len)
+    }
 }
 
 /// Tracks reclaimed regions of the flat file so new records can be placed into
@@ -394,11 +409,14 @@ impl FlatFile {
             Some(page) => page,
             None => self.end_page.fetch_add(pages as u64, Ordering::SeqCst),
         };
-        let offset = page * PAGE;
+        if page > u32::MAX as u64 {
+            bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
+        }
+        let page = page as u32;
 
         let _g = prof::scope(prof::Cat::FileWrite);
-        (&self.file).write_all_at(payload, offset)?;
-        Ok(DiskPtr { offset, len: total })
+        (&self.file).write_all_at(payload, page as u64 * PAGE)?;
+        Ok(DiskPtr { page, len: total })
     }
 
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
@@ -409,7 +427,7 @@ impl FlatFile {
         self.free
             .lock()
             .unwrap()
-            .free(ptr.offset / PAGE, pages_for(ptr.len));
+            .free(ptr.page as u64, ptr.pages());
     }
 
     fn end_page(&self) -> u64 {
@@ -437,7 +455,7 @@ fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
     let mut record = vec![0u8; ptr.len as usize];
     {
         let _g = prof::scope(prof::Cat::FileRead);
-        file.read_exact_at(&mut record, ptr.offset)?;
+        file.read_exact_at(&mut record, ptr.offset())?;
     }
     let _g = prof::scope(prof::Cat::Deserialize);
     deserialize_subtree(&record)
@@ -764,13 +782,13 @@ impl FlatMpt {
         // Phase A (serial, read-only): route each key to the frontier disk leaf
         // it lands in, grouping keys per leaf. Keys with no existing leaf create
         // fresh structure and are applied serially afterwards.
-        let mut groups: HashMap<u64, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
+        let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
         let mut fresh: Vec<(Key, Hash)> = Vec::new();
         for (key, value_hash) in leaves {
             match find_disk_ptr_key(&self.upper, &key, 0) {
                 Some(ptr) => {
                     groups
-                        .entry(ptr.offset)
+                        .entry(ptr.page)
                         .or_insert_with(|| (ptr, key, Vec::new()))
                         .2
                         .push((key, value_hash));
@@ -1613,7 +1631,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
         }
         Node::Overflow { ptr, root } => {
             out.push(4);
-            out.extend_from_slice(&ptr.offset.to_le_bytes());
+            out.extend_from_slice(&ptr.page.to_le_bytes());
             out.extend_from_slice(&ptr.len.to_le_bytes());
             out.extend_from_slice(root);
         }
@@ -1677,10 +1695,6 @@ impl<'a> CompactReader<'a> {
         Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
     }
 
-    fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap()))
-    }
-
     fn read_hash(&mut self) -> Result<Hash> {
         let bytes = self.read_bytes(32)?;
         let mut hash = [0; 32];
@@ -1730,11 +1744,11 @@ impl<'a> CompactReader<'a> {
                 Ok(Node::Branch { children, hash })
             }
             4 => {
-                let offset = self.read_u64()?;
+                let page = self.read_u32()?;
                 let len = self.read_u32()?;
                 let root = self.read_hash()?;
                 Ok(Node::Overflow {
-                    ptr: DiskPtr { offset, len },
+                    ptr: DiskPtr { page, len },
                     root,
                 })
             }
@@ -2113,7 +2127,7 @@ mod tests {
         // Build branch B2 with the same child as an Overflow pointer at slot 3.
         let mut c2 = empty_box_children();
         c2[3] = Some(Box::new(Node::Overflow {
-            ptr: DiskPtr { offset: 4096, len: 200 },
+            ptr: DiskPtr { page: 1, len: 200 },
             root: inline_hash,
         }));
         let branch_overflow = make_branch(c2);
@@ -2129,7 +2143,7 @@ mod tests {
         match back.node {
             Node::Branch { children, .. } => match children[3].as_deref() {
                 Some(Node::Overflow { ptr, root }) => {
-                    assert_eq!(*ptr, DiskPtr { offset: 4096, len: 200 });
+                    assert_eq!(*ptr, DiskPtr { page: 1, len: 200 });
                     assert_eq!(*root, inline_hash);
                 }
                 other => panic!("slot 3 not an Overflow: {other:?}"),
