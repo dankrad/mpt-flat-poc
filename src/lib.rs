@@ -493,6 +493,40 @@ impl FlatFile {
         Ok(DiskPtr { page, len: total })
     }
 
+    /// Prototype: write several records as ONE contiguous appended `pwrite` (no
+    /// free-list reuse — the file grows). Returns a `DiskPtr` per payload. Lets
+    /// the batch path coalesce 4-8 leaf writes into one larger sequential write.
+    fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let page_counts: Vec<u32> = payloads.iter().map(|p| pages_for(p.len() as u32)).collect();
+        let total: u64 = page_counts.iter().map(|&c| c as u64).sum();
+        let page_start = self.end_page.fetch_add(total, Ordering::SeqCst);
+        if page_start + total > u32::MAX as u64 {
+            bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
+        }
+        let mut buf = vec![0u8; total as usize * PAGE as usize];
+        let mut ptrs = Vec::with_capacity(payloads.len());
+        let mut page = page_start;
+        let mut off = 0usize;
+        for (p, &pc) in payloads.iter().zip(&page_counts) {
+            buf[off..off + p.len()].copy_from_slice(p);
+            ptrs.push(DiskPtr {
+                page: page as u32,
+                len: p.len() as u32,
+            });
+            stats::on_write(p.len());
+            page += pc as u64;
+            off += pc as usize * PAGE as usize;
+        }
+        let _g = prof::scope(prof::Cat::FileWrite);
+        let wt = std::time::Instant::now();
+        (&self.file).write_all_at(&buf, page_start * PAGE)?;
+        stats::on_pwrite(wt.elapsed().as_nanos() as u64);
+        Ok(ptrs)
+    }
+
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
         read_record(&self.file, ptr)
     }
@@ -908,11 +942,9 @@ impl FlatMpt {
         // replacement RamChild — all the per-record CPU + I/O off the serial path.
         // Groups touch disjoint subtrees; the store is thread-safe.
         let store = &self.store;
-        let work = |(ptr, rep, keys): &(DiskPtr, Key, Vec<(Key, Hash)>)| {
-            Ok::<_, anyhow::Error>((*rep, process_group(store, &cfg, *ptr, keys)?))
-        };
+        let batched = batched_writes();
         let results: Vec<(Key, RamChild)> = if groups.len() < 64 {
-            groups.iter().map(work).collect::<Result<_>>()?
+            process_chunk(store, &cfg, &groups, batched)?
         } else {
             let threads = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -922,7 +954,7 @@ impl FlatMpt {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = groups
                     .chunks(chunk)
-                    .map(|c| scope.spawn(|| c.iter().map(work).collect::<Result<Vec<_>>>()))
+                    .map(|c| scope.spawn(|| process_chunk(store, &cfg, c, batched)))
                     .collect();
                 let mut out = Vec::with_capacity(groups.len());
                 for h in handles {
@@ -1606,16 +1638,36 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
     }
 }
 
-/// Apply a whole group of keys (all routing to the disk record at `ptr`) and
-/// produce the replacement `RamChild` for that frontier slot. Pure w.r.t. the
-/// frontier — it only reads/writes the (disjoint) record subtree via the
-/// thread-safe `store`, so groups for different frontier leaves run concurrently.
+/// Outcome of applying a group's keys, before the new leaf record is written.
+enum GroupOut {
+    /// The record was promoted into a RAM frontier branch (no deferred write).
+    Promoted(RamChild),
+    /// The rewritten leaf record's payload + its root, to be written by the caller
+    /// (in place, or coalesced into a batched contiguous append).
+    Leaf { payload: Vec<u8>, root: Hash },
+}
+
+/// Coalesce this many leaf writes into one contiguous appended `pwrite` (the
+/// "batch 4-8 leaves" prototype).
+const BATCH_LEAVES: usize = 8;
+
+/// Whether to use the append-batched write path (prototype; `MPT_BATCHED_WRITES=1`).
+fn batched_writes() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() == Some("1"))
+}
+
+/// Apply a whole group of keys (all routing to the disk record at `ptr`), free
+/// the old record, and return the outcome — *without* writing the new leaf (the
+/// caller writes it, in place or batched). Reads/writes only the disjoint record
+/// subtree via the thread-safe `store`, so groups run concurrently.
 fn process_group(
     store: &FlatFile,
     cfg: &Config,
     ptr: DiskPtr,
     keys: &[(Key, Hash)],
-) -> Result<RamChild> {
+) -> Result<GroupOut> {
     let t = std::time::Instant::now();
     let mut subtree = store.read_lazy(ptr)?;
     let read_ns = t.elapsed().as_nanos() as u64;
@@ -1631,20 +1683,69 @@ fn process_group(
     migrate_record(store, cfg, &mut subtree)?;
     let out = if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
         store.free(ptr);
-        promote_record_to_ram(store, subtree)
+        GroupOut::Promoted(promote_record_to_ram(store, subtree)?)
     } else {
         let st = std::time::Instant::now();
         let (payload, _) = serialize_subtree(&subtree)?;
         stats::on_serialize(st.elapsed().as_nanos() as u64);
         store.free(ptr);
-        let new_ptr = store.write_payload(&payload)?;
-        Ok(RamChild::Disk {
-            ptr: new_ptr,
+        GroupOut::Leaf {
+            payload,
             root: hash_node(&subtree.node),
-        })
+        }
     };
     stats::on_group(read_ns, rebuild_ns, t.elapsed().as_nanos() as u64);
-    out
+    Ok(out)
+}
+
+/// Process a chunk of groups, returning the replacement `(rep_key, RamChild)` for
+/// each. With `batched`, leaf writes are coalesced into contiguous appended
+/// batches of `BATCH_LEAVES` (one `pwrite` per batch); otherwise each is written
+/// in place (reusing freed space).
+fn process_chunk(
+    store: &FlatFile,
+    cfg: &Config,
+    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    batched: bool,
+) -> Result<Vec<(Key, RamChild)>> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut pending: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+    for (ptr, rep, keys) in chunk {
+        match process_group(store, cfg, *ptr, keys)? {
+            GroupOut::Promoted(rc) => out.push((*rep, rc)),
+            GroupOut::Leaf { payload, root } if batched => {
+                pending.push((*rep, root, payload));
+                if pending.len() >= BATCH_LEAVES {
+                    flush_leaf_batch(store, &mut pending, &mut out)?;
+                }
+            }
+            GroupOut::Leaf { payload, root } => {
+                let new_ptr = store.write_payload(&payload)?;
+                out.push((*rep, RamChild::Disk { ptr: new_ptr, root }));
+            }
+        }
+    }
+    flush_leaf_batch(store, &mut pending, &mut out)?;
+    Ok(out)
+}
+
+/// Write all pending leaf payloads as one contiguous appended record batch.
+fn flush_leaf_batch(
+    store: &FlatFile,
+    pending: &mut Vec<(Key, Hash, Vec<u8>)>,
+    out: &mut Vec<(Key, RamChild)>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let ptrs = {
+        let payloads: Vec<&[u8]> = pending.iter().map(|(_, _, p)| p.as_slice()).collect();
+        store.write_batch(&payloads)?
+    };
+    for ((rep, root, _), ptr) in pending.drain(..).zip(ptrs) {
+        out.push((rep, RamChild::Disk { ptr, root }));
+    }
+    Ok(())
 }
 
 /// Splice a batch result into the frontier: navigate `key`'s route to the
