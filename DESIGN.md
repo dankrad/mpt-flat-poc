@@ -27,8 +27,17 @@ The byte-granular variant avoids padding but fragments the free list
 kill the cascade and the padding swarm, while keeping ~1 read per lookup and
 the same Merkle root as the canonical radix-16 MPT.
 
-**Non-goals:** changing the trie itself (root must stay bit-identical),
+**Non-goals:** changing the *logical* trie (the radix-16 structure is fixed),
 changing the value store (RocksDB unchanged), unbounded-RAM full-index designs.
+
+> **Phase 2a finding (done, `c05d971`).** The root was *not* storage-independent:
+> RAM and disk hashed the same node type with different domain tags (ext 1 vs 4,
+> branch 2 vs 5), so the root secretly depended on `max_leaf_bytes` / where the
+> RAM–disk boundary fell. Since the paged design *moves* that boundary, the tags
+> were unified (ext=4, branch=5 everywhere) so the root is a pure function of the
+> key set — order-, config-, and layout-independent. This **changes the absolute
+> root vs `ram-optimization`** (different tags); both stay internally consistent.
+> Locked in by `root_is_independent_of_leaf_size`.
 
 ## 3. The unit: a *page node* record
 
@@ -173,12 +182,15 @@ a record's header branch hash == the root digest cached for it in RAM/manifest.
 
 ## 10. Correctness strategy
 
-The Merkle root must equal the canonical radix-16 MPT root — storage layout does
-not change the trie. Gates on every phase:
+The root must be a pure function of the key set — storage layout does not change
+the (logical) trie. Gates on every phase:
 - `examples/batchcheck.rs`: batch == one-by-one (root + ideally flat size).
-- **Cross-design check:** paged-nodes root == `ram-optimization` root for the
-  same key set at several N. (Add a small example that prints the root so the two
-  branches can be diffed.)
+- `root_is_independent_of_leaf_size` (lib test): same keys, very different
+  `max_leaf_bytes`, identical root. This is the real layout-independence check —
+  it moves the boundary the most. (Supersedes the earlier "== `ram-optimization`
+  root" idea, which no longer holds after the 2a tag unification.)
+- For overflow specifically: an **all-inline build == a build that forces
+  overflow** (tiny `min_promote`) must give the same root.
 
 ## 11. Phased plan
 
