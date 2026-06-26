@@ -9,6 +9,7 @@ use std::{
     io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::Mutex,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -505,7 +506,9 @@ impl FlatFile {
             (&self.file).read_exact_at(&mut record, ptr.offset())?;
         }
         let _g = prof::scope(prof::Cat::Deserialize);
-        deserialize_subtree_lazy(&record)
+        // `Arc::from(Vec)` reuses the allocation (no copy); Raw children then
+        // share it as zero-copy slices.
+        deserialize_subtree_lazy(Arc::from(record))
     }
 
     fn free(&self, ptr: DiskPtr) {
@@ -573,7 +576,10 @@ impl Default for Config {
 // hashes on the path it actually changed (see `node_insert`), instead of
 // re-hashing the whole subtree. All keys are full 64-nibble paths, so leaves
 // only ever sit at depth 64 and branches never carry a value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Not serde-serialized: the flat-file format is the custom `write_node`/lazy
+// reader, and the manifest stores `RamNode`. (Raw holds an `Arc`, which serde
+// wouldn't derive anyway.)
+#[derive(Debug, Clone)]
 enum Node {
     Empty,
     Leaf {
@@ -603,20 +609,20 @@ enum Node {
         ptr: DiskPtr,
         root: Hash,
     },
-    /// A still-serialized child subtree: its exact `write_node` bytes plus its
-    /// root `hash`. Produced by the *lazy* reader so that, to change one key, we
-    /// only parse the nodes on that key's path — untouched sibling subtrees stay
-    /// `Raw` and are written back verbatim, avoiding rebuilding the whole leaf's
-    /// node tree per insert. Expanded one level on demand by `record_node_insert`.
+    /// A still-serialized child subtree: a zero-copy `[off, off+len)` slice of the
+    /// shared record buffer plus its root `hash`. Produced by the *lazy* reader so
+    /// that, to change one key, we only parse the nodes on that key's path —
+    /// untouched sibling subtrees stay `Raw` (no byte copy on read) and are written
+    /// back verbatim. Expanded one level on demand by `record_node_insert`.
     Raw {
-        bytes: Vec<u8>,
+        buf: Arc<[u8]>,
+        off: usize,
+        len: usize,
         hash: Hash,
     },
 }
 
-// A subtree is fully described by its `node`; the flat list of entries it holds
-// is derived on demand (`node_entries`) when a split needs to regroup them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct DiskSubtree {
     prefix: Vec<u8>,
     node: Node,
@@ -1347,8 +1353,8 @@ fn record_node_insert(
 ) -> Result<()> {
     // Expand a lazily-unparsed subtree one level before navigating into it
     // (children become `Raw` again, so deeper untouched subtrees stay unparsed).
-    if let Node::Raw { bytes, .. } = node {
-        *node = parse_node_lazy(bytes)?;
+    if let Node::Raw { buf, off, len, .. } = node {
+        *node = parse_node_lazy(buf, *off, *len)?;
     }
     let nibbles = key_nibbles(&key);
     let lh = leaf_hash(key, value_hash);
@@ -1687,7 +1693,7 @@ fn node_size(node: &Node) -> usize {
         }
         Node::Overflow { .. } => 1 + 4 + 4 + 32,
         // Raw is already serialized — its byte length is its on-disk size.
-        Node::Raw { bytes, .. } => bytes.len(),
+        Node::Raw { len, .. } => *len,
     }
 }
 
@@ -1761,7 +1767,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
             out.extend_from_slice(root);
         }
         // A Raw subtree is already its own `write_node` bytes — emit verbatim.
-        Node::Raw { bytes, .. } => out.extend_from_slice(bytes),
+        Node::Raw { buf, off, len, .. } => out.extend_from_slice(&buf[*off..*off + *len]),
     }
     Ok(())
 }
@@ -1883,29 +1889,89 @@ impl<'a> CompactReader<'a> {
         }
     }
 
+}
+
+/// Lazy reader over a shared `Arc<[u8]>` record buffer. Positions are absolute
+/// offsets into the buffer, so `Raw` children are zero-copy `(buf, off, len)`
+/// slices — no per-sibling byte copy on read.
+struct LazyReader {
+    buf: Arc<[u8]>,
+    pos: usize,
+}
+
+impl LazyReader {
+    fn new(buf: Arc<[u8]>) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn at(buf: Arc<[u8]>, pos: usize) -> Self {
+        Self { buf, pos }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8]> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("compact subtree offset overflow"))?;
+        if end > self.buf.len() {
+            bail!("truncated compact subtree record");
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
     fn peek_u8(&self) -> Result<u8> {
-        self.bytes
+        self.buf
             .get(self.pos)
             .copied()
             .ok_or_else(|| anyhow!("truncated compact subtree record"))
     }
+    fn u16(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn hash(&mut self) -> Result<Hash> {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(self.take(32)?);
+        Ok(h)
+    }
+    fn nibble_path(&mut self) -> Result<Vec<u8>> {
+        let len = self.u8()? as usize;
+        if len > 64 {
+            bail!("compact subtree nibble path too long");
+        }
+        let mut path = Vec::with_capacity(len);
+        for _ in 0..len.div_ceil(2) {
+            let byte = self.u8()?;
+            path.push(byte >> 4);
+            if path.len() < len {
+                path.push(byte & 0x0f);
+            }
+        }
+        Ok(path)
+    }
 
-    /// Advance past one full node without allocating (to locate child boundaries).
+    /// Advance past one full node (to locate a child's byte boundary).
     fn skip_node(&mut self) -> Result<()> {
-        match self.read_u8()? {
+        match self.u8()? {
             0 => {}
             1 => {
-                let _ = self.read_nibble_path()?;
-                let _ = self.read_bytes(32)?;
+                let _ = self.nibble_path()?;
+                let _ = self.take(32)?;
             }
             2 => {
-                let _ = self.read_nibble_path()?;
-                let _ = self.read_bytes(32)?;
+                let _ = self.nibble_path()?;
+                let _ = self.take(32)?;
                 self.skip_node()?;
             }
             3 => {
-                let bitmap = self.read_u16()?;
-                let _ = self.read_bytes(32)?;
+                let bitmap = self.u16()?;
+                let _ = self.take(32)?;
                 for i in 0..16 {
                     if bitmap & (1 << i) != 0 {
                         self.skip_node()?;
@@ -1913,7 +1979,7 @@ impl<'a> CompactReader<'a> {
                 }
             }
             4 => {
-                let _ = self.read_bytes(4 + 4 + 32)?;
+                let _ = self.take(4 + 4 + 32)?;
             }
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
@@ -1921,22 +1987,22 @@ impl<'a> CompactReader<'a> {
     }
 
     /// Skip one node, returning its root hash (the hash field after the header).
-    fn peek_hash_and_skip(&mut self) -> Result<Hash> {
-        match self.read_u8()? {
+    fn hash_and_skip(&mut self) -> Result<Hash> {
+        match self.u8()? {
             0 => Ok(empty_hash()),
             1 => {
-                let _ = self.read_nibble_path()?;
-                self.read_hash()
+                let _ = self.nibble_path()?;
+                self.hash()
             }
             2 => {
-                let _ = self.read_nibble_path()?;
-                let h = self.read_hash()?;
+                let _ = self.nibble_path()?;
+                let h = self.hash()?;
                 self.skip_node()?;
                 Ok(h)
             }
             3 => {
-                let bitmap = self.read_u16()?;
-                let h = self.read_hash()?;
+                let bitmap = self.u16()?;
+                let h = self.hash()?;
                 for i in 0..16 {
                     if bitmap & (1 << i) != 0 {
                         self.skip_node()?;
@@ -1945,44 +2011,43 @@ impl<'a> CompactReader<'a> {
                 Ok(h)
             }
             4 => {
-                let _ = self.read_bytes(4 + 4)?;
-                self.read_hash()
+                let _ = self.take(4 + 4)?;
+                self.hash()
             }
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
     }
 
-    /// Parse the node's spine (this node, any extension chain, and the branch
-    /// beneath) but leave the branch's child *subtrees* as `Raw`.
-    fn read_node_lazy(&mut self) -> Result<Node> {
-        match self.read_u8()? {
+    /// Parse this node and its extension/branch spine; branch child subtrees stay `Raw`.
+    fn node(&mut self) -> Result<Node> {
+        match self.u8()? {
             0 => Ok(Node::Empty),
             1 => {
-                let path = self.read_nibble_path()?;
-                let hash = self.read_hash()?;
+                let path = self.nibble_path()?;
+                let hash = self.hash()?;
                 Ok(Node::Leaf { path, hash })
             }
             2 => {
-                let path = self.read_nibble_path()?;
-                let hash = self.read_hash()?;
-                let child = Box::new(self.read_node_lazy()?);
+                let path = self.nibble_path()?;
+                let hash = self.hash()?;
+                let child = Box::new(self.node()?);
                 Ok(Node::Extension { path, child, hash })
             }
             3 => {
-                let bitmap = self.read_u16()?;
-                let hash = self.read_hash()?;
+                let bitmap = self.u16()?;
+                let hash = self.hash()?;
                 let mut children = empty_box_children();
                 for (idx, slot) in children.iter_mut().enumerate() {
                     if bitmap & (1 << idx) != 0 {
-                        *slot = Some(Box::new(self.read_child_lazy()?));
+                        *slot = Some(Box::new(self.child()?));
                     }
                 }
                 Ok(Node::Branch { children, hash })
             }
             4 => {
-                let page = self.read_u32()?;
-                let len = self.read_u32()?;
-                let root = self.read_hash()?;
+                let page = self.u32()?;
+                let len = self.u32()?;
+                let root = self.hash()?;
                 Ok(Node::Overflow {
                     ptr: DiskPtr { page, len },
                     root,
@@ -1992,41 +2057,45 @@ impl<'a> CompactReader<'a> {
         }
     }
 
-    /// A branch child: extension/branch subtrees become `Raw` (skipped, not
-    /// parsed); small terminal nodes (leaf/overflow/empty) are parsed fully so the
-    /// existing matches (overflow detection, leaf overwrite) see them directly.
-    fn read_child_lazy(&mut self) -> Result<Node> {
+    /// A branch child: extension/branch subtrees become a zero-copy `Raw`; small
+    /// terminal nodes (leaf/overflow/empty) are parsed fully so the existing
+    /// matches (overflow detection, leaf overwrite) see them directly.
+    fn child(&mut self) -> Result<Node> {
         match self.peek_u8()? {
             2 | 3 => {
-                let start = self.pos;
-                let hash = self.peek_hash_and_skip()?;
+                let off = self.pos;
+                let hash = self.hash_and_skip()?;
                 Ok(Node::Raw {
-                    bytes: self.bytes[start..self.pos].to_vec(),
+                    buf: self.buf.clone(),
+                    off,
+                    len: self.pos - off,
                     hash,
                 })
             }
-            _ => self.read_node_lazy(),
+            _ => self.node(),
         }
     }
 }
 
-/// Parse one node from its serialized bytes, lazily (children left `Raw`).
-fn parse_node_lazy(bytes: &[u8]) -> Result<Node> {
-    let mut reader = CompactReader::new(bytes);
-    let node = reader.read_node_lazy()?;
-    if !reader.is_finished() {
+/// Expand a `Raw` one level: parse the node at `buf[off..off+len]`, leaving its
+/// children `Raw` over the same shared buffer.
+fn parse_node_lazy(buf: &Arc<[u8]>, off: usize, len: usize) -> Result<Node> {
+    let mut r = LazyReader::at(buf.clone(), off);
+    let node = r.node()?;
+    if r.pos != off + len {
         bail!("trailing bytes in raw node");
     }
     Ok(node)
 }
 
 /// Like [`deserialize_subtree`], but only parses the spine down to the top
-/// branch; child subtrees stay `Raw` until navigation expands them.
-fn deserialize_subtree_lazy(payload: &[u8]) -> Result<DiskSubtree> {
-    let mut reader = CompactReader::new(payload);
-    let prefix = reader.read_nibble_path()?;
-    let node = reader.read_node_lazy()?;
-    if !reader.is_finished() {
+/// branch; child subtrees stay `Raw` (zero-copy slices of the record buffer).
+fn deserialize_subtree_lazy(buf: Arc<[u8]>) -> Result<DiskSubtree> {
+    let end = buf.len();
+    let mut r = LazyReader::new(buf);
+    let prefix = r.nibble_path()?;
+    let node = r.node()?;
+    if r.pos != end {
         bail!("trailing bytes in flat-file record");
     }
     Ok(DiskSubtree { prefix, node })
