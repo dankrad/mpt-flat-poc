@@ -838,6 +838,16 @@ impl FlatMpt {
         count_disk_leaves(&self.upper)
     }
 
+    /// Size summary of the live disk leaves, from their `DiskPtr`s (RAM-only, no
+    /// reads): count, total record bytes, and a page-count histogram. Average
+    /// leaf size = `total_bytes / count` — it collapses when a split cascade
+    /// replaces full leaves with swarms of near-empty ones.
+    pub fn leaf_stats(&self) -> LeafStats {
+        let mut stats = LeafStats::default();
+        collect_leaf_stats(&self.upper, &mut stats);
+        stats
+    }
+
     /// Logical size of the flat file (high-water mark). Stays flat across
     /// rewrites when freed space is reused.
     pub fn flat_file_len(&self) -> u64 {
@@ -1824,6 +1834,45 @@ fn empty_children() -> [Option<RamChild>; 16] {
 
 fn empty_box_children() -> [Option<Box<Node>>; 16] {
     std::array::from_fn(|_| None)
+}
+
+/// Size summary of the live disk leaves (see [`FlatMpt::leaf_stats`]).
+#[derive(Debug, Default, Clone)]
+pub struct LeafStats {
+    pub count: usize,
+    pub total_bytes: u64,
+    /// Histogram by page count: index `p` (1..=8, 8 = "8 or more") -> #leaves.
+    pub page_hist: [u64; 9],
+}
+
+impl LeafStats {
+    pub fn avg_bytes(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.total_bytes / self.count as u64
+        }
+    }
+}
+
+fn collect_leaf_stats(node: &RamNode, stats: &mut LeafStats) {
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { child, .. } => collect_leaf_stats(child, stats),
+        RamNode::Branch { children, .. } => {
+            for child in children.iter().flatten() {
+                match child {
+                    RamChild::Disk { ptr, .. } => {
+                        stats.count += 1;
+                        stats.total_bytes += ptr.len as u64;
+                        let pages = ((ptr.len as u64).div_ceil(PAGE).max(1)).min(8) as usize;
+                        stats.page_hist[pages] += 1;
+                    }
+                    RamChild::Ram(n) => collect_leaf_stats(n, stats),
+                }
+            }
+        }
+    }
 }
 
 fn count_disk_leaves(node: &RamNode) -> usize {

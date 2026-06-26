@@ -156,15 +156,16 @@ fn main() {
         if done % PROGRESS_EVERY == 0 && done < preload {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
+            let ls = db.leaf_stats();
             println!(
-                "  [{:>4}M] {:>6.0}s | {:.2} µs/key | flat {:.1} GiB | leaves {} | free_reg {} | writes {} | RAM {:.1} MiB",
+                "  [{:>4}M] {:>6.0}s | {:.2} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | free_reg {} | RAM {:.1} MiB",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
                 db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
-                db.disk_leaves(),
+                ls.count,
+                ls.avg_bytes(),
                 db.free_regions(),
-                mpt_flat_poc::stats::WRITES.load(std::sync::atomic::Ordering::Relaxed),
                 mib(live),
             );
             std::io::stdout().flush().ok();
@@ -188,6 +189,22 @@ fn main() {
         db.flat_file_len() as f64 / 1_048_576.0,
         db.free_regions(),
         db.free_bytes() as f64 / 1_048_576.0,
+    );
+    let ls = db.leaf_stats();
+    println!(
+        "  leaves: {} (avg {} B = {:.1} keys/leaf), live {:.1} MiB vs flat {:.1} MiB",
+        ls.count,
+        ls.avg_bytes(),
+        preload as f64 / ls.count.max(1) as f64,
+        ls.total_bytes as f64 / 1_048_576.0,
+        db.flat_file_len() as f64 / 1_048_576.0,
+    );
+    println!(
+        "  leaf pages: {}",
+        (1..=8)
+            .map(|p| format!("{p}p={}", ls.page_hist[p]))
+            .collect::<Vec<_>>()
+            .join(" "),
     );
 
     // In-RAM index footprint: ground truth (live heap delta) + structural breakdown.
