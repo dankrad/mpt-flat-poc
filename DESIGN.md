@@ -101,13 +101,35 @@ Per-record budget, mapped onto the existing `Config`:
 | `target_leaf_bytes` | migrate inline children to overflow until back under this   |
 | `min_promote_bytes` | a child must be ≥ this to earn its *own* overflow record    |
 
-Rules:
-- **Inline → Overflow:** when a record exceeds `max`, repeatedly move its
-  **largest inline child** (that is ≥ `min_promote`) into a new overflow record
-  and flip its locator, until the record is ≤ `target`.
-- **`min_promote` kills the padding swarm:** children below it are *never* given
-  their own record — they stay packed in (2). So we never mint ~555 B records;
-  only sizeable subtrees (≥ `min_promote`) get their own page (low padding).
+Two distinct triggers (do **not** conflate them):
+
+- **Proactive promotion — gated by `min_promote`.** When an inline child *grows*
+  to ≥ `min_promote`, give it its own overflow record promptly, even if the
+  record isn't full. These are the common, low-padding promotions (the child is
+  already sizeable, so its page is well-filled). Children below `min_promote`
+  stay packed in (2) — this is what avoids minting ~555 B records.
+
+- **Forced shedding — ignores `min_promote`.** If a record still exceeds `max`
+  (only happens when it's packed with many *sub-`min_promote`* children), it
+  **must** shed: promote the **largest** child, then the next largest, until the
+  record is ≤ `target`. `min_promote` does *not* gate this — progress is
+  mandatory, so a full record is never stuck.
+
+  *Why this is safe (it was the obvious deadlock):*
+  - **Converges:** each forced promotion removes one child; header is bounded
+    (~700 B). Worst case, all 16 promote and the record becomes a *bare 16-way
+    branch header* (≤ `target`) — a normal MPT branch over 16 child records.
+  - **No swarm:** one child at a time, not 16-at-once — incremental, not a
+    synchronized cascade.
+  - **Transient padding amortizes:** a forced-promoted child starts ~`max/16`
+    but under uniform load grows toward `max` before *it* sheds, so a record
+    averages ~1 full page over its life. Padding is only on young records.
+  - **Skew** (all data under one nibble) pushes data down a level; hashed/uniform
+    keys diverge within a few nibbles, and key length (64 nibbles) + extension
+    compression bound the chain.
+
+So `min_promote` is a *preference* for voluntary promotion, not a hard floor that
+can block a full record.
 - **Depth comes from overflow chains, not header splits.** The header branch is
   always 16-way; a child that keeps growing becomes its own page node with its
   own (1)/(2)/(3), recursively. No 16-at-once cascade — migration is incremental
