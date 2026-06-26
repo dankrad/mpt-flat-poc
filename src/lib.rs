@@ -1790,7 +1790,9 @@ fn node_size(node: &Node) -> usize {
             1 + (1 + path.len().div_ceil(2)) + 32 + node_size(child)
         }
         Node::Branch { children, .. } => {
-            1 + 2 + 32 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
+            // tag + bitmap + hash + child-length table (u32 per present child) + children.
+            let n = children.iter().flatten().count();
+            1 + 2 + 32 + n * 4 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
         }
         Node::Overflow { .. } => 1 + 4 + 4 + 32,
         // Raw is already serialized — its byte length is its on-disk size.
@@ -1857,8 +1859,21 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
             }
             out.extend_from_slice(&bitmap.to_le_bytes());
             out.extend_from_slice(hash);
+            // Child-length table: a u32 per present child, so a reader can jump to
+            // child `i` by summing lengths 0..i instead of scanning siblings. Not
+            // hashed (the branch hash is over the child digests), so it doesn't
+            // affect the root. Reserve the slots, then backfill from the serialized
+            // lengths as each child is written.
+            let n = bitmap.count_ones() as usize;
+            let table_pos = out.len();
+            out.resize(table_pos + n * 4, 0);
+            let mut ti = 0;
             for child in children.iter().flatten() {
+                let start = out.len();
                 write_node(out, child)?;
+                let len = (out.len() - start) as u32;
+                out[table_pos + ti * 4..table_pos + ti * 4 + 4].copy_from_slice(&len.to_le_bytes());
+                ti += 1;
             }
         }
         Node::Overflow { ptr, root } => {
@@ -1969,6 +1984,10 @@ impl<'a> CompactReader<'a> {
             3 => {
                 let bitmap = self.read_u16()?;
                 let hash = self.read_hash()?;
+                // Skip the child-length table; the full parse reads children
+                // sequentially and doesn't need it.
+                let n = bitmap.count_ones() as usize;
+                let _ = self.read_bytes(n * 4)?;
                 let mut children = empty_box_children();
                 for (idx, slot) in children.iter_mut().enumerate() {
                     if bitmap & (1 << idx) != 0 {
@@ -2057,69 +2076,8 @@ impl LazyReader {
         Ok(path)
     }
 
-    /// Advance past one full node (to locate a child's byte boundary).
-    fn skip_node(&mut self) -> Result<()> {
-        match self.u8()? {
-            0 => {}
-            1 => {
-                let _ = self.nibble_path()?;
-                let _ = self.take(32)?;
-            }
-            2 => {
-                let _ = self.nibble_path()?;
-                let _ = self.take(32)?;
-                self.skip_node()?;
-            }
-            3 => {
-                let bitmap = self.u16()?;
-                let _ = self.take(32)?;
-                for i in 0..16 {
-                    if bitmap & (1 << i) != 0 {
-                        self.skip_node()?;
-                    }
-                }
-            }
-            4 => {
-                let _ = self.take(4 + 4 + 32)?;
-            }
-            tag => bail!("invalid compact subtree node tag {tag}"),
-        }
-        Ok(())
-    }
-
-    /// Skip one node, returning its root hash (the hash field after the header).
-    fn hash_and_skip(&mut self) -> Result<Hash> {
-        match self.u8()? {
-            0 => Ok(empty_hash()),
-            1 => {
-                let _ = self.nibble_path()?;
-                self.hash()
-            }
-            2 => {
-                let _ = self.nibble_path()?;
-                let h = self.hash()?;
-                self.skip_node()?;
-                Ok(h)
-            }
-            3 => {
-                let bitmap = self.u16()?;
-                let h = self.hash()?;
-                for i in 0..16 {
-                    if bitmap & (1 << i) != 0 {
-                        self.skip_node()?;
-                    }
-                }
-                Ok(h)
-            }
-            4 => {
-                let _ = self.take(4 + 4)?;
-                self.hash()
-            }
-            tag => bail!("invalid compact subtree node tag {tag}"),
-        }
-    }
-
-    /// Parse this node and its extension/branch spine; branch child subtrees stay `Raw`.
+    /// Parse this node and its extension/branch spine; branch child subtrees stay
+    /// `Raw`. Children are located via the branch's length table (no sibling scan).
     fn node(&mut self) -> Result<Node> {
         match self.u8()? {
             0 => Ok(Node::Empty),
@@ -2137,10 +2095,35 @@ impl LazyReader {
             3 => {
                 let bitmap = self.u16()?;
                 let hash = self.hash()?;
+                let n = bitmap.count_ones() as usize;
+                let mut lens = [0u32; 16];
+                for l in lens.iter_mut().take(n) {
+                    *l = self.u32()?;
+                }
                 let mut children = empty_box_children();
+                let mut ti = 0;
                 for (idx, slot) in children.iter_mut().enumerate() {
-                    if bitmap & (1 << idx) != 0 {
-                        *slot = Some(Box::new(self.child()?));
+                    if bitmap & (1 << idx) == 0 {
+                        continue;
+                    }
+                    let len = lens[ti] as usize;
+                    ti += 1;
+                    // ext/branch subtrees become zero-copy `Raw` — jump over them via
+                    // the table (no scan), reading only the child's header hash. Small
+                    // terminal nodes (leaf/overflow/empty) are parsed fully.
+                    match self.peek_u8()? {
+                        2 | 3 => {
+                            let off = self.pos;
+                            let hash = extract_hash(&self.buf[off..off + len])?;
+                            self.pos += len;
+                            *slot = Some(Box::new(Node::Raw {
+                                buf: self.buf.clone(),
+                                off,
+                                len,
+                                hash,
+                            }));
+                        }
+                        _ => *slot = Some(Box::new(self.node()?)),
                     }
                 }
                 Ok(Node::Branch { children, hash })
@@ -2157,24 +2140,27 @@ impl LazyReader {
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
     }
+}
 
-    /// A branch child: extension/branch subtrees become a zero-copy `Raw`; small
-    /// terminal nodes (leaf/overflow/empty) are parsed fully so the existing
-    /// matches (overflow detection, leaf overwrite) see them directly.
-    fn child(&mut self) -> Result<Node> {
-        match self.peek_u8()? {
-            2 | 3 => {
-                let off = self.pos;
-                let hash = self.hash_and_skip()?;
-                Ok(Node::Raw {
-                    buf: self.buf.clone(),
-                    off,
-                    len: self.pos - off,
-                    hash,
-                })
-            }
-            _ => self.node(),
+/// Read a node's root hash from the front of its serialized `bytes` — a shallow
+/// header parse (tag + path/bitmap), no recursion into the subtree.
+fn extract_hash(bytes: &[u8]) -> Result<Hash> {
+    let mut r = CompactReader::new(bytes);
+    match r.read_u8()? {
+        0 => Ok(empty_hash()),
+        1 | 2 => {
+            let _ = r.read_nibble_path()?;
+            r.read_hash()
         }
+        3 => {
+            let _ = r.read_u16()?;
+            r.read_hash()
+        }
+        4 => {
+            let _ = r.read_bytes(4 + 4)?;
+            r.read_hash()
+        }
+        tag => bail!("invalid compact subtree node tag {tag}"),
     }
 }
 
