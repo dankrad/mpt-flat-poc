@@ -1754,7 +1754,11 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            let computed = hash_join(1, path, &hash_ram(child));
+            // Tag 4 == the disk-side extension tag (`make_extension`). Using one
+            // tag per node type across RAM and disk makes a node's hash depend
+            // only on its structure, never on which side of the storage boundary
+            // it currently lives on — see `root_is_independent_of_leaf_size`.
+            let computed = hash_join(4, path, &hash_ram(child));
             hash.set(Some(computed));
             computed
         }
@@ -1762,7 +1766,8 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            let mut bytes = vec![2];
+            // Tag 5 == the disk-side branch tag (`make_branch`); see above.
+            let mut bytes = vec![5];
             for child in children {
                 let h = match child {
                     Some(RamChild::Ram(node)) => hash_ram(node),
@@ -2003,6 +2008,40 @@ mod tests {
             .insert_batch(vec![(key, b"first".to_vec()), (key, b"second".to_vec())])
             .unwrap();
         assert_eq!(batched.get_value(&key).unwrap(), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn root_is_independent_of_leaf_size() {
+        // The Merkle root must be a pure function of the key set — independent of
+        // `max_leaf_bytes`, i.e. of where the RAM/disk storage boundary falls.
+        // Tiny leaves push almost everything into the RAM frontier (many splits);
+        // huge leaves keep it all in one disk subtree. Same keys => same root.
+        // (This FAILS under the old split-tag scheme and is the precondition for
+        // the paged-node design, where overflow records move that boundary.)
+        let tiny = Config {
+            target_leaf_bytes: 512,
+            max_leaf_bytes: 1024,
+            min_promote_bytes: 256,
+        };
+        let huge = Config {
+            target_leaf_bytes: 32 * 1024,
+            max_leaf_bytes: 64 * 1024,
+            min_promote_bytes: 16 * 1024,
+        };
+        let mut a = db(tiny);
+        let mut b = db(huge);
+        for i in 0..5000u64 {
+            let k = hashed_key(i.to_le_bytes());
+            a.insert(k, vec![7u8; 32]).unwrap();
+            b.insert(k, vec![7u8; 32]).unwrap();
+        }
+        assert_eq!(
+            a.root(),
+            b.root(),
+            "root depends on leaf size — hash is not storage-independent",
+        );
+        // Sanity: the two really did take different storage paths.
+        assert_ne!(a.disk_leaves(), b.disk_leaves());
     }
 
     #[test]
