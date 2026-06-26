@@ -9,6 +9,8 @@ use std::{
     io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::Mutex,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Number of buffered values before the overlay is flushed to RocksDB as one
@@ -347,12 +349,20 @@ impl FreeList {
 
 /// Append-mostly flat file of compact-serialized [`DiskSubtree`] records, with a
 /// [`FreeList`] so that space freed by rewrites can be reused.
+///
+/// Thread-safe: positioned `pread`/`pwrite` go through a shared `&File`, and the
+/// only mutable state — the free list and the high-water mark — is behind a
+/// `Mutex`/atomic. That lets `insert_batch` run many independent record updates
+/// concurrently (each touches a disjoint subtree; only the brief allocation step
+/// is serialized).
 #[derive(Debug)]
 struct FlatFile {
     file: File,
-    free: FreeList,
+    free: Mutex<FreeList>,
     /// High-water mark in pages: the next page index where fresh appends land.
-    end_page: u64,
+    /// Always ≥ every live/free region, so `fetch_add` hands out fresh,
+    /// non-overlapping extents without touching the free-list lock.
+    end_page: AtomicU64,
 }
 
 /// Pages needed to hold a record of `record_bytes` (length prefix + payload).
@@ -364,26 +374,25 @@ impl FlatFile {
     fn new(file: File) -> Self {
         Self {
             file,
-            free: FreeList::default(),
-            end_page: 0,
+            free: Mutex::new(FreeList::default()),
+            end_page: AtomicU64::new(0),
         }
     }
 
     /// Store an already-encoded subtree payload in a page-aligned record,
     /// preferring a reclaimed free region over extending the file. The record
     /// `[len: u32 LE][payload]` is written in a single positioned `pwrite`, and
-    /// occupies `ceil((len+4)/PAGE)` whole pages.
-    fn write_payload(&mut self, payload: &[u8]) -> Result<DiskPtr> {
+    /// occupies `ceil((len+4)/PAGE)` whole pages. Safe to call concurrently:
+    /// allocation holds the free-list lock only briefly; the `pwrite` is lock-free.
+    fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32 + 4;
         stats::on_write(total as usize);
         let pages = pages_for(total);
-        let page = match self.free.alloc(pages) {
+        // Reuse a freed region if one fits; otherwise extend the file. Both yield
+        // a page range disjoint from every other in-flight allocation.
+        let page = match self.free.lock().unwrap().alloc(pages) {
             Some(page) => page,
-            None => {
-                let page = self.end_page;
-                self.end_page += pages as u64;
-                page
-            }
+            None => self.end_page.fetch_add(pages as u64, Ordering::SeqCst),
         };
         let offset = page * PAGE;
 
@@ -393,27 +402,34 @@ impl FlatFile {
         record.extend_from_slice(payload);
 
         let _g = prof::scope(prof::Cat::FileWrite);
-        self.file.write_all_at(&record, offset)?;
+        (&self.file).write_all_at(&record, offset)?;
         Ok(DiskPtr { offset, len: total })
     }
 
-    fn read(&mut self, ptr: DiskPtr) -> Result<DiskSubtree> {
+    fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
         read_record(&self.file, ptr)
     }
 
-    fn free(&mut self, ptr: DiskPtr) {
-        self.free.free(ptr.offset / PAGE, pages_for(ptr.len));
+    fn free(&self, ptr: DiskPtr) {
+        self.free
+            .lock()
+            .unwrap()
+            .free(ptr.offset / PAGE, pages_for(ptr.len));
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn end_page(&self) -> u64 {
+        self.end_page.load(Ordering::SeqCst)
+    }
+
+    fn flush(&self) -> Result<()> {
         let _g = prof::scope(prof::Cat::Flush);
-        Ok(self.file.flush()?)
+        Ok((&self.file).flush()?)
     }
 
     /// Flush and fsync the flat file to disk (used before a manifest checkpoint
     /// so the manifest never references data that hasn't reached storage).
-    fn sync(&mut self) -> Result<()> {
-        self.file.flush()?;
+    fn sync(&self) -> Result<()> {
+        (&self.file).flush()?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -711,7 +727,11 @@ impl FlatMpt {
 
         Ok(Self {
             cfg,
-            store: FlatFile { file, free, end_page },
+            store: FlatFile {
+                file,
+                free: Mutex::new(free),
+                end_page: AtomicU64::new(end_page),
+            },
             upper,
             values,
             overlay: HashMap::new(),
@@ -749,13 +769,15 @@ impl FlatMpt {
     pub fn persist(&mut self) -> Result<()> {
         self.flush_values()?;
         self.store.sync()?;
+        let free = self.store.free.lock().unwrap();
         let manifest = ManifestRef {
             cfg: &self.cfg,
             upper: &self.upper,
-            free: &self.store.free,
-            end_page: self.store.end_page,
+            free: &free,
+            end_page: self.store.end_page(),
         };
         let bytes = bincode::serialize(&manifest)?;
+        drop(free);
 
         let meta = meta_path(&self.path);
         let mut tmp = meta.clone().into_os_string();
@@ -795,18 +817,73 @@ impl FlatMpt {
         if entries.is_empty() {
             return Ok(self.root());
         }
-        // 2c: temporarily serial. The parallel precompute path (Phase B below in
-        // git history) reads + `node_insert`s each touched leaf off-thread, but
-        // `node_insert` can't cross `Overflow` edges (those need serial writes).
-        // Re-integrating batch over the overflow-aware path is Phase 4; until then
-        // dedup-then-apply serially keeps results identical to one-by-one.
-        let mut leaves: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+        // Dedup (last write wins) and compute leaf value-hashes; buffer values.
+        let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
         for (key, value) in entries {
-            leaves.insert(key, value); // last write wins
+            let value_hash = hash_leaf_value(&value);
+            self.overlay.insert(key, value);
+            leaves.insert(key, value_hash);
         }
-        for (key, value) in leaves {
-            self.insert(key, value)?;
+        self.flush_values()?;
+        let cfg = self.cfg.clone();
+
+        // Phase A (serial, read-only): route each key to the frontier disk leaf
+        // it lands in, grouping keys per leaf. Keys with no existing leaf create
+        // fresh structure and are applied serially afterwards.
+        let mut groups: HashMap<u64, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
+        let mut fresh: Vec<(Key, Hash)> = Vec::new();
+        for (key, value_hash) in leaves {
+            match find_disk_ptr_key(&self.upper, &key, 0) {
+                Some(ptr) => {
+                    groups
+                        .entry(ptr.offset)
+                        .or_insert_with(|| (ptr, key, Vec::new()))
+                        .2
+                        .push((key, value_hash));
+                }
+                None => fresh.push((key, value_hash)),
+            }
         }
+        let groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
+
+        // Phase B (parallel): each group reads its record, applies its keys
+        // (record_node_insert + migrate + possible promotion), and produces the
+        // replacement RamChild — all the per-record CPU + I/O off the serial path.
+        // Groups touch disjoint subtrees; the store is thread-safe.
+        let store = &self.store;
+        let work = |(ptr, rep, keys): &(DiskPtr, Key, Vec<(Key, Hash)>)| {
+            Ok::<_, anyhow::Error>((*rep, process_group(store, &cfg, *ptr, keys)?))
+        };
+        let results: Vec<(Key, RamChild)> = if groups.len() < 64 {
+            groups.iter().map(work).collect::<Result<_>>()?
+        } else {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8);
+            let chunk = groups.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = groups
+                    .chunks(chunk)
+                    .map(|c| scope.spawn(|| c.iter().map(work).collect::<Result<Vec<_>>>()))
+                    .collect();
+                let mut out = Vec::with_capacity(groups.len());
+                for h in handles {
+                    out.extend(h.join().expect("batch group thread panicked")?);
+                }
+                Ok::<_, anyhow::Error>(out)
+            })?
+        };
+
+        // Phase C (serial): splice each group's result into the frontier, then
+        // create structure for the brand-new keys. Recompute the root once.
+        for (rep, new_child) in results {
+            install_at_key(&mut self.upper, &rep, 0, new_child);
+        }
+        for (key, value_hash) in fresh {
+            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash)?;
+        }
+        self.store.flush()?;
         Ok(self.root())
     }
 
@@ -845,17 +922,17 @@ impl FlatMpt {
     /// Logical size of the flat file (high-water mark). Stays flat across
     /// rewrites when freed space is reused.
     pub fn flat_file_len(&self) -> u64 {
-        self.store.end_page * PAGE
+        self.store.end_page() * PAGE
     }
 
     /// Total bytes currently held in the flat file's free list.
     pub fn free_bytes(&self) -> u64 {
-        self.store.free.total() * PAGE
+        self.store.free.lock().unwrap().total() * PAGE
     }
 
     /// Number of distinct free regions tracked in the flat file.
     pub fn free_regions(&self) -> usize {
-        self.store.free.region_count()
+        self.store.free.lock().unwrap().region_count()
     }
 
     /// Heap held by the in-RAM index — the part of the database that is *not*
@@ -864,7 +941,7 @@ impl FlatMpt {
     pub fn ram_report(&self) -> RamReport {
         let frontier_nodes = count_ram_nodes(&self.upper);
         let frontier_bytes = frontier_bytes(&self.upper);
-        let free_regions = self.store.free.region_count();
+        let free_regions = self.store.free.lock().unwrap().region_count();
         // by_offset (u64->u32) and by_size ((u32,u64)) both hold one entry per
         // region; this is the stored-data size and omits BTree node overhead.
         let free_list_bytes = free_regions
@@ -920,7 +997,7 @@ fn meta_path(path: &Path) -> PathBuf {
 }
 
 fn insert_ram(
-    store: &mut FlatFile,
+    store: &FlatFile,
     cfg: &Config,
     node: &mut RamNode,
     prefix: Vec<u8>,
@@ -1051,7 +1128,7 @@ fn insert_ram(
     }
 }
 
-fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Result<RamChild> {
+fn split_subtree(store: &FlatFile, cfg: &Config, subtree: DiskSubtree) -> Result<RamChild> {
     let leaves = node_entries(&subtree.node);
     // Absorb any nibbles all entries still share into the prefix (becomes a RAM
     // extension), then fan the rest out by their next nibble.
@@ -1134,7 +1211,7 @@ fn group_by_nibble(batch: &[(Key, Hash)], depth: usize) -> Vec<(u8, &[(Key, Hash
 /// Build a disk leaf from `entries`; if it exceeds `max_leaf_bytes`, split it
 /// into a RAM-frontier branch instead.
 fn make_disk_or_split(
-    store: &mut FlatFile,
+    store: &FlatFile,
     cfg: &Config,
     prefix: Vec<u8>,
     entries: Vec<(Key, Hash)>,
@@ -1154,7 +1231,7 @@ fn make_disk_or_split(
 /// grouped by route so each touched disk leaf is read, merged, rebuilt, and
 /// written exactly once, and each frontier node is re-hashed at most once.
 fn insert_ram_batch(
-    store: &mut FlatFile,
+    store: &FlatFile,
     cfg: &Config,
     node: &mut RamNode,
     prefix: Vec<u8>,
@@ -1530,7 +1607,7 @@ fn follow_key(node: &Node, depth: usize, key: &Key) -> PathEnd {
 /// Pure-inline subtrees are handled exactly as `node_insert` does, so the
 /// resulting structure and hashes are identical to an all-inline build.
 fn record_node_insert(
-    store: &mut FlatFile,
+    store: &FlatFile,
     cfg: &Config,
     node: &mut Node,
     depth: usize,
@@ -1643,7 +1720,7 @@ fn top_branch_prefix(subtree: &DiskSubtree) -> Option<Vec<u8>> {
 /// Converges — worst case every child becomes an `Overflow` and the record is a
 /// bare branch header. Root-preserving: an `Overflow{root}` contributes the same
 /// digest the inline child did.
-fn migrate_record(store: &mut FlatFile, cfg: &Config, subtree: &mut DiskSubtree) -> Result<()> {
+fn migrate_record(store: &FlatFile, cfg: &Config, subtree: &mut DiskSubtree) -> Result<()> {
     let Some(branch_prefix) = top_branch_prefix(subtree) else {
         return Ok(());
     };
@@ -1718,7 +1795,7 @@ fn count_overflow_children(node: &Node) -> usize {
 /// children keep their existing record, inline children are written out to their
 /// own records. Root-preserving: the RAM node hashes identically to the disk
 /// record (unified tags, unchanged child roots). The caller frees the old record.
-fn promote_record_to_ram(store: &mut FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
+fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
     let DiskSubtree { prefix, node } = subtree;
     let (ext_path, branch_node) = match node {
         Node::Branch { .. } => (Vec::new(), node),
@@ -1762,6 +1839,67 @@ fn promote_record_to_ram(store: &mut FlatFile, subtree: DiskSubtree) -> Result<R
             child: Box::new(branch),
             hash: Cell::new(None),
         })))
+    }
+}
+
+/// Apply a whole group of keys (all routing to the disk record at `ptr`) and
+/// produce the replacement `RamChild` for that frontier slot. Pure w.r.t. the
+/// frontier — it only reads/writes the (disjoint) record subtree via the
+/// thread-safe `store`, so groups for different frontier leaves run concurrently.
+fn process_group(
+    store: &FlatFile,
+    cfg: &Config,
+    ptr: DiskPtr,
+    keys: &[(Key, Hash)],
+) -> Result<RamChild> {
+    let mut subtree = store.read(ptr)?;
+    let depth = subtree.prefix.len();
+    for (key, value_hash) in keys {
+        record_node_insert(store, cfg, &mut subtree.node, depth, *key, *value_hash)?;
+    }
+    migrate_record(store, cfg, &mut subtree)?;
+    if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
+        store.free(ptr);
+        promote_record_to_ram(store, subtree)
+    } else {
+        let (payload, _) = serialize_subtree(&subtree)?;
+        store.free(ptr);
+        let new_ptr = store.write_payload(&payload)?;
+        Ok(RamChild::Disk {
+            ptr: new_ptr,
+            root: hash_node(&subtree.node),
+        })
+    }
+}
+
+/// Splice a batch result into the frontier: navigate `key`'s route to the
+/// `RamChild::Disk` slot it lands in and replace it with `new`, invalidating the
+/// cached hash of every node on the path. Returns whether the slot was found.
+fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) -> bool {
+    match node {
+        RamNode::Empty => false,
+        RamNode::Extension { path, child, hash } => {
+            let done = install_at_key(child, key, depth + path.len(), new);
+            if done {
+                hash.set(None);
+            }
+            done
+        }
+        RamNode::Branch { children, hash } => {
+            let idx = nibble_at(key, depth) as usize;
+            let done = match children[idx].as_mut() {
+                Some(RamChild::Disk { .. }) => {
+                    children[idx] = Some(new);
+                    true
+                }
+                Some(RamChild::Ram(child)) => install_at_key(child, key, depth + 1, new),
+                None => false,
+            };
+            if done {
+                hash.set(None);
+            }
+            done
+        }
     }
 }
 
