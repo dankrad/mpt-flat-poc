@@ -59,6 +59,21 @@ pub mod stats {
         BATCHES.fetch_add(1, Relaxed);
     }
 
+    /// Phase-B sub-breakdown, summed across all worker threads (so the total
+    /// exceeds Phase-B wall time by the parallel speedup — only the ratios are
+    /// meaningful): READ = fetching the record, REBUILD = applying keys
+    /// (`record_node_insert`: keccak + structure), FINAL = migrate + split/promote
+    /// + serialize + write.
+    pub static B_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static B_REBUILD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static B_FINAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on_group(read_ns: u64, rebuild_ns: u64, final_ns: u64) {
+        B_READ_NS.fetch_add(read_ns, Relaxed);
+        B_REBUILD_NS.fetch_add(rebuild_ns, Relaxed);
+        B_FINAL_NS.fetch_add(final_ns, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
@@ -90,6 +105,9 @@ pub mod stats {
         PHASE_B_NS.store(0, Relaxed);
         PHASE_C_NS.store(0, Relaxed);
         BATCHES.store(0, Relaxed);
+        B_READ_NS.store(0, Relaxed);
+        B_REBUILD_NS.store(0, Relaxed);
+        B_FINAL_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -1526,13 +1544,20 @@ fn process_group(
     ptr: DiskPtr,
     keys: &[(Key, Hash)],
 ) -> Result<RamChild> {
+    let t = std::time::Instant::now();
     let mut subtree = store.read(ptr)?;
+    let read_ns = t.elapsed().as_nanos() as u64;
+
     let depth = subtree.prefix.len();
+    let t = std::time::Instant::now();
     for (key, value_hash) in keys {
         record_node_insert(store, cfg, &mut subtree.node, depth, *key, *value_hash)?;
     }
+    let rebuild_ns = t.elapsed().as_nanos() as u64;
+
+    let t = std::time::Instant::now();
     migrate_record(store, cfg, &mut subtree)?;
-    if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
+    let out = if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
         store.free(ptr);
         promote_record_to_ram(store, subtree)
     } else {
@@ -1543,7 +1568,9 @@ fn process_group(
             ptr: new_ptr,
             root: hash_node(&subtree.node),
         })
-    }
+    };
+    stats::on_group(read_ns, rebuild_ns, t.elapsed().as_nanos() as u64);
+    out
 }
 
 /// Splice a batch result into the frontier: navigate `key`'s route to the
