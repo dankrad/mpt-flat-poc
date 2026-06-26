@@ -795,47 +795,18 @@ impl FlatMpt {
         if entries.is_empty() {
             return Ok(self.root());
         }
-        // Dedup (last write wins) and sort by key; compute leaf value-hashes.
-        let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
+        // 2c: temporarily serial. The parallel precompute path (Phase B below in
+        // git history) reads + `node_insert`s each touched leaf off-thread, but
+        // `node_insert` can't cross `Overflow` edges (those need serial writes).
+        // Re-integrating batch over the overflow-aware path is Phase 4; until then
+        // dedup-then-apply serially keeps results identical to one-by-one.
+        let mut leaves: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
         for (key, value) in entries {
-            let value_hash = hash_leaf_value(&value);
-            self.overlay.insert(key, value);
-            leaves.insert(key, value_hash);
+            leaves.insert(key, value); // last write wins
         }
-        self.flush_values()?;
-        let leaves: Vec<(Key, Hash)> = leaves.into_iter().collect();
-
-        // Phase A (serial, cheap): route every key to the disk leaf it lands in,
-        // grouping keys per leaf. Keys with no existing leaf (None) create new
-        // structure and are handled by the serial apply below.
-        let mut groups: HashMap<u64, Vec<(Key, Hash)>> = HashMap::new();
-        let mut ptrs: HashMap<u64, DiskPtr> = HashMap::new();
-        for &(key, value_hash) in &leaves {
-            if let Some(ptr) = find_disk_ptr_key(&self.upper, &key, 0) {
-                groups.entry(ptr.offset).or_default().push((key, value_hash));
-                ptrs.entry(ptr.offset).or_insert(ptr);
-            }
+        for (key, value) in leaves {
+            self.insert(key, value)?;
         }
-        // Phase B (parallel): read + apply keys (hash) + serialize each touched
-        // leaf — all the per-leaf CPU, off the write path.
-        let tasks: Vec<(DiskPtr, Vec<(Key, Hash)>)> =
-            groups.into_iter().map(|(off, g)| (ptrs[&off], g)).collect();
-        let updates = precompute_leaves(&self.store.file, &tasks)?;
-        let mut precomputed: HashMap<u64, LeafUpdate> =
-            updates.into_iter().map(|u| (u.offset, u)).collect();
-
-        // Phase C (serial): install precomputed leaves (free + write/split) and
-        // build any brand-new leaves; recompute the frontier hashes once.
-        let cfg = self.cfg.clone();
-        insert_ram_batch(
-            &mut self.store,
-            &cfg,
-            &mut self.upper,
-            Vec::new(),
-            &leaves,
-            &mut precomputed,
-        )?;
-        self.store.flush()?;
         Ok(self.root())
     }
 
@@ -914,16 +885,22 @@ impl FlatMpt {
         }
     }
 
+    /// Number of flat-file records read to reach `key` (1 + the overflow-chain
+    /// depth on its path). 0 if no disk record is addressed for the key.
     pub fn disk_accesses_for_key(&mut self, key: &Key) -> Result<usize> {
         let nibbles = key_nibbles(key);
-        let Some(ptr) = find_disk_ptr(&self.upper, &nibbles, 0) else {
+        let Some(mut ptr) = find_disk_ptr(&self.upper, &nibbles, 0) else {
             return Ok(0);
         };
-        let subtree = self.store.read(ptr)?;
-        if node_contains(&subtree.node, key) {
-            Ok(1)
-        } else {
-            bail!("key not found in addressed disk subtree")
+        let mut reads = 0;
+        loop {
+            let subtree = self.store.read(ptr)?;
+            reads += 1;
+            match follow_key(&subtree.node, subtree.prefix.len(), key) {
+                PathEnd::Overflow(next) => ptr = next,
+                PathEnd::Inline(true) => return Ok(reads),
+                PathEnd::Inline(false) => bail!("key not found in addressed disk subtree"),
+            }
         }
     }
 }
@@ -1040,29 +1017,18 @@ fn insert_ram(
                 Some(RamChild::Disk { ptr, root }) => {
                     let mut subtree = store.read(*ptr)?;
                     let old_ptr = *ptr;
-                    // Incremental: re-hash only the path from this leaf's root down
-                    // to the changed entry; untouched siblings keep cached hashes.
-                    node_insert(&mut subtree.node, subtree.prefix.len(), key, value_hash);
-                    debug_assert_eq!(
-                        hash_node(&subtree.node),
-                        hash_node(&build_node(
-                            &node_entries(&subtree.node),
-                            subtree.prefix.len()
-                        )),
-                        "incremental node hash diverged from a full rebuild",
-                    );
-                    let (payload, new_bytes) = serialize_subtree(&subtree)?;
-                    // The old record is now dead; reclaim it before writing so the
-                    // rewrite can land back in the same region when it still fits.
+                    // Incremental insert, crossing any overflow edges on the key's
+                    // path (re-hashing only that path). Then shed children to
+                    // overflow if the record outgrew `max` — the record stays on
+                    // disk (one frontier entry) instead of promoting a RAM branch.
+                    record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
+                    migrate_record(store, cfg, &mut subtree)?;
+                    let (payload, _) = serialize_subtree(&subtree)?;
+                    // Old record is dead; reclaim before writing so the rewrite can
+                    // reuse the same region when it still fits.
                     store.free(old_ptr);
-                    if new_bytes <= cfg.max_leaf_bytes {
-                        let new_ptr = store.write_payload(&payload)?;
-                        *ptr = new_ptr;
-                        *root = hash_node(&subtree.node);
-                    } else {
-                        stats::on_split(new_bytes);
-                        children[idx] = Some(split_subtree(store, cfg, subtree)?);
-                    }
+                    *ptr = store.write_payload(&payload)?;
+                    *root = hash_node(&subtree.node);
                     Ok(())
                 }
                 None => {
@@ -1373,16 +1339,24 @@ fn make_extension(path: Vec<u8>, child: Node) -> Node {
     }
 }
 
-fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
-    // Disk-side branches never carry a value (every key is a full 64-nibble path).
+/// keccak(5 ‖ h0 ‖ … ‖ h15) over the 16 child digests (empty slots use the empty
+/// hash). An `Overflow` child contributes its `root` via `hash_node`, so a branch
+/// hashes identically whether a child is inline or overflowed.
+fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
     let mut bytes = vec![5];
-    for child in &children {
+    for child in children {
         bytes.extend_from_slice(&child.as_ref().map(|c| hash_node(c)).unwrap_or_else(empty_hash));
     }
+    keccak(&bytes)
+}
+
+fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
+    // Disk-side branches never carry a value (every key is a full 64-nibble path).
+    let hash = branch_hash(&children);
     Node::Branch {
         children,
         value: None,
-        hash: keccak(&bytes),
+        hash,
     }
 }
 
@@ -1505,6 +1479,210 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
         Node::Overflow { .. } => unreachable!("node_insert crossed an overflow child"),
     };
     *node = updated;
+}
+
+/// Outcome of following a key's nibble path through one record's (inline) node.
+enum PathEnd {
+    /// The path reaches an `Overflow` child; continue in the record at `ptr`.
+    Overflow(DiskPtr),
+    /// The path terminates within this record; `bool` is whether the key is present.
+    Inline(bool),
+}
+
+/// Follow `key`'s nibble path through `node` (rooted at `depth`), stopping at the
+/// first `Overflow` edge (so it never recurses into one). Only walks the slot the
+/// key routes to — siblings (including overflow siblings) are not visited.
+fn follow_key(node: &Node, depth: usize, key: &Key) -> PathEnd {
+    match node {
+        Node::Empty => PathEnd::Inline(false),
+        Node::Leaf { key: k, .. } => PathEnd::Inline(k == key),
+        Node::Extension { path, child, .. } => {
+            let nibbles = key_nibbles(key);
+            if nibbles.get(depth..depth + path.len()) == Some(path.as_slice()) {
+                follow_key(child, depth + path.len(), key)
+            } else {
+                PathEnd::Inline(false)
+            }
+        }
+        Node::Branch { children, .. } => {
+            let idx = nibble_at(key, depth) as usize;
+            match children[idx].as_deref() {
+                None => PathEnd::Inline(false),
+                Some(Node::Overflow { ptr, .. }) => PathEnd::Overflow(*ptr),
+                Some(child) => follow_key(child, depth + 1, key),
+            }
+        }
+        Node::Overflow { ptr, .. } => PathEnd::Overflow(*ptr),
+    }
+}
+
+/// Like [`node_insert`], but the subtree may contain `Overflow` children (which
+/// live only at branch slots). Crossing one reads, recurses into, migrates, and
+/// rewrites that child record, then updates the `Overflow{ptr, root}` in place.
+/// Pure-inline subtrees are handled exactly as `node_insert` does, so the
+/// resulting structure and hashes are identical to an all-inline build.
+fn record_node_insert(
+    store: &mut FlatFile,
+    cfg: &Config,
+    node: &mut Node,
+    depth: usize,
+    key: Key,
+    value_hash: Hash,
+) -> Result<()> {
+    let nibbles = key_nibbles(&key);
+    let updated = match std::mem::replace(node, Node::Empty) {
+        Node::Empty => single_entry_node(key, value_hash, depth),
+        Node::Leaf { key: leaf_key, .. } => {
+            debug_assert_eq!(leaf_key, key, "two distinct keys cannot share a full path");
+            make_leaf(key, value_hash)
+        }
+        Node::Extension { path, mut child, .. } => {
+            let common = common_prefix(&path, &nibbles[depth..]);
+            if common == path.len() {
+                record_node_insert(store, cfg, &mut child, depth + path.len(), key, value_hash)?;
+                make_extension(path, *child)
+            } else {
+                // Diverges partway along the extension — no overflow edge here;
+                // identical to `node_insert`'s divergence case.
+                let mut children = empty_box_children();
+                let old_idx = path[common] as usize;
+                let old_rest = path[common + 1..].to_vec();
+                children[old_idx] = Some(Box::new(if old_rest.is_empty() {
+                    *child
+                } else {
+                    make_extension(old_rest, *child)
+                }));
+                let new_idx = nibbles[depth + common] as usize;
+                children[new_idx] =
+                    Some(Box::new(single_entry_node(key, value_hash, depth + common + 1)));
+                let branch = make_branch(children);
+                if common == 0 {
+                    branch
+                } else {
+                    make_extension(path[..common].to_vec(), branch)
+                }
+            }
+        }
+        Node::Branch { mut children, .. } => {
+            let idx = nibbles[depth] as usize;
+            match children[idx].as_deref_mut() {
+                Some(Node::Overflow { ptr, root }) => {
+                    // Recurse into the overflow record, then rewrite it.
+                    let mut sub = store.read(*ptr)?;
+                    record_node_insert(store, cfg, &mut sub.node, sub.prefix.len(), key, value_hash)?;
+                    migrate_record(store, cfg, &mut sub)?;
+                    let (payload, _) = serialize_subtree(&sub)?;
+                    store.free(*ptr);
+                    *ptr = store.write_payload(&payload)?;
+                    *root = hash_node(&sub.node);
+                }
+                Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value_hash)?,
+                None => {
+                    children[idx] = Some(Box::new(single_entry_node(key, value_hash, depth + 1)));
+                }
+            }
+            make_branch(children)
+        }
+        Node::Overflow { .. } => unreachable!("overflow is only reached via its parent branch slot"),
+    };
+    *node = updated;
+    Ok(())
+}
+
+/// `&mut` access to the top branch's children (descending through a leading
+/// extension). `None` if the record holds no branch (a 0/1-entry record).
+fn top_branch_children_mut(node: &mut Node) -> Option<&mut [Option<Box<Node>>; 16]> {
+    match node {
+        Node::Branch { children, .. } => Some(children),
+        Node::Extension { child, .. } => top_branch_children_mut(child),
+        _ => None,
+    }
+}
+
+/// Recompute cached hashes for the record's leading structure after a top-branch
+/// child slot changed (e.g. an inline child became an `Overflow`).
+fn rehash_top(node: &mut Node) {
+    match node {
+        Node::Branch { children, hash, .. } => *hash = branch_hash(children),
+        Node::Extension { path, child, hash } => {
+            rehash_top(child);
+            *hash = hash_join(4, path, &hash_node(child));
+        }
+        _ => {}
+    }
+}
+
+/// The nibble prefix of the record's top branch (record prefix + leading
+/// extension path), or `None` if the record holds no branch.
+fn top_branch_prefix(subtree: &DiskSubtree) -> Option<Vec<u8>> {
+    match &subtree.node {
+        Node::Branch { .. } => Some(subtree.prefix.clone()),
+        Node::Extension { path, child, .. } if matches!(**child, Node::Branch { .. }) => {
+            let mut p = subtree.prefix.clone();
+            p.extend_from_slice(path);
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+/// Shed top-branch children of `subtree` into their own `Overflow` records until
+/// it fits (the "(2)→(3) migration"):
+///  - **Proactive:** any inline child whose own record would be ≥ `min_promote`
+///    is moved out (it deserves its own record).
+///  - **Forced:** while the record still exceeds `max_leaf_bytes`, the *largest*
+///    inline child is moved out (ignoring `min_promote`) until ≤ `target`.
+/// Converges — worst case every child becomes an `Overflow` and the record is a
+/// bare branch header. Root-preserving: an `Overflow{root}` contributes the same
+/// digest the inline child did.
+fn migrate_record(store: &mut FlatFile, cfg: &Config, subtree: &mut DiskSubtree) -> Result<()> {
+    let Some(branch_prefix) = top_branch_prefix(subtree) else {
+        return Ok(());
+    };
+    loop {
+        let (_, total) = serialize_subtree(subtree)?;
+        let children = top_branch_children_mut(&mut subtree.node).unwrap();
+
+        // Measure each inline child as its own record.
+        let mut inline: Vec<(usize, usize)> = Vec::new();
+        for (i, slot) in children.iter().enumerate() {
+            if let Some(boxed) = slot {
+                if !matches!(**boxed, Node::Overflow { .. }) {
+                    let mut cp = branch_prefix.clone();
+                    cp.push(i as u8);
+                    let child_sub = DiskSubtree { prefix: cp, node: (**boxed).clone() };
+                    let (_, cb) = serialize_subtree(&child_sub)?;
+                    inline.push((i, cb));
+                }
+            }
+        }
+
+        // Pick a child to shed: proactive first, then forced if still over max.
+        let shed = inline
+            .iter()
+            .find(|(_, b)| *b >= cfg.min_promote_bytes)
+            .map(|(i, _)| *i)
+            .or_else(|| {
+                if total > cfg.max_leaf_bytes {
+                    inline.iter().max_by_key(|(_, b)| *b).map(|(i, _)| *i)
+                } else {
+                    None
+                }
+            });
+        let Some(idx) = shed else { return Ok(()) };
+
+        // Move children[idx] out to its own record and replace with an Overflow.
+        let child = children[idx].take().unwrap();
+        let mut cp = branch_prefix.clone();
+        cp.push(idx as u8);
+        let child_sub = DiskSubtree { prefix: cp, node: *child };
+        let (payload, _) = serialize_subtree(&child_sub)?;
+        let ptr = store.write_payload(&payload)?;
+        let root = hash_node(&child_sub.node);
+        let children = top_branch_children_mut(&mut subtree.node).unwrap();
+        children[idx] = Some(Box::new(Node::Overflow { ptr, root }));
+        rehash_top(&mut subtree.node);
+    }
 }
 
 /// Serialize a subtree once, returning the payload and the total on-disk record
@@ -2085,8 +2263,19 @@ mod tests {
             b.root(),
             "root depends on leaf size — hash is not storage-independent",
         );
-        // Sanity: the two really did take different storage paths.
-        assert_ne!(a.disk_leaves(), b.disk_leaves());
+        // Sanity: the two really took different storage paths. Tiny leaves force
+        // on-disk overflow chains (>1 read for some keys); huge leaves keep every
+        // top-nibble subtree inline in one record (always 1 read).
+        let a_max = (0..5000u64)
+            .map(|i| a.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap())
+            .max()
+            .unwrap();
+        assert!(a_max > 1, "tiny-leaf build should use overflow chains, got {a_max}");
+        assert_eq!(
+            b.disk_accesses_for_key(&hashed_key(0u64.to_le_bytes())).unwrap(),
+            1,
+            "huge-leaf build should be all-inline",
+        );
     }
 
     #[test]
@@ -2182,7 +2371,8 @@ mod tests {
         assert_eq!(db.ram_nodes(), ram_nodes);
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(db.get_value(key).unwrap(), Some(vec![i as u8; 40]));
-            assert_eq!(db.disk_accesses_for_key(key).unwrap(), 1);
+            // With tiny leaves, some keys sit behind an overflow chain (>=1 read).
+            assert!(db.disk_accesses_for_key(key).unwrap() >= 1);
         }
 
         // And the reopened database is fully writable.
@@ -2239,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_large_disk_leaf_into_ram_frontier() {
+    fn splits_large_disk_leaf_into_overflow_records() {
         let cfg = Config {
             target_leaf_bytes: 512,
             max_leaf_bytes: 768,
@@ -2250,10 +2440,22 @@ mod tests {
             db.insert(hashed_key(i.to_le_bytes()), vec![i as u8; 32])
                 .unwrap();
         }
-        assert!(db.ram_nodes() > 2);
+        // Always-pack: growth is absorbed by on-disk overflow records rather than
+        // RAM-branch promotion, so the frontier stays shallow while some keys sit
+        // behind an overflow chain (>1 read).
+        assert!(
+            db.ram_nodes() < 20,
+            "frontier should stay shallow, got {}",
+            db.ram_nodes()
+        );
+        let max_reads = (0..200u64)
+            .map(|i| db.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap())
+            .max()
+            .unwrap();
+        assert!(max_reads > 1, "expected overflow chains, max reads={max_reads}");
+        // Every key is still reachable.
         for i in [0u64, 33, 99, 199] {
-            let key = hashed_key(i.to_le_bytes());
-            assert_eq!(db.disk_accesses_for_key(&key).unwrap(), 1);
+            assert!(db.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap() >= 1);
         }
     }
 
