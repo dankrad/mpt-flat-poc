@@ -1647,20 +1647,17 @@ fn migrate_record(store: &mut FlatFile, cfg: &Config, subtree: &mut DiskSubtree)
     let Some(branch_prefix) = top_branch_prefix(subtree) else {
         return Ok(());
     };
+    let child_prefix_len = branch_prefix.len() + 1;
     loop {
-        let (_, total) = serialize_subtree(subtree)?;
+        // Size-only (no allocation): the record, and each inline child as its
+        // own record. Most inserts shed nothing, so this must stay cheap.
+        let total = record_size(subtree.prefix.len(), &subtree.node);
         let children = top_branch_children_mut(&mut subtree.node).unwrap();
-
-        // Measure each inline child as its own record.
         let mut inline: Vec<(usize, usize)> = Vec::new();
         for (i, slot) in children.iter().enumerate() {
             if let Some(boxed) = slot {
                 if !matches!(**boxed, Node::Overflow { .. }) {
-                    let mut cp = branch_prefix.clone();
-                    cp.push(i as u8);
-                    let child_sub = DiskSubtree { prefix: cp, node: (**boxed).clone() };
-                    let (_, cb) = serialize_subtree(&child_sub)?;
-                    inline.push((i, cb));
+                    inline.push((i, record_size(child_prefix_len, boxed)));
                 }
             }
         }
@@ -1766,6 +1763,30 @@ fn promote_record_to_ram(store: &mut FlatFile, subtree: DiskSubtree) -> Result<R
             hash: Cell::new(None),
         })))
     }
+}
+
+/// On-disk byte size of `node` (matches exactly what [`write_node`] emits), with
+/// no allocation — a cheap size pass used by migration to decide shedding
+/// without serializing every child into a throwaway buffer.
+fn node_size(node: &Node) -> usize {
+    match node {
+        Node::Empty => 1,
+        Node::Leaf { .. } => 1 + 32 + 32 + 32,
+        Node::Extension { path, child, .. } => {
+            1 + (1 + path.len().div_ceil(2)) + 32 + node_size(child)
+        }
+        Node::Branch { children, .. } => {
+            1 + 2 + 32 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
+        }
+        Node::Overflow { .. } => 1 + 8 + 4 + 32,
+    }
+}
+
+/// Total on-disk record size for a `DiskSubtree { prefix, node }` — equal to the
+/// `total` [`serialize_subtree`] would return, but allocation-free.
+fn record_size(prefix_len: usize, node: &Node) -> usize {
+    // MAGIC(4) + VERSION(1) + path-len(1) + path bytes + node + length prefix(4).
+    10 + prefix_len.div_ceil(2) + node_size(node)
 }
 
 /// Serialize a subtree once, returning the payload and the total on-disk record
