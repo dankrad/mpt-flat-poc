@@ -16,8 +16,6 @@ use std::{
 /// Number of buffered values before the overlay is flushed to RocksDB as one
 /// `WriteBatch`, amortizing per-`put` overhead.
 const VALUE_BATCH: usize = 256;
-const SUBTREE_MAGIC: &[u8; 4] = b"FMPC";
-const SUBTREE_VERSION: u8 = 1;
 
 /// Flat-file allocation granularity. Records are page-aligned and occupy a whole
 /// number of pages, so each leaf read/write is a single positioned I/O over a
@@ -380,12 +378,14 @@ impl FlatFile {
     }
 
     /// Store an already-encoded subtree payload in a page-aligned record,
-    /// preferring a reclaimed free region over extending the file. The record
-    /// `[len: u32 LE][payload]` is written in a single positioned `pwrite`, and
-    /// occupies `ceil((len+4)/PAGE)` whole pages. Safe to call concurrently:
+    /// preferring a reclaimed free region over extending the file. The payload is
+    /// written verbatim (no length prefix — its exact size lives in the returned
+    /// [`DiskPtr`]) in a single positioned `pwrite`, occupying `ceil(len/PAGE)`
+    /// whole pages. Reads fetch exactly `len` bytes, so the unused tail of the
+    /// last page is never read and needn't be zeroed. Safe to call concurrently:
     /// allocation holds the free-list lock only briefly; the `pwrite` is lock-free.
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
-        let total = payload.len() as u32 + 4;
+        let total = payload.len() as u32;
         stats::on_write(total as usize);
         let pages = pages_for(total);
         // Reuse a freed region if one fits; otherwise extend the file. Both yield
@@ -396,13 +396,8 @@ impl FlatFile {
         };
         let offset = page * PAGE;
 
-        // One contiguous buffer => one positioned write (one I/O request).
-        let mut record = Vec::with_capacity(total as usize);
-        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        record.extend_from_slice(payload);
-
         let _g = prof::scope(prof::Cat::FileWrite);
-        (&self.file).write_all_at(&record, offset)?;
+        (&self.file).write_all_at(payload, offset)?;
         Ok(DiskPtr { offset, len: total })
     }
 
@@ -444,12 +439,8 @@ fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
         let _g = prof::scope(prof::Cat::FileRead);
         file.read_exact_at(&mut record, ptr.offset)?;
     }
-    let len = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
-    if len + 4 != ptr.len as usize {
-        bail!("flat-file record length mismatch");
-    }
     let _g = prof::scope(prof::Cat::Deserialize);
-    deserialize_subtree(&record[4..])
+    deserialize_subtree(&record)
 }
 
 
@@ -495,7 +486,6 @@ enum Node {
     },
     Branch {
         children: [Option<Box<Node>>; 16],
-        value: Option<Hash>,
         hash: Hash,
     },
     /// A child subtree that lives in its *own* flat-file record rather than
@@ -1131,11 +1121,7 @@ fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
 fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
     // Disk-side branches never carry a value (every key is a full 64-nibble path).
     let hash = branch_hash(&children);
-    Node::Branch {
-        children,
-        value: None,
-        hash,
-    }
+    Node::Branch { children, hash }
 }
 
 /// Canonical node for a subtree holding exactly one entry at `depth`.
@@ -1565,44 +1551,31 @@ fn node_size(node: &Node) -> usize {
 /// Total on-disk record size for a `DiskSubtree { prefix, node }` — equal to the
 /// `total` [`serialize_subtree`] would return, but allocation-free.
 fn record_size(prefix_len: usize, node: &Node) -> usize {
-    // MAGIC(4) + VERSION(1) + path-len(1) + path bytes + node + length prefix(4).
-    10 + prefix_len.div_ceil(2) + node_size(node)
+    // path-len byte(1) + path bytes + node. No magic/version/length framing — the
+    // record is just the prefix path followed by the node tree.
+    (1 + prefix_len.div_ceil(2)) + node_size(node)
 }
 
-/// Serialize a subtree once, returning the payload and the total on-disk record
-/// size (`payload + 4`-byte length prefix). Callers use the size to decide
-/// rewrite-vs-split and pass the same payload to [`FlatFile::write_payload`].
+/// Serialize a subtree to its on-disk payload (the prefix path followed by the
+/// node tree — no magic/version/length framing; the size is carried by the
+/// addressing [`DiskPtr`]). Returns the payload and its exact byte length.
 fn serialize_subtree(subtree: &DiskSubtree) -> Result<(Vec<u8>, usize)> {
     let _g = prof::scope(prof::Cat::Serialize);
     let mut payload = Vec::new();
-    payload.extend_from_slice(SUBTREE_MAGIC);
-    payload.push(SUBTREE_VERSION);
     write_nibble_path(&mut payload, &subtree.prefix)?;
     write_node(&mut payload, &subtree.node)?;
-    let total = payload.len() + 4;
+    let total = payload.len();
     Ok((payload, total))
 }
 
 fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
-    if payload.get(..SUBTREE_MAGIC.len()) != Some(SUBTREE_MAGIC.as_slice()) {
-        // Backward compatibility for databases written before the compact
-        // subtree format was introduced.
-        return Ok(bincode::deserialize(payload)?);
-    }
-
     let mut reader = CompactReader::new(payload);
-    let magic = reader.read_bytes(SUBTREE_MAGIC.len())?;
-    if magic != SUBTREE_MAGIC {
-        bail!("invalid compact subtree magic");
-    }
-    let version = reader.read_u8()?;
-    if version != SUBTREE_VERSION {
-        bail!("unsupported compact subtree version {version}");
-    }
     let prefix = reader.read_nibble_path()?;
     let node = reader.read_node()?;
+    // Reads fetch exactly `DiskPtr::len` bytes, so the record must consume all of
+    // them; anything left over signals corruption.
     if !reader.is_finished() {
-        bail!("trailing bytes in compact subtree record");
+        bail!("trailing bytes in flat-file record");
     }
     Ok(DiskSubtree { prefix, node })
 }
@@ -1623,10 +1596,8 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
         }
         Node::Branch {
             children,
-            value,
             hash,
         } => {
-            debug_assert!(value.is_none(), "disk branches never carry values");
             out.push(3);
             let mut bitmap = 0u16;
             for (idx, child) in children.iter().enumerate() {
@@ -1756,11 +1727,7 @@ impl<'a> CompactReader<'a> {
                         *slot = Some(Box::new(self.read_node()?));
                     }
                 }
-                Ok(Node::Branch {
-                    children,
-                    value: None,
-                    hash,
-                })
+                Ok(Node::Branch { children, hash })
             }
             4 => {
                 let offset = self.read_u64()?;
