@@ -234,10 +234,12 @@ the (logical) trie. Gates on every phase:
    stays shallow (`ram_nodes=1` at 200k) and growth goes to disk overflow.
    **Gate met:** overflow build == all-inline build, same root (200k, and
    `root_is_independent_of_leaf_size`). `insert_batch` temporarily serial.
-2d. **RAM-branch promotion = the adaptive boundary** — *next*. Promote a packed
-   disk record to a RAM branch once its children are fat (≥ `min_promote`), so
-   the frontier lifts to cover the upper tree → cuts read-depth and the transient
-   overflow padding, while staying bounded. The read-perf half of 2c.
+2d. **RAM-branch promotion = the adaptive boundary.** ✔ (`6c382c9`) Promote a
+   packed record to a RAM branch once `PROMOTE_AT_OVERFLOW` (8/16) children are
+   externalized; overflow children become `RamChild::Disk`, leftover inline
+   children (now ~`min_promote`) are written out. Root-preserving. At 200k:
+   `ram_nodes` 1 → 273 (= 1+16+256, the complete top 3 levels) ⇒ lookups are RAM
+   nav + 1 read. The read-perf half of the boundary.
 3. **Migration tuning + stats.** `overflow_records` / `migrations` stats, read-
    depth probe; tune `min_promote : max` for the RAM/reads balance.
 4. **Batch + parallel.** Re-integrate `insert_batch` over the overflow-aware path
