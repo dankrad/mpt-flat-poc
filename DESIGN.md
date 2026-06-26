@@ -227,17 +227,21 @@ the (logical) trie. Gates on every phase:
    the RAM/disk boundary. ✔ (`c05d971`, `root_is_independent_of_leaf_size`)
 2b. **`Node::Overflow` foundation.** Wire format + hash contract + round-trip
    test. ✔ (`c35cb0c`)
-2c. **Record-crossing insert + adaptive boundary** — *next*. At a split, promote
-   a branch to RAM only if all children are fat (≥ `min_promote`); otherwise keep
-   it as a packed disk record and shed fat children to `Overflow`. Record-level
-   insert traverses overflow edges (read → recurse → rewrite → re-hash up).
-   **Gate:** all-inline build (huge `min_promote`) == forced-overflow build (tiny
-   `min_promote`) — same root; plus `batchcheck` + `root_is_independent_of_leaf_size`.
-3. **Migration tuning + stats.** Forced/proactive shedding to `target`; add
-   `overflow_records` / `migrations` stats and a read-depth probe.
-4. **Batch + parallel.** Re-integrate `insert_batch` over the new format (note the
-   constraint: parallel precompute may *read* overflow records but writes stay
-   serial).
+2c. **Record-crossing insert + overflow migration (always-pack).** ✔ (`7a48622`)
+   `record_node_insert` traverses overflow edges; `migrate_record` sheds
+   top-branch children (proactive ≥ `min_promote`, forced largest-first to
+   `target`). *Pure-paged* for now: no RAM-branch promotion, so the frontier
+   stays shallow (`ram_nodes=1` at 200k) and growth goes to disk overflow.
+   **Gate met:** overflow build == all-inline build, same root (200k, and
+   `root_is_independent_of_leaf_size`). `insert_batch` temporarily serial.
+2d. **RAM-branch promotion = the adaptive boundary** — *next*. Promote a packed
+   disk record to a RAM branch once its children are fat (≥ `min_promote`), so
+   the frontier lifts to cover the upper tree → cuts read-depth and the transient
+   overflow padding, while staying bounded. The read-perf half of 2c.
+3. **Migration tuning + stats.** `overflow_records` / `migrations` stats, read-
+   depth probe; tune `min_promote : max` for the RAM/reads balance.
+4. **Batch + parallel.** Re-integrate `insert_batch` over the overflow-aware path
+   (parallel precompute may *read* overflow records; writes stay serial).
 5. **Scale.** Run `benches/large.rs` through the old cascade points (40M, 560M);
    confirm `avg_leaf`/`split`/`free_reg`/RAM stay healthy and track the
    ~150 GB / ~0.5 GB ideal.
