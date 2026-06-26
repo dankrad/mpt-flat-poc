@@ -14,8 +14,6 @@ use std::{
 /// Number of buffered values before the overlay is flushed to RocksDB as one
 /// `WriteBatch`, amortizing per-`put` overhead.
 const VALUE_BATCH: usize = 256;
-const SUBTREE_MAGIC: &[u8; 4] = b"FMPC";
-const SUBTREE_VERSION: u8 = 1;
 
 /// Flat-file allocation granularity. Records are page-aligned and occupy a whole
 /// number of pages, so each leaf read/write is a single positioned I/O over a
@@ -250,10 +248,27 @@ pub mod prof {
     pub use imp::{ENABLED, Guard, audit_start, audit_take, record, reset, scope, snapshot};
 }
 
+/// Address of a flat-file record, compressed to fit the page-aligned layout: a
+/// `u32` first-page index (16 TiB of addressable file at 4 KiB pages) and a
+/// `u16` length in pages (records are bounded by `max_leaf_bytes`, so a couple of
+/// pages in practice). Eight bytes instead of the twelve a `{u64, u32}` byte
+/// pointer would take, shrinking every `RamChild::Disk` and the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskPtr {
-    pub offset: u64,
-    pub len: u32,
+    pub page: u32,
+    pub pages: u16,
+}
+
+impl DiskPtr {
+    /// Byte offset of the record in the flat file.
+    fn offset(&self) -> u64 {
+        self.page as u64 * PAGE
+    }
+    /// Allocated size of the record in bytes (a whole number of pages; the exact
+    /// payload length is shorter and is not stored — see [`write_node`]).
+    fn byte_len(&self) -> usize {
+        self.pages as usize * PAGE as usize
+    }
 }
 
 /// Tracks reclaimed regions of the flat file so new records can be placed into
@@ -274,40 +289,40 @@ pub struct DiskPtr {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct FreeList {
     /// first page index -> length in pages of each free region.
-    by_offset: BTreeMap<u64, u32>,
+    by_offset: BTreeMap<u32, u32>,
     /// (length, first page) of each free region, for size-ordered best-fit lookup.
     #[serde(skip)]
-    by_size: BTreeSet<(u32, u64)>,
+    by_size: BTreeSet<(u32, u32)>,
 }
 
 impl FreeList {
-    fn insert_region(&mut self, offset: u64, len: u32) {
+    fn insert_region(&mut self, offset: u32, len: u32) {
         self.by_offset.insert(offset, len);
         self.by_size.insert((len, offset));
     }
 
-    fn remove_region(&mut self, offset: u64, len: u32) {
+    fn remove_region(&mut self, offset: u32, len: u32) {
         self.by_offset.remove(&offset);
         self.by_size.remove(&(len, offset));
     }
 
-    /// Reserve `need` bytes from a free region if one is large enough.
-    /// Returns the offset of the allocation, leaving any remainder free.
-    fn alloc(&mut self, need: u32) -> Option<u64> {
+    /// Reserve `need` pages from a free region if one is large enough.
+    /// Returns the first page of the allocation, leaving any remainder free.
+    fn alloc(&mut self, need: u32) -> Option<u32> {
         // Best fit: smallest region with len >= need, in O(log n).
         let (len, offset) = self.by_size.range((need, 0)..).next().copied()?;
         self.remove_region(offset, len);
         let remainder = len - need;
         if remainder > 0 {
-            self.insert_region(offset + need as u64, remainder);
+            self.insert_region(offset + need, remainder);
         }
         Some(offset)
     }
 
-    /// Mark `[offset, offset + len)` as free, coalescing with neighbours.
-    fn free(&mut self, offset: u64, len: u32) {
+    /// Mark `[offset, offset + len)` (in pages) as free, coalescing with neighbours.
+    fn free(&mut self, offset: u32, len: u32) {
         let mut start = offset;
-        let mut size = len as u64;
+        let mut size = len;
 
         // Merge with the region immediately preceding this one.
         let pred = self
@@ -316,19 +331,19 @@ impl FreeList {
             .next_back()
             .map(|(&off, &len)| (off, len));
         if let Some((prev_off, prev_len)) = pred {
-            if prev_off + prev_len as u64 == start {
+            if prev_off + prev_len == start {
                 start = prev_off;
-                size += prev_len as u64;
+                size += prev_len;
                 self.remove_region(prev_off, prev_len);
             }
         }
         // Merge with the region immediately following this one.
         if let Some(next_len) = self.by_offset.get(&(start + size)).copied() {
             self.remove_region(start + size, next_len);
-            size += next_len as u64;
+            size += next_len;
         }
 
-        self.insert_region(start, size as u32);
+        self.insert_region(start, size);
     }
 
     fn total(&self) -> u64 {
@@ -345,17 +360,18 @@ impl FreeList {
     }
 }
 
-/// Append-mostly flat file of compact-serialized [`DiskSubtree`] records, with a
+/// Append-mostly flat file of compact-serialized [`Node`] records, with a
 /// [`FreeList`] so that space freed by rewrites can be reused.
 #[derive(Debug)]
 struct FlatFile {
     file: File,
     free: FreeList,
     /// High-water mark in pages: the next page index where fresh appends land.
-    end_page: u64,
+    end_page: u32,
 }
 
-/// Pages needed to hold a record of `record_bytes` (length prefix + payload).
+/// Pages needed to hold a record of `record_bytes` (the payload; there is no
+/// length prefix — the size is carried by the addressing [`DiskPtr`]).
 fn pages_for(record_bytes: u32) -> u32 {
     record_bytes.div_ceil(PAGE as u32)
 }
@@ -370,39 +386,48 @@ impl FlatFile {
     }
 
     /// Store an already-encoded subtree payload in a page-aligned record,
-    /// preferring a reclaimed free region over extending the file. The record
-    /// `[len: u32 LE][payload]` is written in a single positioned `pwrite`, and
-    /// occupies `ceil((len+4)/PAGE)` whole pages.
+    /// preferring a reclaimed free region over extending the file. The payload
+    /// is written in a single positioned `pwrite` and occupies
+    /// `ceil(len/PAGE)` whole pages; its exact length is recorded in the
+    /// returned [`DiskPtr`], so no on-disk length prefix is needed.
     fn write_payload(&mut self, payload: &[u8]) -> Result<DiskPtr> {
-        let total = payload.len() as u32 + 4;
+        let total = payload.len() as u32;
         stats::on_write(total as usize);
         let pages = pages_for(total);
+        if pages > u16::MAX as u32 {
+            bail!("record of {total} bytes exceeds the DiskPtr page-count limit");
+        }
         let page = match self.free.alloc(pages) {
             Some(page) => page,
             None => {
                 let page = self.end_page;
-                self.end_page += pages as u64;
+                self.end_page += pages;
                 page
             }
         };
-        let offset = page * PAGE;
+        let offset = page as u64 * PAGE;
 
-        // One contiguous buffer => one positioned write (one I/O request).
-        let mut record = Vec::with_capacity(total as usize);
-        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        record.extend_from_slice(payload);
+        // Zero-pad to a whole number of pages: the unused tail of the last page is
+        // then deterministic, so reads can tolerate trailing zeros and a reused
+        // region never exposes stale bytes from its previous occupant. Still a
+        // single positioned, page-aligned write.
+        let mut record = vec![0u8; pages as usize * PAGE as usize];
+        record[..payload.len()].copy_from_slice(payload);
 
         let _g = prof::scope(prof::Cat::FileWrite);
         self.file.write_all_at(&record, offset)?;
-        Ok(DiskPtr { offset, len: total })
+        Ok(DiskPtr {
+            page,
+            pages: pages as u16,
+        })
     }
 
-    fn read(&mut self, ptr: DiskPtr) -> Result<DiskSubtree> {
+    fn read(&mut self, ptr: DiskPtr) -> Result<Node> {
         read_record(&self.file, ptr)
     }
 
     fn free(&mut self, ptr: DiskPtr) {
-        self.free.free(ptr.offset / PAGE, pages_for(ptr.len));
+        self.free.free(ptr.page, ptr.pages as u32);
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -422,26 +447,24 @@ impl FlatFile {
 /// Read and decode one record by pointer, using only `&File` (a positioned
 /// `pread` + decode) so it can run on any thread. `read_exact_at` is a `pread`,
 /// which is safe to call concurrently on the same file from multiple threads.
-fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
-    let mut record = vec![0u8; ptr.len as usize];
+fn read_record(file: &File, ptr: DiskPtr) -> Result<Node> {
+    let mut record = vec![0u8; ptr.byte_len()];
     {
         let _g = prof::scope(prof::Cat::FileRead);
-        file.read_exact_at(&mut record, ptr.offset)?;
-    }
-    let len = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
-    if len + 4 != ptr.len as usize {
-        bail!("flat-file record length mismatch");
+        file.read_exact_at(&mut record, ptr.offset())?;
     }
     let _g = prof::scope(prof::Cat::Deserialize);
-    deserialize_subtree(&record[4..])
+    deserialize_node(&record)
 }
 
-/// A leaf's update computed off the write path: the updated subtree, its
-/// serialized payload, encoded size, and root hash — everything except the
-/// flat-file write itself (which must stay serial, as the allocator is shared).
+/// A leaf's update computed off the write path: the updated node, its serialized
+/// payload, encoded size, and root hash — everything except the flat-file write
+/// itself (which must stay serial, as the allocator is shared).
 struct LeafUpdate {
-    offset: u64,
-    subtree: DiskSubtree,
+    /// First page of the leaf being replaced; used to match the update back to its
+    /// frontier slot during the serial install phase.
+    page: u32,
+    node: Node,
     payload: Vec<u8>,
     bytes: usize,
     root: Hash,
@@ -449,18 +472,23 @@ struct LeafUpdate {
 
 /// The per-leaf work for one update: read the leaf, apply its keys
 /// (`node_insert` — the hashing), and serialize. No flat-file mutation, so this
-/// is pure CPU+read and runs on any thread.
-fn compute_leaf_update(file: &File, ptr: DiskPtr, group: &[(Key, Hash)]) -> Result<LeafUpdate> {
-    let mut subtree = read_record(file, ptr)?;
-    let depth = subtree.prefix.len();
+/// is pure CPU+read and runs on any thread. `depth` is the nibble depth at which
+/// the leaf's node is rooted (formerly carried by the on-disk subtree prefix).
+fn compute_leaf_update(
+    file: &File,
+    ptr: DiskPtr,
+    depth: usize,
+    group: &[(Key, Hash)],
+) -> Result<LeafUpdate> {
+    let mut node = read_record(file, ptr)?;
     for (key, value_hash) in group {
-        node_insert(&mut subtree.node, depth, *key, *value_hash);
+        node_insert(&mut node, depth, *key, *value_hash);
     }
-    let (payload, bytes) = serialize_subtree(&subtree)?;
-    let root = hash_node(&subtree.node);
+    let (payload, bytes) = serialize_node(&node)?;
+    let root = hash_node(&node);
     Ok(LeafUpdate {
-        offset: ptr.offset,
-        subtree,
+        page: ptr.page,
+        node,
         payload,
         bytes,
         root,
@@ -474,9 +502,11 @@ fn compute_leaf_update(file: &File, ptr: DiskPtr, group: &[(Key, Hash)]) -> Resu
 /// thread-safe, and each task owns its own subtree, so there's no sharing.
 fn precompute_leaves(
     file: &File,
-    tasks: &[(DiskPtr, Vec<(Key, Hash)>)],
+    tasks: &[(DiskPtr, usize, Vec<(Key, Hash)>)],
 ) -> Result<Vec<LeafUpdate>> {
-    let work = |(ptr, group): &(DiskPtr, Vec<(Key, Hash)>)| compute_leaf_update(file, *ptr, group);
+    let work = |(ptr, depth, group): &(DiskPtr, usize, Vec<(Key, Hash)>)| {
+        compute_leaf_update(file, *ptr, *depth, group)
+    };
     if tasks.len() < 64 {
         return tasks.iter().map(work).collect();
     }
@@ -520,12 +550,24 @@ impl Default for Config {
 // hashes on the path it actually changed (see `node_insert`), instead of
 // re-hashing the whole subtree. All keys are full 64-nibble paths, so leaves
 // only ever sit at depth 64 and branches never carry a value.
+//
+// A `Leaf` carries its *remaining* nibble path (the merged extension+leaf of a
+// classic MPT) plus its cached Merkle hash. It deliberately does NOT store the
+// key or the value_hash:
+//   * the full key is recoverable from the leaf's position (subtree prefix ++
+//     structural nibbles ++ `path`), so storing it would duplicate the path;
+//   * the value_hash is only ever needed to (re)compute the leaf hash, and the
+//     hash is `keccak(3 || full_key || value_hash)` — independent of where the
+//     leaf sits — so it can be reused verbatim through splits, and a fresh
+//     value_hash is supplied directly on overwrite.
+// The leaf hash still commits to the full key (and thus the path), so the root
+// remains a sound commitment to the key/value set even though neither field is
+// stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Node {
     Empty,
     Leaf {
-        key: Key,
-        value_hash: Hash,
+        path: Vec<u8>,
         hash: Hash,
     },
     Extension {
@@ -535,24 +577,15 @@ enum Node {
     },
     Branch {
         children: [Option<Box<Node>>; 16],
-        value: Option<Hash>,
         hash: Hash,
     },
-}
-
-// A subtree is fully described by its `node`; the flat list of entries it holds
-// is derived on demand (`node_entries`) when a split needs to regroup them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DiskSubtree {
-    prefix: Vec<u8>,
-    node: Node,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RamChild {
     Ram(Box<RamNode>),
-    // `root` is the subtree's Merkle hash; the on-disk record size is recoverable
-    // from `ptr.len`, so it isn't stored here.
+    // `root` is the subtree's Merkle hash; the record's size (in pages) lives in
+    // `ptr`, and its rooting depth is recovered from the frontier path on descent.
     Disk { ptr: DiskPtr, root: Hash },
 }
 
@@ -635,7 +668,7 @@ struct ManifestRef<'a> {
     cfg: &'a Config,
     upper: &'a RamNode,
     free: &'a FreeList,
-    end_page: u64,
+    end_page: u32,
 }
 
 #[derive(Deserialize)]
@@ -643,7 +676,7 @@ struct Manifest {
     cfg: Config,
     upper: RamNode,
     free: FreeList,
-    end_page: u64,
+    end_page: u32,
 }
 
 impl FlatMpt {
@@ -798,21 +831,26 @@ impl FlatMpt {
         // Phase A (serial, cheap): route every key to the disk leaf it lands in,
         // grouping keys per leaf. Keys with no existing leaf (None) create new
         // structure and are handled by the serial apply below.
-        let mut groups: HashMap<u64, Vec<(Key, Hash)>> = HashMap::new();
-        let mut ptrs: HashMap<u64, DiskPtr> = HashMap::new();
+        let mut groups: HashMap<u32, Vec<(Key, Hash)>> = HashMap::new();
+        let mut ptrs: HashMap<u32, (DiskPtr, usize)> = HashMap::new();
         for &(key, value_hash) in &leaves {
-            if let Some(ptr) = find_disk_ptr_key(&self.upper, &key, 0) {
-                groups.entry(ptr.offset).or_default().push((key, value_hash));
-                ptrs.entry(ptr.offset).or_insert(ptr);
+            if let Some((ptr, depth)) = find_disk_ptr_key(&self.upper, &key, 0) {
+                groups.entry(ptr.page).or_default().push((key, value_hash));
+                ptrs.entry(ptr.page).or_insert((ptr, depth));
             }
         }
         // Phase B (parallel): read + apply keys (hash) + serialize each touched
         // leaf — all the per-leaf CPU, off the write path.
-        let tasks: Vec<(DiskPtr, Vec<(Key, Hash)>)> =
-            groups.into_iter().map(|(off, g)| (ptrs[&off], g)).collect();
+        let tasks: Vec<(DiskPtr, usize, Vec<(Key, Hash)>)> = groups
+            .into_iter()
+            .map(|(page, g)| {
+                let (ptr, depth) = ptrs[&page];
+                (ptr, depth, g)
+            })
+            .collect();
         let updates = precompute_leaves(&self.store.file, &tasks)?;
-        let mut precomputed: HashMap<u64, LeafUpdate> =
-            updates.into_iter().map(|u| (u.offset, u)).collect();
+        let mut precomputed: HashMap<u32, LeafUpdate> =
+            updates.into_iter().map(|u| (u.page, u)).collect();
 
         // Phase C (serial): install precomputed leaves (free + write/split) and
         // build any brand-new leaves; recompute the frontier hashes once.
@@ -864,7 +902,7 @@ impl FlatMpt {
     /// Logical size of the flat file (high-water mark). Stays flat across
     /// rewrites when freed space is reused.
     pub fn flat_file_len(&self) -> u64 {
-        self.store.end_page * PAGE
+        self.store.end_page as u64 * PAGE
     }
 
     /// Total bytes currently held in the flat file's free list.
@@ -905,12 +943,11 @@ impl FlatMpt {
     }
 
     pub fn disk_accesses_for_key(&mut self, key: &Key) -> Result<usize> {
-        let nibbles = key_nibbles(key);
-        let Some(ptr) = find_disk_ptr(&self.upper, &nibbles, 0) else {
+        let Some((ptr, depth)) = find_disk_ptr_key(&self.upper, key, 0) else {
             return Ok(0);
         };
-        let subtree = self.store.read(ptr)?;
-        if node_contains(&subtree.node, key) {
+        let node = self.store.read(ptr)?;
+        if node_contains(&node, key, depth) {
             Ok(1)
         } else {
             bail!("key not found in addressed disk subtree")
@@ -932,6 +969,20 @@ fn meta_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Build a brand-new single-entry disk record rooted at nibble `depth`, write it,
+/// and return the `RamChild::Disk` pointing at it.
+fn write_leaf_record(
+    store: &mut FlatFile,
+    depth: usize,
+    key: Key,
+    value_hash: Hash,
+) -> Result<RamChild> {
+    let node = single_entry_node(key, leaf_hash(key, value_hash), depth);
+    let (payload, _) = serialize_node(&node)?;
+    let ptr = store.write_payload(&payload)?;
+    Ok(RamChild::Disk { ptr, root: hash_node(&node) })
+}
+
 fn insert_ram(
     store: &mut FlatFile,
     cfg: &Config,
@@ -949,13 +1000,9 @@ fn insert_ram(
             // Build the leaf at the branch-slot depth (prefix + slot nibble), the
             // same depth every other code path uses, so the representation — and
             // therefore the hash — is independent of how the leaf was created.
-            let mut child_prefix = prefix;
-            child_prefix.push(idx as u8);
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
-            let (payload, _) = serialize_subtree(&subtree)?;
-            let ptr = store.write_payload(&payload)?;
+            let depth = prefix.len() + 1;
             let mut children = empty_children();
-            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+            children[idx] = Some(write_leaf_record(store, depth, key, value_hash)?);
             *node = RamNode::Branch {
                 children,
                 hash: Cell::new(None),
@@ -988,13 +1035,8 @@ fn insert_ram(
                 }));
 
                 let new_idx = nibbles[prefix.len() + common] as usize;
-                let mut new_prefix = prefix.clone();
-                new_prefix.extend_from_slice(&old_path[..common]);
-                new_prefix.push(new_idx as u8);
-                let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
-                let (payload, _) = serialize_subtree(&subtree)?;
-                let ptr = store.write_payload(&payload)?;
-                children[new_idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+                let depth = prefix.len() + common + 1;
+                children[new_idx] = Some(write_leaf_record(store, depth, key, value_hash)?);
 
                 let branch = RamNode::Branch {
                     children,
@@ -1023,6 +1065,7 @@ fn insert_ram(
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
+            let depth = child_prefix.len();
             match &mut children[idx] {
                 Some(RamChild::Ram(child)) => {
                     insert_ram(store, cfg, child, child_prefix, key, value_hash)
@@ -1032,34 +1075,28 @@ fn insert_ram(
                     let old_ptr = *ptr;
                     // Incremental: re-hash only the path from this leaf's root down
                     // to the changed entry; untouched siblings keep cached hashes.
-                    node_insert(&mut subtree.node, subtree.prefix.len(), key, value_hash);
+                    node_insert(&mut subtree, depth, key, value_hash);
                     debug_assert_eq!(
-                        hash_node(&subtree.node),
-                        hash_node(&build_node(
-                            &node_entries(&subtree.node),
-                            subtree.prefix.len()
-                        )),
+                        hash_node(&subtree),
+                        hash_node(&build_node(&node_entries(&subtree, &child_prefix), depth)),
                         "incremental node hash diverged from a full rebuild",
                     );
-                    let (payload, new_bytes) = serialize_subtree(&subtree)?;
+                    let (payload, new_bytes) = serialize_node(&subtree)?;
                     // The old record is now dead; reclaim it before writing so the
                     // rewrite can land back in the same region when it still fits.
                     store.free(old_ptr);
                     if new_bytes <= cfg.max_leaf_bytes {
                         let new_ptr = store.write_payload(&payload)?;
                         *ptr = new_ptr;
-                        *root = hash_node(&subtree.node);
+                        *root = hash_node(&subtree);
                     } else {
                         stats::on_split(new_bytes);
-                        children[idx] = Some(split_subtree(store, cfg, subtree)?);
+                        children[idx] = Some(split_subtree(store, cfg, subtree, child_prefix)?);
                     }
                     Ok(())
                 }
                 None => {
-                    let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
-                    let (payload, _) = serialize_subtree(&subtree)?;
-                    let ptr = store.write_payload(&payload)?;
-                    children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+                    children[idx] = Some(write_leaf_record(store, depth, key, value_hash)?);
                     Ok(())
                 }
             }
@@ -1067,12 +1104,21 @@ fn insert_ram(
     }
 }
 
-fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Result<RamChild> {
-    let leaves = node_entries(&subtree.node);
+/// Turn an oversized disk node (rooted at nibble depth `prefix.len()`) back into
+/// a RAM-frontier branch of smaller disk records. `prefix` is the nibble path to
+/// the node's root, supplied by the caller (it is no longer stored on disk); it
+/// is needed to reconstruct each leaf's full key for regrouping.
+fn split_subtree(
+    store: &mut FlatFile,
+    cfg: &Config,
+    node: Node,
+    prefix: Vec<u8>,
+) -> Result<RamChild> {
+    let leaves = node_entries(&node, &prefix);
     // Absorb any nibbles all entries still share into the prefix (becomes a RAM
     // extension), then fan the rest out by their next nibble.
-    let shared = shared_prefix_after(&leaves, subtree.prefix.len());
-    let mut prefix = subtree.prefix;
+    let shared = shared_prefix_after(&leaves, prefix.len());
+    let mut prefix = prefix;
     prefix.extend_from_slice(&shared);
 
     let groups = group_by_next_nibble(&leaves, prefix.len());
@@ -1085,25 +1131,25 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
         }
         let mut child_prefix = prefix.clone();
         child_prefix.push(idx as u8);
-        let child_subtree = subtree_from_entries(child_prefix, entries);
-        let (payload, child_bytes) = serialize_subtree(&child_subtree)?;
+        let child_node = build_node(&entries, child_prefix.len());
+        let (payload, child_bytes) = serialize_node(&child_node)?;
         if child_bytes > cfg.max_leaf_bytes {
             stats::on_split(child_bytes);
-            children[idx] = Some(split_subtree(store, cfg, child_subtree)?);
+            children[idx] = Some(split_subtree(store, cfg, child_node, child_prefix)?);
         } else if child_bytes >= cfg.min_promote_bytes {
             let ptr = store.write_payload(&payload)?;
             stats::on_split_leaf(child_bytes);
-            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&child_subtree.node) });
+            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&child_node) });
         } else {
-            remainder.push((idx, child_subtree));
+            remainder.push((idx, child_node));
         }
     }
 
-    for (idx, rem_subtree) in remainder {
-        let (payload, bytes) = serialize_subtree(&rem_subtree)?;
+    for (idx, rem_node) in remainder {
+        let (payload, bytes) = serialize_node(&rem_node)?;
         let ptr = store.write_payload(&payload)?;
         stats::on_split_leaf(bytes);
-        children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&rem_subtree.node) });
+        children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&rem_node) });
     }
 
     let branch = RamNode::Branch {
@@ -1121,9 +1167,11 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
     }
 }
 
-fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Hash)>) -> DiskSubtree {
-    let node = build_node(&entries, prefix.len());
-    DiskSubtree { prefix, node }
+/// Convert a freshly-inserted `(key, value_hash)` batch group into the canonical
+/// `(key, leaf_hash)` entry form used by [`build_node`] (the value_hash is folded
+/// into the position-independent leaf hash and then dropped).
+fn leaf_entries(group: &[(Key, Hash)]) -> Vec<(Key, Hash)> {
+    group.iter().map(|&(k, vh)| (k, leaf_hash(k, vh))).collect()
 }
 
 /// The `i`-th nibble of a key (i in 0..64), without allocating.
@@ -1155,14 +1203,14 @@ fn make_disk_or_split(
     prefix: Vec<u8>,
     entries: Vec<(Key, Hash)>,
 ) -> Result<RamChild> {
-    let subtree = subtree_from_entries(prefix, entries);
-    let (payload, bytes) = serialize_subtree(&subtree)?;
+    let node = build_node(&entries, prefix.len());
+    let (payload, bytes) = serialize_node(&node)?;
     if bytes <= cfg.max_leaf_bytes {
         let ptr = store.write_payload(&payload)?;
-        Ok(RamChild::Disk { ptr, root: hash_node(&subtree.node) })
+        Ok(RamChild::Disk { ptr, root: hash_node(&node) })
     } else {
         stats::on_split(bytes);
-        split_subtree(store, cfg, subtree)
+        split_subtree(store, cfg, node, prefix)
     }
 }
 
@@ -1175,7 +1223,7 @@ fn insert_ram_batch(
     node: &mut RamNode,
     prefix: Vec<u8>,
     batch: &[(Key, Hash)],
-    precomputed: &mut HashMap<u64, LeafUpdate>,
+    precomputed: &mut HashMap<u32, LeafUpdate>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1188,7 +1236,7 @@ fn insert_ram_batch(
                 let mut child_prefix = prefix.clone();
                 child_prefix.push(nib);
                 children[nib as usize] =
-                    Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+                    Some(make_disk_or_split(store, cfg, child_prefix, leaf_entries(group))?);
             }
             *node = RamNode::Branch {
                 children,
@@ -1243,7 +1291,7 @@ fn insert_ram_batch(
                         }
                     } else {
                         children[idx] =
-                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+                            Some(make_disk_or_split(store, cfg, child_prefix, leaf_entries(group))?);
                     }
                 }
 
@@ -1278,10 +1326,12 @@ fn insert_ram_batch(
                     Some(RamChild::Disk { ptr, .. }) => {
                         // The leaf's update (read + node_insert + serialize) was
                         // computed in parallel; here we only do the serial write.
-                        let update = match precomputed.remove(&ptr.offset) {
+                        let update = match precomputed.remove(&ptr.page) {
                             Some(update) => update,
                             // Fallback (shouldn't happen): compute inline.
-                            None => compute_leaf_update(&store.file, *ptr, group)?,
+                            None => {
+                                compute_leaf_update(&store.file, *ptr, child_prefix.len(), group)?
+                            }
                         };
                         store.free(*ptr);
                         if update.bytes <= cfg.max_leaf_bytes {
@@ -1289,12 +1339,13 @@ fn insert_ram_batch(
                             children[idx] = Some(RamChild::Disk { ptr: new_ptr, root: update.root });
                         } else {
                             stats::on_split(update.bytes);
-                            children[idx] = Some(split_subtree(store, cfg, update.subtree)?);
+                            children[idx] =
+                                Some(split_subtree(store, cfg, update.node, child_prefix)?);
                         }
                     }
                     None => {
                         children[idx] =
-                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
+                            Some(make_disk_or_split(store, cfg, child_prefix, leaf_entries(group))?);
                     }
                 }
             }
@@ -1303,50 +1354,81 @@ fn insert_ram_batch(
     }
 }
 
-/// Collect every `(key, value_hash)` leaf in a node, in ascending key order.
-fn node_entries(node: &Node) -> Vec<(Key, Hash)> {
-    fn walk(node: &Node, out: &mut Vec<(Key, Hash)>) {
+/// Collect every `(key, leaf_hash)` entry in a node, in ascending key order.
+/// `prefix` is the nibble path to the node's root (depth = `prefix.len()`); each
+/// leaf's full key is reconstructed from `prefix ++ structural nibbles ++ leaf
+/// path` (the key is no longer stored), and the cached, position-independent leaf
+/// hash is reused verbatim — no value_hash and no re-hashing are needed.
+fn node_entries(node: &Node, prefix: &[u8]) -> Vec<(Key, Hash)> {
+    fn walk(node: &Node, acc: &mut Vec<u8>, out: &mut Vec<(Key, Hash)>) {
         match node {
             Node::Empty => {}
-            Node::Leaf {
-                key, value_hash, ..
-            } => out.push((*key, *value_hash)),
-            Node::Extension { child, .. } => walk(child, out),
+            Node::Leaf { path, hash } => {
+                let len = acc.len();
+                acc.extend_from_slice(path);
+                out.push((nibbles_to_key(acc), *hash));
+                acc.truncate(len);
+            }
+            Node::Extension { path, child, .. } => {
+                let len = acc.len();
+                acc.extend_from_slice(path);
+                walk(child, acc, out);
+                acc.truncate(len);
+            }
             Node::Branch { children, .. } => {
-                for child in children.iter().flatten() {
-                    walk(child, out);
+                for (idx, child) in children.iter().enumerate() {
+                    if let Some(child) = child {
+                        acc.push(idx as u8);
+                        walk(child, acc, out);
+                        acc.pop();
+                    }
                 }
             }
         }
     }
+    let mut acc = prefix.to_vec();
     let mut out = Vec::new();
-    walk(node, &mut out);
+    walk(node, &mut acc, &mut out);
     out
 }
 
-/// Whether a node's subtree holds `key` (used by the `disk_accesses_for_key` probe).
-fn node_contains(node: &Node, key: &Key) -> bool {
+/// Whether the node holds `key`; `depth` is the nibble depth of `node`. Used by
+/// the `disk_accesses_for_key` probe (containment is decided structurally now
+/// that leaves no longer store the key).
+fn node_contains(node: &Node, key: &Key, depth: usize) -> bool {
     match node {
         Node::Empty => false,
-        Node::Leaf { key: k, .. } => k == key,
-        Node::Extension { child, .. } => node_contains(child, key),
-        Node::Branch { children, .. } => {
-            children.iter().flatten().any(|c| node_contains(c, key))
+        Node::Leaf { path, .. } => key_nibbles(key)[depth..] == path[..],
+        Node::Extension { path, child, .. } => {
+            let rem = &key_nibbles(key)[depth..];
+            rem.len() >= path.len()
+                && &rem[..path.len()] == path.as_slice()
+                && node_contains(child, key, depth + path.len())
         }
+        Node::Branch { children, .. } => match &children[nibble_at(key, depth) as usize] {
+            Some(child) => node_contains(child, key, depth + 1),
+            None => false,
+        },
     }
 }
 
 // --- Disk-node constructors: compute and cache the node hash exactly once. ---
 
-fn make_leaf(key: Key, value_hash: Hash) -> Node {
+/// Position-independent Merkle hash of a leaf: `keccak(3 || full_key ||
+/// value_hash)`. Committing to the full key (rather than the remaining path)
+/// keeps the hash invariant as the leaf is pushed to different depths by splits,
+/// so it can be reused verbatim and neither the key nor value_hash is stored.
+fn leaf_hash(key: Key, value_hash: Hash) -> Hash {
     let mut bytes = vec![3];
     bytes.extend_from_slice(&key);
     bytes.extend_from_slice(&value_hash);
-    Node::Leaf {
-        key,
-        value_hash,
-        hash: keccak(&bytes),
-    }
+    keccak(&bytes)
+}
+
+/// Path-carrying leaf (the merged extension+leaf of a classic MPT): stores the
+/// remaining nibbles down to depth 64 plus the precomputed hash.
+fn leaf_node(path: Vec<u8>, hash: Hash) -> Node {
+    Node::Leaf { path, hash }
 }
 
 fn make_extension(path: Vec<u8>, child: Node) -> Node {
@@ -1366,20 +1448,14 @@ fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
     }
     Node::Branch {
         children,
-        value: None,
         hash: keccak(&bytes),
     }
 }
 
-/// Canonical node for a subtree holding exactly one entry at `depth`.
-fn single_entry_node(key: Key, value_hash: Hash, depth: usize) -> Node {
-    let path = key_nibbles(&key)[depth..].to_vec();
-    let leaf = make_leaf(key, value_hash);
-    if path.is_empty() {
-        leaf
-    } else {
-        make_extension(path, leaf)
-    }
+/// Canonical node for a subtree holding exactly one `(key, leaf_hash)` entry at
+/// `depth`: a single path-carrying leaf.
+fn single_entry_node(key: Key, leaf_hash: Hash, depth: usize) -> Node {
+    leaf_node(key_nibbles(&key)[depth..].to_vec(), leaf_hash)
 }
 
 fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
@@ -1387,8 +1463,8 @@ fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
         return Node::Empty;
     }
     if entries.len() == 1 {
-        let (key, value_hash) = entries[0];
-        return single_entry_node(key, value_hash, depth);
+        let (key, lh) = entries[0];
+        return single_entry_node(key, lh, depth);
     }
 
     let nibbles: Vec<Vec<u8>> = entries.iter().map(|(key, _)| key_nibbles(key)).collect();
@@ -1420,28 +1496,42 @@ fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
     make_branch(children)
 }
 
-/// Insert `(key, value_hash)` into an existing disk-subtree node in place,
-/// recomputing cached hashes only for the nodes on the changed path. Every
-/// untouched sibling subtree is left exactly as-is (hash included), which is
-/// what makes the disk-side hashing strictly essential. `depth` is the nibble
-/// depth of `node`. Produces the same canonical structure `build_node` would.
+/// Insert `(key, value_hash)` into an existing disk node in place, recomputing
+/// cached hashes only for the nodes on the changed path. Untouched sibling
+/// subtrees are left exactly as-is (hashes included); a leaf displaced by a new
+/// sibling keeps its cached (position-independent) hash and only gets a shorter
+/// path. `depth` is the nibble depth of `node`. Produces the same canonical
+/// structure `build_node` would.
 fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
     let nibbles = key_nibbles(&key);
     let updated = match std::mem::replace(node, Node::Empty) {
-        Node::Empty => single_entry_node(key, value_hash, depth),
-        Node::Leaf {
-            key: leaf_key,
-            value_hash: leaf_vh,
-            ..
-        } => {
-            if leaf_key == key {
-                make_leaf(key, value_hash)
+        Node::Empty => single_entry_node(key, leaf_hash(key, value_hash), depth),
+        Node::Leaf { path, hash } => {
+            let remaining = &nibbles[depth..];
+            let common = common_prefix(&path, remaining);
+            if common == path.len() {
+                // Same key (both remaining paths run to depth 64): overwrite value.
+                debug_assert_eq!(path.as_slice(), remaining);
+                leaf_node(path, leaf_hash(key, value_hash))
             } else {
-                // A bare leaf sits at depth 64, so two distinct 32-byte keys can
-                // never both reach it — they diverge earlier, at a branch.
-                debug_assert_ne!(leaf_key, key);
-                let _ = leaf_vh;
-                unreachable!("two distinct keys cannot share a full 64-nibble path");
+                // The new key diverges partway along the leaf's path. Keep the old
+                // leaf's cached hash (its full key is unchanged) under a shorter
+                // path, and add the new leaf alongside.
+                let mut children = empty_box_children();
+                let old_idx = path[common] as usize;
+                children[old_idx] = Some(Box::new(leaf_node(path[common + 1..].to_vec(), hash)));
+                let new_idx = remaining[common] as usize;
+                children[new_idx] = Some(Box::new(single_entry_node(
+                    key,
+                    leaf_hash(key, value_hash),
+                    depth + common + 1,
+                )));
+                let branch = make_branch(children);
+                if common == 0 {
+                    branch
+                } else {
+                    make_extension(path[..common].to_vec(), branch)
+                }
             }
         }
         Node::Extension {
@@ -1463,8 +1553,11 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
                     make_extension(old_rest, *child)
                 }));
                 let new_idx = nibbles[depth + common] as usize;
-                children[new_idx] =
-                    Some(Box::new(single_entry_node(key, value_hash, depth + common + 1)));
+                children[new_idx] = Some(Box::new(single_entry_node(
+                    key,
+                    leaf_hash(key, value_hash),
+                    depth + common + 1,
+                )));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -1478,8 +1571,11 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
             match &mut children[idx] {
                 Some(child) => node_insert(child, depth + 1, key, value_hash),
                 None => {
-                    children[idx] =
-                        Some(Box::new(single_entry_node(key, value_hash, depth + 1)));
+                    children[idx] = Some(Box::new(single_entry_node(
+                        key,
+                        leaf_hash(key, value_hash),
+                        depth + 1,
+                    )));
                 }
             }
             make_branch(children)
@@ -1488,55 +1584,34 @@ fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
     *node = updated;
 }
 
-/// Serialize a subtree once, returning the payload and the total on-disk record
-/// size (`payload + 4`-byte length prefix). Callers use the size to decide
-/// rewrite-vs-split and pass the same payload to [`FlatFile::write_payload`].
-fn serialize_subtree(subtree: &DiskSubtree) -> Result<(Vec<u8>, usize)> {
+/// Serialize a node, returning the payload and its byte length. The length is the
+/// exact on-disk record size (recorded in the addressing [`DiskPtr`], so no
+/// length prefix is written) and is used by callers to decide rewrite-vs-split.
+fn serialize_node(node: &Node) -> Result<(Vec<u8>, usize)> {
     let _g = prof::scope(prof::Cat::Serialize);
     let mut payload = Vec::new();
-    payload.extend_from_slice(SUBTREE_MAGIC);
-    payload.push(SUBTREE_VERSION);
-    write_nibble_path(&mut payload, &subtree.prefix)?;
-    write_node(&mut payload, &subtree.node)?;
-    let total = payload.len() + 4;
+    write_node(&mut payload, node)?;
+    let total = payload.len();
     Ok((payload, total))
 }
 
-fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
-    if payload.get(..SUBTREE_MAGIC.len()) != Some(SUBTREE_MAGIC.as_slice()) {
-        // Backward compatibility for databases written before the compact
-        // subtree format was introduced.
-        return Ok(bincode::deserialize(payload)?);
-    }
-
+fn deserialize_node(payload: &[u8]) -> Result<Node> {
     let mut reader = CompactReader::new(payload);
-    let magic = reader.read_bytes(SUBTREE_MAGIC.len())?;
-    if magic != SUBTREE_MAGIC {
-        bail!("invalid compact subtree magic");
-    }
-    let version = reader.read_u8()?;
-    if version != SUBTREE_VERSION {
-        bail!("unsupported compact subtree version {version}");
-    }
-    let prefix = reader.read_nibble_path()?;
     let node = reader.read_node()?;
-    if !reader.is_finished() {
-        bail!("trailing bytes in compact subtree record");
+    // The record is read as a whole number of pages; everything past the node is
+    // zero padding written by `write_payload`. A non-zero tail means corruption.
+    if !reader.remaining_is_zero() {
+        bail!("non-zero trailing bytes in flat-file record");
     }
-    Ok(DiskSubtree { prefix, node })
+    Ok(node)
 }
 
 fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     match node {
         Node::Empty => out.push(0),
-        Node::Leaf {
-            key,
-            value_hash,
-            hash,
-        } => {
+        Node::Leaf { path, hash } => {
             out.push(1);
-            out.extend_from_slice(key);
-            out.extend_from_slice(value_hash);
+            write_nibble_path(out, path)?;
             out.extend_from_slice(hash);
         }
         Node::Extension { path, child, hash } => {
@@ -1545,12 +1620,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
             out.extend_from_slice(hash);
             write_node(out, child)?;
         }
-        Node::Branch {
-            children,
-            value,
-            hash,
-        } => {
-            debug_assert!(value.is_none(), "disk branches never carry values");
+        Node::Branch { children, hash } => {
             out.push(3);
             let mut bitmap = 0u16;
             for (idx, child) in children.iter().enumerate() {
@@ -1594,8 +1664,9 @@ impl<'a> CompactReader<'a> {
         Self { bytes, pos: 0 }
     }
 
-    fn is_finished(&self) -> bool {
-        self.pos == self.bytes.len()
+    /// Whether every remaining byte is zero (used to validate page padding).
+    fn remaining_is_zero(&self) -> bool {
+        self.bytes[self.pos..].iter().all(|&b| b == 0)
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -1647,14 +1718,9 @@ impl<'a> CompactReader<'a> {
         match self.read_u8()? {
             0 => Ok(Node::Empty),
             1 => {
-                let key = self.read_hash()?;
-                let value_hash = self.read_hash()?;
+                let path = self.read_nibble_path()?;
                 let hash = self.read_hash()?;
-                Ok(Node::Leaf {
-                    key,
-                    value_hash,
-                    hash,
-                })
+                Ok(Node::Leaf { path, hash })
             }
             2 => {
                 let path = self.read_nibble_path()?;
@@ -1671,11 +1737,7 @@ impl<'a> CompactReader<'a> {
                         *slot = Some(Box::new(self.read_node()?));
                     }
                 }
-                Ok(Node::Branch {
-                    children,
-                    value: None,
-                    hash,
-                })
+                Ok(Node::Branch { children, hash })
             }
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
@@ -1691,30 +1753,11 @@ fn group_by_next_nibble(entries: &[(Key, Hash)], depth: usize) -> [Vec<(Key, Has
     groups
 }
 
-fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {
-    match node {
-        RamNode::Empty => None,
-        RamNode::Extension { path, child, .. } => {
-            if nibbles.get(depth..depth + path.len()) == Some(path.as_slice()) {
-                find_disk_ptr(child, nibbles, depth + path.len())
-            } else {
-                None
-            }
-        }
-        RamNode::Branch { children, .. } => {
-            let idx = *nibbles.get(depth)? as usize;
-            match children[idx].as_ref()? {
-                RamChild::Ram(child) => find_disk_ptr(child, nibbles, depth + 1),
-                RamChild::Disk { ptr, .. } => Some(*ptr),
-            }
-        }
-    }
-}
-
-/// Route `key` to the disk leaf it currently lives in (or `None` if it would
-/// land on an empty/absent slot). Allocation-free variant of [`find_disk_ptr`],
-/// used to collect leaves for parallel prefetch.
-fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr> {
+/// Route `key` to the disk leaf it currently lives in, returning the leaf's
+/// `DiskPtr` and the nibble depth at which its node is rooted (or `None` if the
+/// key would land on an empty/absent slot). The depth replaces the per-record
+/// prefix that disk subtrees used to store.
+fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<(DiskPtr, usize)> {
     match node {
         RamNode::Empty => None,
         RamNode::Extension { path, child, .. } => {
@@ -1732,7 +1775,7 @@ fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr>
             }
             match children[nibble_at(key, depth) as usize].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr_key(child, key, depth + 1),
-                RamChild::Disk { ptr, .. } => Some(*ptr),
+                RamChild::Disk { ptr, .. } => Some((*ptr, depth + 1)),
             }
         }
     }
@@ -1822,6 +1865,18 @@ fn key_nibbles(key: &Key) -> Vec<u8> {
         .collect()
 }
 
+/// Pack 64 nibbles back into a 32-byte key (inverse of [`key_nibbles`]). Used to
+/// reconstruct a leaf's full key from its position, since leaves no longer store
+/// the key.
+fn nibbles_to_key(nibbles: &[u8]) -> Key {
+    debug_assert_eq!(nibbles.len(), 64, "a full key is 64 nibbles");
+    let mut key = [0u8; 32];
+    for (i, pair) in nibbles.chunks(2).enumerate() {
+        key[i] = (pair[0] << 4) | pair[1];
+    }
+    key
+}
+
 fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
@@ -1879,8 +1934,10 @@ fn collect_leaf_stats(node: &RamNode, stats: &mut LeafStats) {
                 match child {
                     RamChild::Disk { ptr, .. } => {
                         stats.count += 1;
-                        stats.total_bytes += ptr.len as u64;
-                        let pages = ((ptr.len as u64).div_ceil(PAGE).max(1)).min(8) as usize;
+                        // Page-aligned footprint (exact payload bytes are no longer
+                        // stored in the pointer).
+                        stats.total_bytes += ptr.byte_len() as u64;
+                        let pages = (ptr.pages as usize).clamp(1, 8);
                         stats.page_hist[pages] += 1;
                     }
                     RamChild::Ram(n) => collect_leaf_stats(n, stats),

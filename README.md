@@ -27,13 +27,13 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
    │   { ptr, root }     (Box<RamNode>)                          │
    │        │                                                    │
    └────────┼────────────────────────────────────────────────-─┘
-            │ DiskPtr { offset, len }
+            │ DiskPtr { page, pages }
             ▼
    store: FlatFile  ──────────────────────  values: rocksdb::DB
    ┌──────────────────────────────┐         ┌──────────────────────┐
-   │ flat file of DiskSubtree      │         │  key → value bytes    │
-   │ records  [len][compact bytes] │         │  (the trie only ever  │
-   │ + FreeList (reuse of holes)   │         │   stores value_hash)  │
+   │ flat file of compact `Node`   │         │  key → value bytes    │
+   │ records (page-aligned)        │         │  (the trie only ever  │
+   │ + FreeList (reuse of holes)   │         │   hashes value_hash)  │
    └──────────────────────────────┘         └──────────────────────┘
 ```
 
@@ -43,18 +43,29 @@ There are **three storage tiers**, each with a distinct job:
 The top of the trie is held in memory. Its nodes are `Branch` (16-way) and
 `Extension` (shared-nibble path) — the same shapes as a classic MPT. A branch
 slot points either to another in-RAM node (`RamChild::Ram`) or to a subtree that
-has been pushed to disk (`RamChild::Disk`, holding a `DiskPtr`, the subtree's
-cached `root` hash, and its byte size).
+has been pushed to disk (`RamChild::Disk`, holding a `DiskPtr` and the subtree's
+cached `root` hash).
 
 The frontier stays small on purpose: large subtrees are written to disk and
 represented by a single `RamChild::Disk` pointer. `ram_nodes()` reports the
 current frontier size, and several tests assert it stays bounded.
 
 ### 2. The flat file (`FlatFile` / `store`)
-Disk subtrees are compact-encoded `DiskSubtree` records appended to one flat file
-as `[len: u32][payload]`. A `DiskPtr { offset, len }` addresses a record. The
-payload keeps the subtree's cached Merkle hashes, but avoids bincode's enum,
-`Vec`, `Option`, and `Box` overhead for the hot disk records.
+Disk subtrees are compact-encoded `Node` records written to one flat file in
+**page-aligned** extents (a whole number of 4 KiB pages). A `DiskPtr { page,
+pages }` addresses a record — an 8-byte pointer (a `u32` page index + `u16` page
+count), since the page-aligned layout makes a full byte offset and byte length
+redundant. There is **no length prefix and no magic/version header** on the
+record: the size comes from the `DiskPtr`, and the unused tail of the last page
+is zero-padded so reads can validate it. The payload keeps each node's cached
+Merkle hash but avoids bincode's enum, `Vec`, `Option`, and `Box` overhead.
+
+A record stores only what the frontier can't reconstruct: a leaf is just its
+*remaining* nibble path plus its cached hash — **neither the key nor the
+value_hash is stored** (the full key is implied by the leaf's position, and the
+hash, which commits to `key || value_hash`, is position-independent so it survives
+splits and is supplied fresh on overwrite). The subtree's `prefix` is gone too —
+it is the frontier path to the record, which the walker already knows.
 
 Crucially, the file is **not** purely append-only: a `FreeList` tracks regions
 vacated by rewritten/split subtrees. New writes prefer a best-fit free region
@@ -91,7 +102,7 @@ writable trie (cached hashes and all). `create()` remains the from-scratch path
 1. `value_hash = hash_leaf_value(value)`, then buffer `key -> value` in the RAM
    overlay (flushed to RocksDB in `WriteBatch` chunks).
 2. `insert_ram` walks/mutates the RAM frontier down to the relevant branch slot:
-   - **Empty slot** → create a single-entry `DiskSubtree`, write it, install a `RamChild::Disk`.
+   - **Empty slot** → create a single-entry leaf record, write it, install a `RamChild::Disk`.
    - **`RamChild::Disk`** → read the subtree, **incrementally insert** the new
      entry into its `Node` tree (`node_insert`), and either rewrite it in place
      (reusing freed space) or, if it exceeds `Config::max_leaf_bytes`,
@@ -104,10 +115,12 @@ Recomputing the whole trie hash on every insert is the naive cost. This PoC
 avoids it on both tiers:
 
 - **Disk subtrees:** every `Node` caches its own Merkle hash, computed once at
-  construction (`make_leaf` / `make_extension` / `make_branch`) and serialized to
+  construction (`leaf_hash` / `make_extension` / `make_branch`) and serialized to
   disk. `node_insert` mutates a subtree in place and recomputes hashes **only
   along the changed root-to-leaf path**; untouched sibling subtrees are reused
-  verbatim with their cached hashes.
+  verbatim with their cached hashes. Because the leaf hash commits to the *full*
+  key (not the remaining path), a leaf displaced deeper by a new sibling keeps its
+  cached hash and only gets a shorter path — so even that is not re-hashed.
 - **RAM frontier:** `RamNode` caches its hash in a `Cell`. An insert calls
   `invalidate_ram` as it descends, clearing caches only on the touched path;
   `hash_ram`/`root` then recompute just those and reuse the rest. Disk children
@@ -152,32 +165,36 @@ Public API and types:
 - **`Config`** — leaf-size thresholds: `target_leaf_bytes`, `max_leaf_bytes`
   (rewrite vs. split), `min_promote_bytes` (promote to its own disk record vs.
   fold into a remainder).
-- **`Hash` / `Key`** — `[u8; 32]` aliases. **`DiskPtr`** — `{ offset, len }`.
+- **`Hash` / `Key`** — `[u8; 32]` aliases. **`DiskPtr`** — `{ page: u32, pages:
+  u16 }`, an 8-byte page-aligned record address.
 - **`prof`** — opt-in (`--features profiling`) wall-clock attribution + a keccak
   audit hook. Compiles to zero-cost no-ops when the feature is off.
 
 Internal storage:
-- **`FreeList`** — coalescing, best-fit allocator over freed flat-file regions.
-- **`FlatFile`** — the flat file plus its `FreeList` and high-water `end`;
-  `write_payload` / `read` / `free` / `flush` / `sync` of `DiskSubtree` records.
+- **`FreeList`** — coalescing, best-fit allocator over freed flat-file regions,
+  in page units (`u32` page index → `u32` page count).
+- **`FlatFile`** — the flat file plus its `FreeList` and high-water `end_page`;
+  `write_payload` / `read` / `free` / `flush` / `sync` of compact `Node` records.
 - **`Manifest` / `ManifestRef`** — the serialized checkpoint (`cfg` + `upper` +
-  `free` + `end`) read/written by `open` / `persist` via the `.meta` sidecar.
+  `free` + `end_page`) read/written by `open` / `persist` via the `.meta` sidecar.
 
 Internal trie:
 - **`Node`** (`Empty` / `Leaf` / `Extension` / `Branch`) — a disk subtree's
-  Merkle structure; each non-trivial variant caches its `hash`. Serialized.
-- **`DiskSubtree`** — `{ prefix, node }`: the compact-encoded node plus the
-  nibble prefix it is rooted at. Splits derive `(Key, value_hash)` entries from
-  the node on demand.
-- **`RamChild`** — `Ram(Box<RamNode>)` or `Disk { ptr, root, bytes }`.
+  Merkle structure; each non-trivial variant caches its `hash`. A `Leaf` is
+  `{ path, hash }` (the merged extension+leaf of a classic MPT) — no stored key or
+  value_hash. Branches carry no value (keys are full 64-nibble paths). Serialized
+  as bare records; the rooting `prefix` is supplied by the caller from the
+  frontier, not stored. Splits reconstruct `(Key, leaf_hash)` entries from the
+  node + prefix on demand (`node_entries`).
+- **`RamChild`** — `Ram(Box<RamNode>)` or `Disk { ptr, root }`.
 - **`RamNode`** (`Empty` / `Extension` / `Branch`) — RAM frontier nodes with a
   `Cell`-cached hash.
 
 Key functions:
 - `insert_ram` — frontier walk/mutation; `invalidate_ram` clears path caches.
 - `node_insert` — incremental insertion into a disk `Node` (path-only re-hash).
-- `build_node` / `make_*` / `single_entry_node` — canonical node construction
-  with hash caching.
+- `build_node` / `make_extension` / `make_branch` / `single_entry_node` /
+  `leaf_hash` — canonical node construction with hash caching.
 - `split_subtree` — turn an oversized disk leaf back into a RAM branch frontier.
 - `hash_ram` / `hash_node` / `hash_join` / `hash_leaf_value` / `keccak` /
   `empty_hash` — the hashing layer (keccak-256).
@@ -212,7 +229,11 @@ the hot path carries no measurement overhead.
 - **Write amplification.** Each insert into a disk leaf rewrites the whole compact
   subtree record. The compact format keeps this cheaper than bincode, but the
   single-record rewrite remains the central cost of the design.
-- **Splits rebuild.** An overflowing leaf is rebuilt from its entries (its hashes
-  recomputed) — incremental hashing covers ordinary inserts, not splits.
-- **PoC value model.** Keys must be 32 bytes; values are duplicated between the
-  trie's `value_hash` and the RocksDB payload.
+- **Splits rebuild structure.** An overflowing leaf is fanned back out into a RAM
+  branch and smaller disk records. The leaves' cached hashes are reused verbatim
+  (they're position-independent), but the branch/extension nodes above are rebuilt
+  and re-hashed — incremental hashing covers ordinary inserts, not the restructure.
+- **PoC value model.** Keys must be 32 bytes. Value bytes live only in RocksDB;
+  the trie stores just a per-leaf hash that commits to `key || value_hash`, so the
+  value is not duplicated into the trie (the `value_hash` is folded into the leaf
+  hash and otherwise discarded).
