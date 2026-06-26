@@ -37,6 +37,11 @@ pub mod stats {
     pub static MAX_SPLIT_TRIGGER: AtomicU64 = AtomicU64::new(0);
     /// Histogram of written-record sizes, bucketed by page count (index 0..=16).
     pub static PAGE_HIST: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+    /// Leaves emitted by `split_subtree` (the children a split produces) and
+    /// their total bytes — sample the delta between milestones to see the
+    /// average size of *freshly split-created* leaves over an interval.
+    pub static SPLIT_LEAVES: AtomicU64 = AtomicU64::new(0);
+    pub static SPLIT_LEAF_BYTES: AtomicU64 = AtomicU64::new(0);
 
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
@@ -51,12 +56,20 @@ pub mod stats {
         MAX_SPLIT_TRIGGER.fetch_max(trigger as u64, Relaxed);
     }
 
+    /// Record one leaf produced by a split, with its record size in bytes.
+    pub fn on_split_leaf(bytes: usize) {
+        SPLIT_LEAVES.fetch_add(1, Relaxed);
+        SPLIT_LEAF_BYTES.fetch_add(bytes as u64, Relaxed);
+    }
+
     pub fn reset() {
         WRITES.store(0, Relaxed);
         SPLITS.store(0, Relaxed);
         MAX_RECORD.store(0, Relaxed);
         MIN_SPLIT_TRIGGER.store(u64::MAX, Relaxed);
         MAX_SPLIT_TRIGGER.store(0, Relaxed);
+        SPLIT_LEAVES.store(0, Relaxed);
+        SPLIT_LEAF_BYTES.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -1079,6 +1092,7 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
             children[idx] = Some(split_subtree(store, cfg, child_subtree)?);
         } else if child_bytes >= cfg.min_promote_bytes {
             let ptr = store.write_payload(&payload)?;
+            stats::on_split_leaf(child_bytes);
             children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&child_subtree.node) });
         } else {
             remainder.push((idx, child_subtree));
@@ -1086,8 +1100,9 @@ fn split_subtree(store: &mut FlatFile, cfg: &Config, subtree: DiskSubtree) -> Re
     }
 
     for (idx, rem_subtree) in remainder {
-        let (payload, _) = serialize_subtree(&rem_subtree)?;
+        let (payload, bytes) = serialize_subtree(&rem_subtree)?;
         let ptr = store.write_payload(&payload)?;
+        stats::on_split_leaf(bytes);
         children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&rem_subtree.node) });
     }
 

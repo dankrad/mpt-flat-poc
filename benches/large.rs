@@ -143,6 +143,10 @@ fn main() {
     let t = Instant::now();
     let mut chunk_start = Instant::now();
     let mut buf: Vec<(Key, Vec<u8>)> = Vec::new();
+    // Previous-milestone split-leaf totals, to report the per-interval average
+    // size of leaves freshly created by splitting.
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut prev_split_leaves, mut prev_split_bytes) = (0u64, 0u64);
     for i in 0..preload {
         if batch == 0 {
             db.insert(key_at(i), vec![0u8; 32]).unwrap();
@@ -157,14 +161,24 @@ fn main() {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
             let ls = db.leaf_stats();
+            // Split-created leaves in this interval (delta), and their avg size.
+            let sl = mpt_flat_poc::stats::SPLIT_LEAVES.load(Relaxed);
+            let sb = mpt_flat_poc::stats::SPLIT_LEAF_BYTES.load(Relaxed);
+            let d_leaves = sl - prev_split_leaves;
+            let d_bytes = sb - prev_split_bytes;
+            let split_avg = if d_leaves > 0 { d_bytes / d_leaves } else { 0 };
+            prev_split_leaves = sl;
+            prev_split_bytes = sb;
             println!(
-                "  [{:>4}M] {:>6.0}s | {:.2} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | free_reg {} | RAM {:.1} MiB",
+                "  [{:>4}M] {:>6.0}s | {:.1} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | split: {} new @ {} B | free_reg {} | RAM {:.0} MiB",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
                 db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
                 ls.count,
                 ls.avg_bytes(),
+                d_leaves,
+                split_avg,
                 db.free_regions(),
                 mib(live),
             );
