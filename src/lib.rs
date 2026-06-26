@@ -1023,12 +1023,20 @@ fn insert_ram(
                     // disk (one frontier entry) instead of promoting a RAM branch.
                     record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
                     migrate_record(store, cfg, &mut subtree)?;
-                    let (payload, _) = serialize_subtree(&subtree)?;
-                    // Old record is dead; reclaim before writing so the rewrite can
-                    // reuse the same region when it still fits.
-                    store.free(old_ptr);
-                    *ptr = store.write_payload(&payload)?;
-                    *root = hash_node(&subtree.node);
+                    if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
+                        // Majority of children externalized: lift this record into
+                        // the RAM frontier so its (now mostly-fat) children become
+                        // first-class frontier entries — shallower reads/rewrites.
+                        store.free(old_ptr);
+                        children[idx] = Some(promote_record_to_ram(store, subtree)?);
+                    } else {
+                        let (payload, _) = serialize_subtree(&subtree)?;
+                        // Old record is dead; reclaim before writing so the rewrite
+                        // can reuse the same region when it still fits.
+                        store.free(old_ptr);
+                        *ptr = store.write_payload(&payload)?;
+                        *root = hash_node(&subtree.node);
+                    }
                     Ok(())
                 }
                 None => {
@@ -1682,6 +1690,81 @@ fn migrate_record(store: &mut FlatFile, cfg: &Config, subtree: &mut DiskSubtree)
         let children = top_branch_children_mut(&mut subtree.node).unwrap();
         children[idx] = Some(Box::new(Node::Overflow { ptr, root }));
         rehash_top(&mut subtree.node);
+    }
+}
+
+/// Once this many of a packed record's 16 top-branch children have been
+/// externalized to `Overflow` records, the branch is "branchy" enough to earn a
+/// place in the RAM frontier — promote it (see [`promote_record_to_ram`]). A
+/// strict majority (8/16) lifts the frontier early enough to keep read/rewrite
+/// depth shallow, while the children left inline are by then just under
+/// `min_promote` (so writing them out wastes little space).
+const PROMOTE_AT_OVERFLOW: usize = 8;
+
+/// Count the `Overflow` children of a record's top branch (through a leading
+/// extension).
+fn count_overflow_children(node: &Node) -> usize {
+    match node {
+        Node::Branch { children, .. } => children
+            .iter()
+            .flatten()
+            .filter(|c| matches!(***c, Node::Overflow { .. }))
+            .count(),
+        Node::Extension { child, .. } => count_overflow_children(child),
+        _ => 0,
+    }
+}
+
+/// Promote a packed disk record into a RAM-frontier node: its top branch becomes
+/// a `RamNode::Branch` (re-wrapped in a `RamNode::Extension` if the record had a
+/// leading extension), and every child becomes a `RamChild::Disk` — `Overflow`
+/// children keep their existing record, inline children are written out to their
+/// own records. Root-preserving: the RAM node hashes identically to the disk
+/// record (unified tags, unchanged child roots). The caller frees the old record.
+fn promote_record_to_ram(store: &mut FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
+    let DiskSubtree { prefix, node } = subtree;
+    let (ext_path, branch_node) = match node {
+        Node::Branch { .. } => (Vec::new(), node),
+        Node::Extension { path, child, .. } => (path, *child),
+        _ => unreachable!("promote called on a record without a top branch"),
+    };
+    let Node::Branch { children, .. } = branch_node else {
+        unreachable!("a leading extension must wrap a branch");
+    };
+    let mut branch_prefix = prefix;
+    branch_prefix.extend_from_slice(&ext_path);
+
+    let mut ram_children = empty_children();
+    for (i, slot) in children.into_iter().enumerate() {
+        let Some(boxed) = slot else { continue };
+        let child = match *boxed {
+            // Already its own record — reuse it verbatim.
+            Node::Overflow { ptr, root } => RamChild::Disk { ptr, root },
+            // Inline small child — write it out (it's < min_promote, fits one record).
+            other => {
+                let mut cp = branch_prefix.clone();
+                cp.push(i as u8);
+                let root = hash_node(&other);
+                let child_sub = DiskSubtree { prefix: cp, node: other };
+                let (payload, _) = serialize_subtree(&child_sub)?;
+                let ptr = store.write_payload(&payload)?;
+                RamChild::Disk { ptr, root }
+            }
+        };
+        ram_children[i] = Some(child);
+    }
+    let branch = RamNode::Branch {
+        children: ram_children,
+        hash: Cell::new(None),
+    };
+    if ext_path.is_empty() {
+        Ok(RamChild::Ram(Box::new(branch)))
+    } else {
+        Ok(RamChild::Ram(Box::new(RamNode::Extension {
+            path: ext_path,
+            child: Box::new(branch),
+            hash: Cell::new(None),
+        })))
     }
 }
 
