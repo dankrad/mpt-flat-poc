@@ -104,6 +104,18 @@ fn main() {
         pw as f64 / tot_b * 100.0,
         per(pw),
     );
+    // Phase C is serial today; split it to see what a parallel version could win.
+    let (ci, cr, cf) = (
+        stats::C_INSTALL_NS.load(Relaxed),
+        stats::C_ROOT_NS.load(Relaxed),
+        stats::C_FLUSH_NS.load(Relaxed),
+    );
+    println!(
+        "  Phase C: install+fresh {:.1} ms/batch | root recompute {:.1} | flush {:.1}",
+        per(ci),
+        per(cr),
+        per(cf),
+    );
 
     // Re-persist so the on-disk manifest matches the mutated flat file (otherwise
     // the next reopen reads freed/overwritten regions).

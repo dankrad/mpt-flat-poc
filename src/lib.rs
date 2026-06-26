@@ -97,6 +97,19 @@ pub mod stats {
         B_SERIALIZE_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Phase-C sub-breakdown (serial): INSTALL = splice each group's result into
+    /// the frontier + create structure for brand-new keys, ROOT = recompute the
+    /// frontier hashes (`hash_ram` over the invalidated path — the keccac-heavy
+    /// part), FLUSH = the value-store flush.
+    pub static C_INSTALL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static C_ROOT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static C_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_phase_c(install_ns: u64, root_ns: u64, flush_ns: u64) {
+        C_INSTALL_NS.fetch_add(install_ns, Relaxed);
+        C_ROOT_NS.fetch_add(root_ns, Relaxed);
+        C_FLUSH_NS.fetch_add(flush_ns, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
@@ -131,6 +144,9 @@ pub mod stats {
         B_READ_NS.store(0, Relaxed);
         B_REBUILD_NS.store(0, Relaxed);
         B_FINAL_NS.store(0, Relaxed);
+        C_INSTALL_NS.store(0, Relaxed);
+        C_ROOT_NS.store(0, Relaxed);
+        C_FLUSH_NS.store(0, Relaxed);
         W_LOCK_NS.store(0, Relaxed);
         W_PWRITE_NS.store(0, Relaxed);
         B_SERIALIZE_NS.store(0, Relaxed);
@@ -975,9 +991,15 @@ impl FlatMpt {
         for (key, value_hash) in fresh {
             insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash)?;
         }
+        let install_ns = t_c.elapsed().as_nanos() as u64;
+        let t_flush = std::time::Instant::now();
         self.store.flush()?;
+        let flush_ns = t_flush.elapsed().as_nanos() as u64;
+        let t_root = std::time::Instant::now();
         let root = self.root();
+        let root_ns = t_root.elapsed().as_nanos() as u64;
         stats::on_batch(a_ns, b_ns, t_c.elapsed().as_nanos() as u64);
+        stats::on_phase_c(install_ns, root_ns, flush_ns);
         Ok(root)
     }
 
