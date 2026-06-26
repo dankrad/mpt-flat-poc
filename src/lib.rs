@@ -452,67 +452,8 @@ fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
     deserialize_subtree(&record[4..])
 }
 
-/// A leaf's update computed off the write path: the updated subtree, its
-/// serialized payload, encoded size, and root hash — everything except the
-/// flat-file write itself (which must stay serial, as the allocator is shared).
-struct LeafUpdate {
-    offset: u64,
-    subtree: DiskSubtree,
-    payload: Vec<u8>,
-    bytes: usize,
-    root: Hash,
-}
 
-/// The per-leaf work for one update: read the leaf, apply its keys
-/// (`node_insert` — the hashing), and serialize. No flat-file mutation, so this
-/// is pure CPU+read and runs on any thread.
-fn compute_leaf_update(file: &File, ptr: DiskPtr, group: &[(Key, Hash)]) -> Result<LeafUpdate> {
-    let mut subtree = read_record(file, ptr)?;
-    let depth = subtree.prefix.len();
-    for (key, value_hash) in group {
-        node_insert(&mut subtree.node, depth, *key, *value_hash);
-    }
-    let (payload, bytes) = serialize_subtree(&subtree)?;
-    let root = hash_node(&subtree.node);
-    Ok(LeafUpdate {
-        offset: ptr.offset,
-        subtree,
-        payload,
-        bytes,
-        root,
-    })
-}
 
-/// Compute all touched-leaf updates in parallel: each task `(ptr, keys)` is read,
-/// hashed (`node_insert`), and serialized independently across scoped threads.
-/// This moves the dominant per-leaf CPU (keccak + bincode) off the serial path;
-/// only the writes/splits remain serial. `pread` and the decode/encode are
-/// thread-safe, and each task owns its own subtree, so there's no sharing.
-fn precompute_leaves(
-    file: &File,
-    tasks: &[(DiskPtr, Vec<(Key, Hash)>)],
-) -> Result<Vec<LeafUpdate>> {
-    let work = |(ptr, group): &(DiskPtr, Vec<(Key, Hash)>)| compute_leaf_update(file, *ptr, group);
-    if tasks.len() < 64 {
-        return tasks.iter().map(work).collect();
-    }
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
-    let chunk = tasks.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = tasks
-            .chunks(chunk)
-            .map(|c| scope.spawn(|| c.iter().map(work).collect::<Result<Vec<_>>>()))
-            .collect();
-        let mut out = Vec::with_capacity(tasks.len());
-        for h in handles {
-            out.extend(h.join().expect("precompute thread panicked")?);
-        }
-        Ok(out)
-    })
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -540,8 +481,11 @@ impl Default for Config {
 enum Node {
     Empty,
     Leaf {
-        key: Key,
-        value_hash: Hash,
+        /// Remaining key nibbles from this leaf's position to depth 64 (a merged
+        /// extension+leaf). The full key is `position_prefix ++ path`, recovered
+        /// from the tree position, so the key isn't stored; `value_hash` is folded
+        /// into the position-independent `hash`, so it isn't stored either.
+        path: Vec<u8>,
         hash: Hash,
     },
     Extension {
@@ -1015,7 +959,7 @@ fn insert_ram(
             // therefore the hash — is independent of how the leaf was created.
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
+            let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
             let (payload, _) = serialize_subtree(&subtree)?;
             let ptr = store.write_payload(&payload)?;
             let mut children = empty_children();
@@ -1055,7 +999,7 @@ fn insert_ram(
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
-                let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
+                let subtree = subtree_from_entries(new_prefix, vec![(key, leaf_hash(key, value_hash))]);
                 let (payload, _) = serialize_subtree(&subtree)?;
                 let ptr = store.write_payload(&payload)?;
                 children[new_idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
@@ -1117,7 +1061,7 @@ fn insert_ram(
                     Ok(())
                 }
                 None => {
-                    let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
+                    let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
                     let (payload, _) = serialize_subtree(&subtree)?;
                     let ptr = store.write_payload(&payload)?;
                     children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
@@ -1128,59 +1072,6 @@ fn insert_ram(
     }
 }
 
-fn split_subtree(store: &FlatFile, cfg: &Config, subtree: DiskSubtree) -> Result<RamChild> {
-    let leaves = node_entries(&subtree.node);
-    // Absorb any nibbles all entries still share into the prefix (becomes a RAM
-    // extension), then fan the rest out by their next nibble.
-    let shared = shared_prefix_after(&leaves, subtree.prefix.len());
-    let mut prefix = subtree.prefix;
-    prefix.extend_from_slice(&shared);
-
-    let groups = group_by_next_nibble(&leaves, prefix.len());
-    let mut children = empty_children();
-    let mut remainder = Vec::new();
-
-    for (idx, entries) in groups.into_iter().enumerate() {
-        if entries.is_empty() {
-            continue;
-        }
-        let mut child_prefix = prefix.clone();
-        child_prefix.push(idx as u8);
-        let child_subtree = subtree_from_entries(child_prefix, entries);
-        let (payload, child_bytes) = serialize_subtree(&child_subtree)?;
-        if child_bytes > cfg.max_leaf_bytes {
-            stats::on_split(child_bytes);
-            children[idx] = Some(split_subtree(store, cfg, child_subtree)?);
-        } else if child_bytes >= cfg.min_promote_bytes {
-            let ptr = store.write_payload(&payload)?;
-            stats::on_split_leaf(child_bytes);
-            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&child_subtree.node) });
-        } else {
-            remainder.push((idx, child_subtree));
-        }
-    }
-
-    for (idx, rem_subtree) in remainder {
-        let (payload, bytes) = serialize_subtree(&rem_subtree)?;
-        let ptr = store.write_payload(&payload)?;
-        stats::on_split_leaf(bytes);
-        children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&rem_subtree.node) });
-    }
-
-    let branch = RamNode::Branch {
-        children,
-        hash: Cell::new(None),
-    };
-    if shared.is_empty() {
-        Ok(RamChild::Ram(Box::new(branch)))
-    } else {
-        Ok(RamChild::Ram(Box::new(RamNode::Extension {
-            path: shared,
-            child: Box::new(branch),
-            hash: Cell::new(None),
-        })))
-    }
-}
 
 fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Hash)>) -> DiskSubtree {
     let node = build_node(&entries, prefix.len());
@@ -1193,226 +1084,28 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
     if i % 2 == 0 { byte >> 4 } else { byte & 0x0f }
 }
 
-/// Partition a key-sorted batch into contiguous runs sharing `nibble_at(.., depth)`.
-fn group_by_nibble(batch: &[(Key, Hash)], depth: usize) -> Vec<(u8, &[(Key, Hash)])> {
-    let mut groups = Vec::new();
-    let mut i = 0;
-    while i < batch.len() {
-        let nib = nibble_at(&batch[i].0, depth);
-        let start = i;
-        while i < batch.len() && nibble_at(&batch[i].0, depth) == nib {
-            i += 1;
-        }
-        groups.push((nib, &batch[start..i]));
-    }
-    groups
-}
 
-/// Build a disk leaf from `entries`; if it exceeds `max_leaf_bytes`, split it
-/// into a RAM-frontier branch instead.
-fn make_disk_or_split(
-    store: &FlatFile,
-    cfg: &Config,
-    prefix: Vec<u8>,
-    entries: Vec<(Key, Hash)>,
-) -> Result<RamChild> {
-    let subtree = subtree_from_entries(prefix, entries);
-    let (payload, bytes) = serialize_subtree(&subtree)?;
-    if bytes <= cfg.max_leaf_bytes {
-        let ptr = store.write_payload(&payload)?;
-        Ok(RamChild::Disk { ptr, root: hash_node(&subtree.node) })
-    } else {
-        stats::on_split(bytes);
-        split_subtree(store, cfg, subtree)
-    }
-}
 
-/// Insert a key-sorted batch of `(key, value_hash)` into the frontier. Keys are
-/// grouped by route so each touched disk leaf is read, merged, rebuilt, and
-/// written exactly once, and each frontier node is re-hashed at most once.
-fn insert_ram_batch(
-    store: &FlatFile,
-    cfg: &Config,
-    node: &mut RamNode,
-    prefix: Vec<u8>,
-    batch: &[(Key, Hash)],
-    precomputed: &mut HashMap<u64, LeafUpdate>,
-) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    invalidate_ram(node);
-    match node {
-        RamNode::Empty => {
-            let mut children = empty_children();
-            for (nib, group) in group_by_nibble(batch, prefix.len()) {
-                let mut child_prefix = prefix.clone();
-                child_prefix.push(nib);
-                children[nib as usize] =
-                    Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
-            }
-            *node = RamNode::Branch {
-                children,
-                hash: Cell::new(None),
-            };
-            Ok(())
-        }
-        RamNode::Extension { path, child, .. } => {
-            // Earliest point any batch key diverges from the shared path.
-            let common = batch
-                .iter()
-                .map(|(k, _)| common_prefix(path, &key_nibbles(k)[prefix.len()..]))
-                .min()
-                .unwrap();
-            if common == path.len() {
-                let mut next_prefix = prefix;
-                next_prefix.extend_from_slice(path);
-                insert_ram_batch(store, cfg, child, next_prefix, batch, precomputed)
-            } else {
-                let old = std::mem::replace(node, RamNode::Empty);
-                let RamNode::Extension {
-                    path: old_path,
-                    child: old_child,
-                    ..
-                } = old
-                else {
-                    unreachable!();
-                };
-                let mut children = empty_children();
-                let old_idx = old_path[common] as usize;
-                let old_remainder = old_path[common + 1..].to_vec();
-                children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
-                    old_child
-                } else {
-                    Box::new(RamNode::Extension {
-                        path: old_remainder,
-                        child: old_child,
-                        hash: Cell::new(None),
-                    })
-                }));
 
-                let split_depth = prefix.len() + common;
-                for (nib, group) in group_by_nibble(batch, split_depth) {
-                    let idx = nib as usize;
-                    let mut child_prefix = prefix.clone();
-                    child_prefix.extend_from_slice(&old_path[..common]);
-                    child_prefix.push(nib);
-                    if idx == old_idx {
-                        // Diverges into the slot the old continuation occupies; fold in.
-                        if let Some(RamChild::Ram(c)) = &mut children[idx] {
-                            insert_ram_batch(store, cfg, c, child_prefix, group, precomputed)?;
-                        }
-                    } else {
-                        children[idx] =
-                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
-                    }
-                }
 
-                let branch = RamNode::Branch {
-                    children,
-                    hash: Cell::new(None),
-                };
-                *node = if common == 0 {
-                    branch
-                } else {
-                    RamNode::Extension {
-                        path: old_path[..common].to_vec(),
-                        child: Box::new(branch),
-                        hash: Cell::new(None),
-                    }
-                };
-                Ok(())
-            }
-        }
-        RamNode::Branch { children, .. } => {
-            if prefix.len() >= 64 {
-                bail!("key terminates at a frontier branch; keys must be distinct and fixed-length");
-            }
-            for (nib, group) in group_by_nibble(batch, prefix.len()) {
-                let idx = nib as usize;
-                let mut child_prefix = prefix.clone();
-                child_prefix.push(nib);
-                match &mut children[idx] {
-                    Some(RamChild::Ram(child)) => {
-                        insert_ram_batch(store, cfg, child, child_prefix, group, precomputed)?;
-                    }
-                    Some(RamChild::Disk { ptr, .. }) => {
-                        // The leaf's update (read + node_insert + serialize) was
-                        // computed in parallel; here we only do the serial write.
-                        let update = match precomputed.remove(&ptr.offset) {
-                            Some(update) => update,
-                            // Fallback (shouldn't happen): compute inline.
-                            None => compute_leaf_update(&store.file, *ptr, group)?,
-                        };
-                        store.free(*ptr);
-                        if update.bytes <= cfg.max_leaf_bytes {
-                            let new_ptr = store.write_payload(&update.payload)?;
-                            children[idx] = Some(RamChild::Disk { ptr: new_ptr, root: update.root });
-                        } else {
-                            stats::on_split(update.bytes);
-                            children[idx] = Some(split_subtree(store, cfg, update.subtree)?);
-                        }
-                    }
-                    None => {
-                        children[idx] =
-                            Some(make_disk_or_split(store, cfg, child_prefix, group.to_vec())?);
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Collect every `(key, value_hash)` leaf in a node, in ascending key order.
-fn node_entries(node: &Node) -> Vec<(Key, Hash)> {
-    fn walk(node: &Node, out: &mut Vec<(Key, Hash)>) {
-        match node {
-            Node::Empty => {}
-            Node::Leaf {
-                key, value_hash, ..
-            } => out.push((*key, *value_hash)),
-            Node::Extension { child, .. } => walk(child, out),
-            Node::Branch { children, .. } => {
-                for child in children.iter().flatten() {
-                    walk(child, out);
-                }
-            }
-            // Entries inside an overflow record can't be enumerated without a
-            // store read; the splitter sheds children individually rather than
-            // re-fanning, so it never asks for entries across an overflow edge.
-            Node::Overflow { .. } => unreachable!("node_entries crossed an overflow child"),
-        }
-    }
-    let mut out = Vec::new();
-    walk(node, &mut out);
-    out
-}
-
-/// Whether a node's subtree holds `key` (used by the `disk_accesses_for_key` probe).
-fn node_contains(node: &Node, key: &Key) -> bool {
-    match node {
-        Node::Empty => false,
-        Node::Leaf { key: k, .. } => k == key,
-        Node::Extension { child, .. } => node_contains(child, key),
-        Node::Branch { children, .. } => {
-            children.iter().flatten().any(|c| node_contains(c, key))
-        }
-        Node::Overflow { .. } => unreachable!("node_contains crossed an overflow child"),
-    }
-}
 
 // --- Disk-node constructors: compute and cache the node hash exactly once. ---
 
-fn make_leaf(key: Key, value_hash: Hash) -> Node {
+/// Position-independent leaf hash: `keccak(3 ‖ key ‖ value_hash)`. It commits to
+/// the *full* key and the value, so it never changes when the leaf moves to a
+/// different position in the tree (only the stored `path` does) — which is what
+/// lets a divergence re-home a leaf without re-hashing it.
+fn leaf_hash(key: Key, value_hash: Hash) -> Hash {
     let mut bytes = vec![3];
     bytes.extend_from_slice(&key);
     bytes.extend_from_slice(&value_hash);
-    Node::Leaf {
-        key,
-        value_hash,
-        hash: keccak(&bytes),
-    }
+    keccak(&bytes)
+}
+
+/// A leaf holding the suffix `path` (key nibbles from its position to depth 64)
+/// and its precomputed `hash`.
+fn leaf_node(path: Vec<u8>, hash: Hash) -> Node {
+    Node::Leaf { path, hash }
 }
 
 fn make_extension(path: Vec<u8>, child: Node) -> Node {
@@ -1446,14 +1139,11 @@ fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
 }
 
 /// Canonical node for a subtree holding exactly one entry at `depth`.
-fn single_entry_node(key: Key, value_hash: Hash, depth: usize) -> Node {
-    let path = key_nibbles(&key)[depth..].to_vec();
-    let leaf = make_leaf(key, value_hash);
-    if path.is_empty() {
-        leaf
-    } else {
-        make_extension(path, leaf)
-    }
+/// Canonical node for a single entry at `depth`: a bare leaf carrying the key's
+/// suffix and its (already-computed) leaf hash. `leaf_hash` is the value from
+/// [`leaf_hash`], not a raw value hash.
+fn single_entry_node(key: Key, leaf_hash: Hash, depth: usize) -> Node {
+    leaf_node(key_nibbles(&key)[depth..].to_vec(), leaf_hash)
 }
 
 fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
@@ -1494,77 +1184,6 @@ fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
     make_branch(children)
 }
 
-/// Insert `(key, value_hash)` into an existing disk-subtree node in place,
-/// recomputing cached hashes only for the nodes on the changed path. Every
-/// untouched sibling subtree is left exactly as-is (hash included), which is
-/// what makes the disk-side hashing strictly essential. `depth` is the nibble
-/// depth of `node`. Produces the same canonical structure `build_node` would.
-fn node_insert(node: &mut Node, depth: usize, key: Key, value_hash: Hash) {
-    let nibbles = key_nibbles(&key);
-    let updated = match std::mem::replace(node, Node::Empty) {
-        Node::Empty => single_entry_node(key, value_hash, depth),
-        Node::Leaf {
-            key: leaf_key,
-            value_hash: leaf_vh,
-            ..
-        } => {
-            if leaf_key == key {
-                make_leaf(key, value_hash)
-            } else {
-                // A bare leaf sits at depth 64, so two distinct 32-byte keys can
-                // never both reach it — they diverge earlier, at a branch.
-                debug_assert_ne!(leaf_key, key);
-                let _ = leaf_vh;
-                unreachable!("two distinct keys cannot share a full 64-nibble path");
-            }
-        }
-        Node::Extension {
-            path, mut child, ..
-        } => {
-            let common = common_prefix(&path, &nibbles[depth..]);
-            if common == path.len() {
-                node_insert(&mut child, depth + path.len(), key, value_hash);
-                make_extension(path, *child)
-            } else {
-                // The new key diverges partway along the extension. Reuse the old
-                // continuation verbatim (cached hashes intact) and add a leaf.
-                let mut children = empty_box_children();
-                let old_idx = path[common] as usize;
-                let old_rest = path[common + 1..].to_vec();
-                children[old_idx] = Some(Box::new(if old_rest.is_empty() {
-                    *child
-                } else {
-                    make_extension(old_rest, *child)
-                }));
-                let new_idx = nibbles[depth + common] as usize;
-                children[new_idx] =
-                    Some(Box::new(single_entry_node(key, value_hash, depth + common + 1)));
-                let branch = make_branch(children);
-                if common == 0 {
-                    branch
-                } else {
-                    make_extension(path[..common].to_vec(), branch)
-                }
-            }
-        }
-        Node::Branch { mut children, .. } => {
-            let idx = nibbles[depth] as usize;
-            match &mut children[idx] {
-                Some(child) => node_insert(child, depth + 1, key, value_hash),
-                None => {
-                    children[idx] =
-                        Some(Box::new(single_entry_node(key, value_hash, depth + 1)));
-                }
-            }
-            make_branch(children)
-        }
-        // Crossing into an overflow record needs a store read+write, which the
-        // pure in-memory `node_insert` can't do — the record-level insert
-        // (Phase 2c) handles overflow edges before recursing here.
-        Node::Overflow { .. } => unreachable!("node_insert crossed an overflow child"),
-    };
-    *node = updated;
-}
 
 /// Outcome of following a key's nibble path through one record's (inline) node.
 enum PathEnd {
@@ -1580,7 +1199,9 @@ enum PathEnd {
 fn follow_key(node: &Node, depth: usize, key: &Key) -> PathEnd {
     match node {
         Node::Empty => PathEnd::Inline(false),
-        Node::Leaf { key: k, .. } => PathEnd::Inline(k == key),
+        // The leaf holds the key's suffix; it matches iff that suffix equals the
+        // remaining nibbles of `key` from here.
+        Node::Leaf { path, .. } => PathEnd::Inline(key_nibbles(key)[depth..] == path[..]),
         Node::Extension { path, child, .. } => {
             let nibbles = key_nibbles(key);
             if nibbles.get(depth..depth + path.len()) == Some(path.as_slice()) {
@@ -1615,11 +1236,33 @@ fn record_node_insert(
     value_hash: Hash,
 ) -> Result<()> {
     let nibbles = key_nibbles(&key);
+    let lh = leaf_hash(key, value_hash);
     let updated = match std::mem::replace(node, Node::Empty) {
-        Node::Empty => single_entry_node(key, value_hash, depth),
-        Node::Leaf { key: leaf_key, .. } => {
-            debug_assert_eq!(leaf_key, key, "two distinct keys cannot share a full path");
-            make_leaf(key, value_hash)
+        Node::Empty => single_entry_node(key, lh, depth),
+        Node::Leaf { path, hash } => {
+            let remaining = &nibbles[depth..];
+            let common = common_prefix(&path, remaining);
+            if common == path.len() {
+                // Same key (both suffixes run to depth 64): overwrite the value.
+                debug_assert_eq!(path.as_slice(), remaining);
+                leaf_node(path, lh)
+            } else {
+                // The new key diverges partway along the leaf's suffix. Keep the
+                // old leaf under a shorter suffix (its full key — and so its hash —
+                // is unchanged) and add the new leaf alongside.
+                let mut children = empty_box_children();
+                let old_idx = path[common] as usize;
+                children[old_idx] = Some(Box::new(leaf_node(path[common + 1..].to_vec(), hash)));
+                let new_idx = remaining[common] as usize;
+                children[new_idx] =
+                    Some(Box::new(single_entry_node(key, lh, depth + common + 1)));
+                let branch = make_branch(children);
+                if common == 0 {
+                    branch
+                } else {
+                    make_extension(path[..common].to_vec(), branch)
+                }
+            }
         }
         Node::Extension { path, mut child, .. } => {
             let common = common_prefix(&path, &nibbles[depth..]);
@@ -1627,8 +1270,7 @@ fn record_node_insert(
                 record_node_insert(store, cfg, &mut child, depth + path.len(), key, value_hash)?;
                 make_extension(path, *child)
             } else {
-                // Diverges partway along the extension — no overflow edge here;
-                // identical to `node_insert`'s divergence case.
+                // Diverges partway along the extension — no overflow edge here.
                 let mut children = empty_box_children();
                 let old_idx = path[common] as usize;
                 let old_rest = path[common + 1..].to_vec();
@@ -1639,7 +1281,7 @@ fn record_node_insert(
                 }));
                 let new_idx = nibbles[depth + common] as usize;
                 children[new_idx] =
-                    Some(Box::new(single_entry_node(key, value_hash, depth + common + 1)));
+                    Some(Box::new(single_entry_node(key, lh, depth + common + 1)));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -1663,7 +1305,7 @@ fn record_node_insert(
                 }
                 Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value_hash)?,
                 None => {
-                    children[idx] = Some(Box::new(single_entry_node(key, value_hash, depth + 1)));
+                    children[idx] = Some(Box::new(single_entry_node(key, lh, depth + 1)));
                 }
             }
             make_branch(children)
@@ -1909,7 +1551,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
 fn node_size(node: &Node) -> usize {
     match node {
         Node::Empty => 1,
-        Node::Leaf { .. } => 1 + 32 + 32 + 32,
+        Node::Leaf { path, .. } => 1 + (1 + path.len().div_ceil(2)) + 32,
         Node::Extension { path, child, .. } => {
             1 + (1 + path.len().div_ceil(2)) + 32 + node_size(child)
         }
@@ -1968,14 +1610,9 @@ fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
 fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     match node {
         Node::Empty => out.push(0),
-        Node::Leaf {
-            key,
-            value_hash,
-            hash,
-        } => {
+        Node::Leaf { path, hash } => {
             out.push(1);
-            out.extend_from_slice(key);
-            out.extend_from_slice(value_hash);
+            write_nibble_path(out, path)?;
             out.extend_from_slice(hash);
         }
         Node::Extension { path, child, hash } => {
@@ -2100,14 +1737,9 @@ impl<'a> CompactReader<'a> {
         match self.read_u8()? {
             0 => Ok(Node::Empty),
             1 => {
-                let key = self.read_hash()?;
-                let value_hash = self.read_hash()?;
+                let path = self.read_nibble_path()?;
                 let hash = self.read_hash()?;
-                Ok(Node::Leaf {
-                    key,
-                    value_hash,
-                    hash,
-                })
+                Ok(Node::Leaf { path, hash })
             }
             2 => {
                 let path = self.read_nibble_path()?;
@@ -2144,14 +1776,6 @@ impl<'a> CompactReader<'a> {
     }
 }
 
-fn group_by_next_nibble(entries: &[(Key, Hash)], depth: usize) -> [Vec<(Key, Hash)>; 16] {
-    let mut groups: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
-    for entry in entries {
-        let nibble = key_nibbles(&entry.0).get(depth).copied().unwrap_or(0) as usize;
-        groups[nibble].push(*entry);
-    }
-    groups
-}
 
 fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {
     match node {
@@ -2296,22 +1920,6 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
 
-fn shared_prefix_after(entries: &[(Key, Hash)], depth: usize) -> Vec<u8> {
-    if entries.len() < 2 || depth >= 64 {
-        return Vec::new();
-    }
-    let nibbles: Vec<Vec<u8>> = entries.iter().map(|(key, _)| key_nibbles(key)).collect();
-    let mut len = 0;
-    while depth + len < 64 {
-        let nibble = nibbles[0][depth + len];
-        if nibbles.iter().all(|ks| ks[depth + len] == nibble) {
-            len += 1;
-        } else {
-            break;
-        }
-    }
-    nibbles[0][depth..depth + len].to_vec()
-}
 
 fn empty_children() -> [Option<RamChild>; 16] {
     std::array::from_fn(|_| None)
@@ -2527,7 +2135,7 @@ mod tests {
         //  (b) hash identically whether that child is inline or overflowed
         //      (the Overflow.root equals the inline node's hash).
         let key = hashed_key("x");
-        let inline_child = make_leaf(key, [9u8; 32]);
+        let inline_child = leaf_node(vec![5, 6, 7], leaf_hash(key, [9u8; 32]));
         let inline_hash = hash_node(&inline_child);
 
         // Build branch B1 with the child inline at slot 3.
