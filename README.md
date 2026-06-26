@@ -27,7 +27,7 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
    │   { ptr, root }     (Box<RamNode>)                          │
    │        │                                                    │
    └────────┼────────────────────────────────────────────────-─┘
-            │ DiskPtr { page, pages }
+            │ DiskPtr { page, len }
             ▼
    store: FlatFile  ──────────────────────  values: rocksdb::DB
    ┌──────────────────────────────┐         ┌──────────────────────┐
@@ -51,14 +51,15 @@ represented by a single `RamChild::Disk` pointer. `ram_nodes()` reports the
 current frontier size, and several tests assert it stays bounded.
 
 ### 2. The flat file (`FlatFile` / `store`)
-Disk subtrees are compact-encoded `Node` records written to one flat file in
-**page-aligned** extents (a whole number of 4 KiB pages). A `DiskPtr { page,
-pages }` addresses a record — an 8-byte pointer (a `u32` page index + `u16` page
-count), since the page-aligned layout makes a full byte offset and byte length
-redundant. There is **no length prefix and no magic/version header** on the
-record: the size comes from the `DiskPtr`, and the unused tail of the last page
-is zero-padded so reads can validate it. The payload keeps each node's cached
-Merkle hash but avoids bincode's enum, `Vec`, `Option`, and `Box` overhead.
+Disk subtrees are compact-encoded `Node` records written to one flat file at
+**page-aligned** offsets (each record occupies a whole number of 4 KiB pages, so
+every read/write is a single positioned I/O over a contiguous extent). A
+`DiskPtr { page: u32, len: u32 }` addresses a record — an 8-byte pointer (a page
+index instead of a full byte offset; the page *count* is derived from `len`).
+There is **no length prefix and no magic/version header** on the record: the
+exact size comes from the `DiskPtr`, so reads fetch precisely `len` bytes. The
+payload keeps each node's cached Merkle hash but avoids bincode's enum, `Vec`,
+`Option`, and `Box` overhead.
 
 A record stores only what the frontier can't reconstruct: a leaf is just its
 *remaining* nibble path plus its cached hash — **neither the key nor the
@@ -165,8 +166,8 @@ Public API and types:
 - **`Config`** — leaf-size thresholds: `target_leaf_bytes`, `max_leaf_bytes`
   (rewrite vs. split), `min_promote_bytes` (promote to its own disk record vs.
   fold into a remainder).
-- **`Hash` / `Key`** — `[u8; 32]` aliases. **`DiskPtr`** — `{ page: u32, pages:
-  u16 }`, an 8-byte page-aligned record address.
+- **`Hash` / `Key`** — `[u8; 32]` aliases. **`DiskPtr`** — `{ page: u32, len:
+  u32 }`, an 8-byte page-aligned record address (page index + exact byte length).
 - **`prof`** — opt-in (`--features profiling`) wall-clock attribution + a keccak
   audit hook. Compiles to zero-cost no-ops when the feature is off.
 

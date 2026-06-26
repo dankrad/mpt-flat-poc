@@ -249,14 +249,15 @@ pub mod prof {
 }
 
 /// Address of a flat-file record, compressed to fit the page-aligned layout: a
-/// `u32` first-page index (16 TiB of addressable file at 4 KiB pages) and a
-/// `u16` length in pages (records are bounded by `max_leaf_bytes`, so a couple of
-/// pages in practice). Eight bytes instead of the twelve a `{u64, u32}` byte
-/// pointer would take, shrinking every `RamChild::Disk` and the manifest.
+/// `u32` first-page index (16 TiB of addressable file at 4 KiB pages) plus the
+/// exact payload length in bytes. Eight bytes (a `u32` page index is enough; a
+/// full `u64` byte offset isn't needed once records are page-aligned) instead of
+/// the twelve a `{u64, u32}` pointer would take, shrinking every
+/// `RamChild::Disk` and the manifest. The page *count* is derived from `len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskPtr {
     pub page: u32,
-    pub pages: u16,
+    pub len: u32,
 }
 
 impl DiskPtr {
@@ -264,10 +265,13 @@ impl DiskPtr {
     fn offset(&self) -> u64 {
         self.page as u64 * PAGE
     }
-    /// Allocated size of the record in bytes (a whole number of pages; the exact
-    /// payload length is shorter and is not stored — see [`write_node`]).
+    /// Exact payload length in bytes.
     fn byte_len(&self) -> usize {
-        self.pages as usize * PAGE as usize
+        self.len as usize
+    }
+    /// Whole pages the record occupies.
+    fn pages(&self) -> u32 {
+        pages_for(self.len)
     }
 }
 
@@ -394,9 +398,6 @@ impl FlatFile {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
         let pages = pages_for(total);
-        if pages > u16::MAX as u32 {
-            bail!("record of {total} bytes exceeds the DiskPtr page-count limit");
-        }
         let page = match self.free.alloc(pages) {
             Some(page) => page,
             None => {
@@ -407,19 +408,12 @@ impl FlatFile {
         };
         let offset = page as u64 * PAGE;
 
-        // Zero-pad to a whole number of pages: the unused tail of the last page is
-        // then deterministic, so reads can tolerate trailing zeros and a reused
-        // region never exposes stale bytes from its previous occupant. Still a
-        // single positioned, page-aligned write.
-        let mut record = vec![0u8; pages as usize * PAGE as usize];
-        record[..payload.len()].copy_from_slice(payload);
-
+        // Exactly `total` bytes are written at a page-aligned offset (one
+        // positioned write). Reads fetch exactly `len` bytes, so the unused tail
+        // of the last page is never read and need not be zeroed.
         let _g = prof::scope(prof::Cat::FileWrite);
-        self.file.write_all_at(&record, offset)?;
-        Ok(DiskPtr {
-            page,
-            pages: pages as u16,
-        })
+        self.file.write_all_at(payload, offset)?;
+        Ok(DiskPtr { page, len: total })
     }
 
     fn read(&mut self, ptr: DiskPtr) -> Result<Node> {
@@ -427,7 +421,7 @@ impl FlatFile {
     }
 
     fn free(&mut self, ptr: DiskPtr) {
-        self.free.free(ptr.page, ptr.pages as u32);
+        self.free.free(ptr.page, ptr.pages());
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1598,10 +1592,10 @@ fn serialize_node(node: &Node) -> Result<(Vec<u8>, usize)> {
 fn deserialize_node(payload: &[u8]) -> Result<Node> {
     let mut reader = CompactReader::new(payload);
     let node = reader.read_node()?;
-    // The record is read as a whole number of pages; everything past the node is
-    // zero padding written by `write_payload`. A non-zero tail means corruption.
-    if !reader.remaining_is_zero() {
-        bail!("non-zero trailing bytes in flat-file record");
+    // Reads fetch exactly `DiskPtr::len` bytes, so the node must consume all of
+    // them; anything left over signals a corrupt record.
+    if !reader.is_finished() {
+        bail!("trailing bytes in flat-file record");
     }
     Ok(node)
 }
@@ -1664,9 +1658,8 @@ impl<'a> CompactReader<'a> {
         Self { bytes, pos: 0 }
     }
 
-    /// Whether every remaining byte is zero (used to validate page padding).
-    fn remaining_is_zero(&self) -> bool {
-        self.bytes[self.pos..].iter().all(|&b| b == 0)
+    fn is_finished(&self) -> bool {
+        self.pos == self.bytes.len()
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -1934,10 +1927,8 @@ fn collect_leaf_stats(node: &RamNode, stats: &mut LeafStats) {
                 match child {
                     RamChild::Disk { ptr, .. } => {
                         stats.count += 1;
-                        // Page-aligned footprint (exact payload bytes are no longer
-                        // stored in the pointer).
-                        stats.total_bytes += ptr.byte_len() as u64;
-                        let pages = (ptr.pages as usize).clamp(1, 8);
+                        stats.total_bytes += ptr.len as u64;
+                        let pages = (ptr.pages() as usize).clamp(1, 8);
                         stats.page_hist[pages] += 1;
                     }
                     RamChild::Ram(n) => collect_leaf_stats(n, stats),
