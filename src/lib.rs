@@ -695,19 +695,44 @@ enum RamChild {
 // Children are an inline 16-slot array: frontier branches are dense in practice
 // (a near-complete 16-ary tree over the disk leaves), so a sparse representation
 // would only add per-branch heap allocations without shrinking anything.
+/// A frontier node's cached hash. It's a plain `Cell` (no atomic overhead on the
+/// hot serial path), but declared `Sync` so the root re-hash can run across
+/// threads: the frontier is a tree of uniquely-owned (`Box`) nodes, so when we
+/// split it into disjoint subtrees each node's cache is touched by exactly one
+/// thread — there is never concurrent access to the same cell.
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+struct HashCell(Cell<Option<Hash>>);
+
+// SAFETY: the only multi-threaded reader is `hash_ram_parallel`, which hands each
+// thread a disjoint subtree of the uniquely-owned frontier; no two threads ever
+// reach the same `HashCell`.
+unsafe impl Sync for HashCell {}
+
+impl HashCell {
+    fn new(v: Option<Hash>) -> Self {
+        HashCell(Cell::new(v))
+    }
+    fn get(&self) -> Option<Hash> {
+        self.0.get()
+    }
+    fn set(&self, v: Option<Hash>) {
+        self.0.set(v)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RamNode {
     Empty,
     Extension {
         path: Vec<u8>,
         child: Box<RamNode>,
-        hash: Cell<Option<Hash>>,
+        hash: HashCell,
     },
     // No `value`: keys are full 64-nibble paths, so none ever terminates at a
     // (necessarily shallower) frontier branch.
     Branch {
         children: [Option<RamChild>; 16],
-        hash: Cell<Option<Hash>>,
+        hash: HashCell,
     },
 }
 
@@ -1013,7 +1038,7 @@ impl FlatMpt {
     }
 
     pub fn root(&self) -> Hash {
-        hash_ram(&self.upper)
+        hash_ram_parallel(&self.upper)
     }
 
     pub fn ram_nodes(&self) -> usize {
@@ -1138,7 +1163,7 @@ fn insert_ram(
             children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
             *node = RamNode::Branch {
                 children,
-                hash: Cell::new(None),
+                hash: HashCell::new(None),
             };
             Ok(())
         }
@@ -1163,7 +1188,7 @@ fn insert_ram(
                     Box::new(RamNode::Extension {
                         path: old_remainder,
                         child: old_child,
-                        hash: Cell::new(None),
+                        hash: HashCell::new(None),
                     })
                 }));
 
@@ -1178,7 +1203,7 @@ fn insert_ram(
 
                 let branch = RamNode::Branch {
                     children,
-                    hash: Cell::new(None),
+                    hash: HashCell::new(None),
                 };
                 *node = if common == 0 {
                     branch
@@ -1186,7 +1211,7 @@ fn insert_ram(
                     RamNode::Extension {
                         path: old_path[..common].to_vec(),
                         child: Box::new(branch),
-                        hash: Cell::new(None),
+                        hash: HashCell::new(None),
                     }
                 };
                 Ok(())
@@ -1666,7 +1691,7 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
     }
     let branch = RamNode::Branch {
         children: ram_children,
-        hash: Cell::new(None),
+        hash: HashCell::new(None),
     };
     if ext_path.is_empty() {
         Ok(RamChild::Ram(Box::new(branch)))
@@ -1674,7 +1699,7 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
         Ok(RamChild::Ram(Box::new(RamNode::Extension {
             path: ext_path,
             child: Box::new(branch),
-            hash: Cell::new(None),
+            hash: HashCell::new(None),
         })))
     }
 }
@@ -2322,6 +2347,84 @@ fn hash_ram(node: &RamNode) -> Hash {
             hash.set(Some(computed));
             computed
         }
+    }
+}
+
+/// Parallel root recompute: re-hash the top branch's child subtrees on separate
+/// threads, then combine. The frontier is a tree of uniquely-owned nodes, so the
+/// subtrees are disjoint — each thread only touches its own nodes' caches (see
+/// [`HashCell`]). Cached nodes short-circuit, so an unchanged batch costs nothing
+/// and only the invalidated paths re-hash. The non-branch spine and the per-child
+/// subtrees use the ordinary serial [`hash_ram`].
+fn hash_ram_parallel(node: &RamNode) -> Hash {
+    match node {
+        RamNode::Empty => empty_hash(),
+        RamNode::Extension { path, child, hash } => {
+            if let Some(cached) = hash.get() {
+                return cached;
+            }
+            // One child: parallelism is at the branch below, so recurse parallel.
+            let computed = hash_join(4, path, &hash_ram_parallel(child));
+            hash.set(Some(computed));
+            computed
+        }
+        RamNode::Branch { children, hash } => {
+            if let Some(cached) = hash.get() {
+                return cached;
+            }
+            // Fan out only when several child subtrees are actually stale. A lone
+            // dirty path (e.g. one-by-one inserts re-hashing after every key) is far
+            // cheaper to walk serially than to spawn a thread pool for; without this
+            // guard root() pays ~16 thread spawns per call.
+            let stale = children.iter().flatten().filter(|c| ram_child_stale(c)).count();
+            if stale < 2 {
+                return hash_ram(node);
+            }
+            // At the top of a deep frontier the children are themselves large Ram
+            // subtrees, so a thread per present child fans the keccak-heavy re-hash
+            // across cores. Cached children / Disk pointers resolve in O(1).
+            let child_hashes: Vec<Hash> = std::thread::scope(|scope| {
+                let handles: Vec<_> = children
+                    .iter()
+                    .flatten()
+                    .map(|child| scope.spawn(move || ram_child_hash(child)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("frontier hash thread panicked"))
+                    .collect()
+            });
+            let mut bytes = vec![5];
+            let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
+            bytes.extend_from_slice(&bitmap.to_le_bytes());
+            for h in &child_hashes {
+                bytes.extend_from_slice(h);
+            }
+            let computed = keccak(&bytes);
+            hash.set(Some(computed));
+            computed
+        }
+    }
+}
+
+/// Hash of a frontier child (serial): a Ram subtree re-hashes, a Disk pointer
+/// returns its stored root.
+fn ram_child_hash(child: &RamChild) -> Hash {
+    match child {
+        RamChild::Ram(node) => hash_ram(node),
+        RamChild::Disk { root, .. } => *root,
+    }
+}
+
+/// Whether a child needs real re-hash work — a Ram subtree whose cached hash was
+/// invalidated. Disk pointers and already-cached subtrees are O(1).
+fn ram_child_stale(child: &RamChild) -> bool {
+    match child {
+        RamChild::Ram(node) => match node.as_ref() {
+            RamNode::Empty => false,
+            RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.get().is_none(),
+        },
+        RamChild::Disk { .. } => false,
     }
 }
 
