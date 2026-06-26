@@ -309,6 +309,12 @@ fn main() {
     println!("  split/write stats: {}", mpt_flat_poc::stats::dump());
     println!();
 
+    // When building a checkpoint, stop here: phases 1/2 below would mutate the
+    // flat file after persist() and leave the on-disk manifest stale.
+    if persist {
+        return;
+    }
+
     // ---- phase 1: brand-new inserts ----
     let mut next_new = preload;
     let mut rounds = Vec::new();

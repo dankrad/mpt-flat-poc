@@ -90,4 +90,19 @@ fn main() {
         rb as f64 / tot_b * 100.0,
         fi as f64 / tot_b * 100.0,
     );
+    // Within the write path: free-list lock (alloc+free, contended) vs pwrite.
+    let lock = stats::W_LOCK_NS.load(Relaxed);
+    let pw = stats::W_PWRITE_NS.load(Relaxed);
+    let tot_w = (lock + pw).max(1) as f64;
+    println!(
+        "  write path (summed over threads): free-list lock {:.0}% | pwrite {:.0}%  (lock {:.1} ms/batch, pwrite {:.1} ms/batch)",
+        lock as f64 / tot_w * 100.0,
+        pw as f64 / tot_w * 100.0,
+        per(lock),
+        per(pw),
+    );
+
+    // Re-persist so the on-disk manifest matches the mutated flat file (otherwise
+    // the next reopen reads freed/overwritten regions).
+    db.persist().unwrap();
 }

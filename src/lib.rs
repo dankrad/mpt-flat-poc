@@ -74,6 +74,19 @@ pub mod stats {
         B_FINAL_NS.fetch_add(final_ns, Relaxed);
     }
 
+    /// Within the write path, separate the time spent acquiring+holding the
+    /// free-list lock (`alloc` + `free`, where threads contend) from the actual
+    /// positioned write (`pwrite`, which is lock-free). Summed across threads.
+    pub static W_LOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static W_PWRITE_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on_alloc_lock(ns: u64) {
+        W_LOCK_NS.fetch_add(ns, Relaxed);
+    }
+    pub fn on_pwrite(ns: u64) {
+        W_PWRITE_NS.fetch_add(ns, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
@@ -108,6 +121,8 @@ pub mod stats {
         B_READ_NS.store(0, Relaxed);
         B_REBUILD_NS.store(0, Relaxed);
         B_FINAL_NS.store(0, Relaxed);
+        W_LOCK_NS.store(0, Relaxed);
+        W_PWRITE_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -442,18 +457,22 @@ impl FlatFile {
         stats::on_write(total as usize);
         let pages = pages_for(total);
         // Reuse a freed region if one fits; otherwise extend the file. Both yield
-        // a page range disjoint from every other in-flight allocation.
-        let page = match self.free.lock().unwrap().alloc(pages) {
-            Some(page) => page,
-            None => self.end_page.fetch_add(pages as u64, Ordering::SeqCst),
-        };
+        // a page range disjoint from every other in-flight allocation. Time the
+        // lock-held alloc separately from the (lock-free) pwrite to expose
+        // free-list contention between the parallel batch workers.
+        let lt = std::time::Instant::now();
+        let reused = self.free.lock().unwrap().alloc(pages);
+        let page = reused.unwrap_or_else(|| self.end_page.fetch_add(pages as u64, Ordering::SeqCst));
+        stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
         if page > u32::MAX as u64 {
             bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
         }
         let page = page as u32;
 
         let _g = prof::scope(prof::Cat::FileWrite);
+        let wt = std::time::Instant::now();
         (&self.file).write_all_at(payload, page as u64 * PAGE)?;
+        stats::on_pwrite(wt.elapsed().as_nanos() as u64);
         Ok(DiskPtr { page, len: total })
     }
 
@@ -462,10 +481,12 @@ impl FlatFile {
     }
 
     fn free(&self, ptr: DiskPtr) {
+        let lt = std::time::Instant::now();
         self.free
             .lock()
             .unwrap()
             .free(ptr.page as u64, ptr.pages());
+        stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
     }
 
     fn end_page(&self) -> u64 {
