@@ -89,6 +89,13 @@ pub mod stats {
         W_PWRITE_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Time spent in `serialize_subtree` (building the record payload — walks the
+    /// whole leaf), a subset of the "finalize" bucket. Summed across threads.
+    pub static B_SERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_serialize(ns: u64) {
+        B_SERIALIZE_NS.fetch_add(ns, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
@@ -125,6 +132,7 @@ pub mod stats {
         B_FINAL_NS.store(0, Relaxed);
         W_LOCK_NS.store(0, Relaxed);
         W_PWRITE_NS.store(0, Relaxed);
+        B_SERIALIZE_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -543,7 +551,7 @@ impl Default for Config {
         Self {
             target_leaf_bytes: 8 * 1024,
             max_leaf_bytes: 16 * 1024,
-            min_promote_bytes: 4 * 1024,
+            min_promote_bytes: 8 * 1024,
         }
     }
 }
@@ -1590,7 +1598,9 @@ fn process_group(
         store.free(ptr);
         promote_record_to_ram(store, subtree)
     } else {
+        let st = std::time::Instant::now();
         let (payload, _) = serialize_subtree(&subtree)?;
+        stats::on_serialize(st.elapsed().as_nanos() as u64);
         store.free(ptr);
         let new_ptr = store.write_payload(&payload)?;
         Ok(RamChild::Disk {

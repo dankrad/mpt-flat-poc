@@ -137,7 +137,7 @@ fn main() {
     let cfg = Config {
         target_leaf_bytes: max / 2,
         max_leaf_bytes: max,
-        min_promote_bytes: max / 4,
+        min_promote_bytes: max / 2,
     };
     // Batch size for preload inserts; 0 = one-by-one. Must divide PROGRESS_EVERY.
     let batch: usize = std::env::var("LARGE_BATCH")

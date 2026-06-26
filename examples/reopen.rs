@@ -90,15 +90,18 @@ fn main() {
         rb as f64 / tot_b * 100.0,
         fi as f64 / tot_b * 100.0,
     );
-    // Within the write path: free-list lock (alloc+free, contended) vs pwrite.
+    // Within Phase B: serialize (builds the record payload — a full-leaf walk),
+    // the free-list lock (alloc+free), and the pwrite. All summed over threads.
+    let ser = stats::B_SERIALIZE_NS.load(Relaxed);
     let lock = stats::W_LOCK_NS.load(Relaxed);
     let pw = stats::W_PWRITE_NS.load(Relaxed);
-    let tot_w = (lock + pw).max(1) as f64;
     println!(
-        "  write path (summed over threads): free-list lock {:.0}% | pwrite {:.0}%  (lock {:.1} ms/batch, pwrite {:.1} ms/batch)",
-        lock as f64 / tot_w * 100.0,
-        pw as f64 / tot_w * 100.0,
+        "  of which (summed): serialize {:.0}% ({:.1} ms/batch) | free-list lock {:.0}% ({:.1}) | pwrite {:.0}% ({:.1})",
+        ser as f64 / tot_b * 100.0,
+        per(ser),
+        lock as f64 / tot_b * 100.0,
         per(lock),
+        pw as f64 / tot_b * 100.0,
         per(pw),
     );
 
