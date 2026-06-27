@@ -1304,6 +1304,31 @@ impl FlatMpt {
         self.store.free_region_count()
     }
 
+    /// Live on-disk bytes — the dense footprint of the records the frontier points
+    /// at (`live_units × 256`). This is the working set that reads must hit; the
+    /// key scaling metric (vs `flat_file_len`, the high-water that includes
+    /// garbage). Excludes the per-page write rounding within a region.
+    pub fn live_bytes(&self) -> u64 {
+        self.store.live_and_free_units().0 * ADDR_UNIT
+    }
+
+    /// Active-file utilization: `live / (end − reclaimed free regions)`. The
+    /// inline-GC controller drives this toward `TARGET_UTIL`.
+    pub fn utilization(&self) -> f64 {
+        let (live_units, free_units) = self.store.live_and_free_units();
+        let active = (self.store.end_page() * UNITS_PER_PAGE).saturating_sub(free_units);
+        if active == 0 {
+            0.0
+        } else {
+            live_units as f64 / active as f64
+        }
+    }
+
+    /// Current GC cleaning rate (victim regions/batch the controller has settled on).
+    pub fn gc_rate_current(&self) -> usize {
+        self.gc_regions
+    }
+
     /// Heap held by the in-RAM index — the part of the database that is *not*
     /// on disk: the trie frontier, the region allocator, and the unflushed value
     /// overlay. Excludes the OS page cache and RocksDB's own (C++) memory.

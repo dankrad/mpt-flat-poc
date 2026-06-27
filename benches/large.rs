@@ -126,7 +126,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
 
-    // Disk-leaf size in KiB (max). target = max/2, min_promote = max/4.
+    // Disk-leaf size in KiB (max). target = max/2, min_promote = max/2.
     // Larger leaves => fewer leaves => smaller frontier and less page padding,
     // at the cost of more bytes rewritten per insert.
     let max_kib: usize = std::env::var("LARGE_MAX_LEAF_KIB")
@@ -145,10 +145,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     println!(
-        "config: max_leaf={} KiB (target {}, min {}), batch={}\n",
+        "config: max_leaf={} KiB (target {}, min_promote {}), batch={}\n",
         max_kib,
         max / 2,
-        max / 4,
+        max / 2,
         if batch == 0 { "off".into() } else { batch.to_string() },
     );
     // With LARGE_PERSIST=1 the DB is built at a fixed, non-temporary path under
@@ -177,9 +177,28 @@ fn main() {
     // Previous-milestone split-leaf totals, to report the per-interval average
     // size of leaves freshly created by splitting.
     use std::sync::atomic::Ordering::Relaxed;
-    // Previous-milestone insert_batch phase totals (ns) + batch count, to report
-    // the per-interval per-batch wall time in each phase.
-    let (mut prev_a, mut prev_b, mut prev_c, mut prev_nb) = (0u64, 0u64, 0u64, 0u64);
+    use mpt_flat_poc::stats;
+    // Per-interval deltas: read each counter, subtract the previous milestone's
+    // value. Indices documented in `snap()`.
+    let snap = || -> [u64; 14] {
+        [
+            stats::PHASE_A_NS.load(Relaxed),      // 0
+            stats::PHASE_B_NS.load(Relaxed),      // 1
+            stats::PHASE_C_NS.load(Relaxed),      // 2
+            stats::BATCHES.load(Relaxed),         // 3
+            stats::B_READ_IO_NS.load(Relaxed),    // 4  pread (device)
+            stats::B_READ_PARSE_NS.load(Relaxed), // 5  parse (cpu)
+            stats::B_REBUILD_NS.load(Relaxed),    // 6  rebuild (cpu)
+            stats::B_SERIALIZE_NS.load(Relaxed),  // 7  serialize (cpu)
+            stats::W_PWRITE_NS.load(Relaxed),     // 8  pwrite (device)
+            stats::W_LOCK_NS.load(Relaxed),       // 9  alloc lock (contention)
+            stats::GC_NS.load(Relaxed),           // 10 GC evacuate (read+relocate)
+            stats::GC_RELOCATED.load(Relaxed),    // 11 records relocated
+            stats::GC_REGIONS.load(Relaxed),      // 12 regions reclaimed
+            stats::B_FINAL_NS.load(Relaxed),      // 13 migrate+serialize+promote
+        ]
+    };
+    let mut prev = snap();
     for i in 0..preload {
         // Caught a SIGINT/SIGTERM: flush any buffered batch, persist a reopenable
         // checkpoint, and exit. (`std::process::exit` skips the NamedTempFile
@@ -211,32 +230,46 @@ fn main() {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
             let ls = db.leaf_stats();
-            // Per-interval insert_batch phase wall-time: A=route, B=parallel, C=install.
-            let pa = mpt_flat_poc::stats::PHASE_A_NS.load(Relaxed);
-            let pb = mpt_flat_poc::stats::PHASE_B_NS.load(Relaxed);
-            let pc = mpt_flat_poc::stats::PHASE_C_NS.load(Relaxed);
-            let nb = mpt_flat_poc::stats::BATCHES.load(Relaxed);
-            let (da, db_ns, dc) = (pa - prev_a, pb - prev_b, pc - prev_c);
-            let dnb = (nb - prev_nb).max(1);
-            let tot = (da + db_ns + dc).max(1);
-            let per = |ns: u64| ns as f64 / 1e6 / dnb as f64; // ms/batch
-            prev_a = pa;
-            prev_b = pb;
-            prev_c = pc;
-            prev_nb = nb;
+            let cur = snap();
+            let d: [u64; 14] = std::array::from_fn(|k| cur[k].saturating_sub(prev[k]));
+            prev = cur;
+            let dnb = d[3].max(1); // batches this interval
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let msb = |ns: u64| ns as f64 / 1e6 / dnb as f64; // ms/batch
+            let uk = |ns: u64| ns as f64 / 1000.0 / PROGRESS_EVERY as f64; // thread-µs/key
+            // Phase wall split now includes GC (which runs between B and C).
+            let phase_tot = (d[0] + d[1] + d[10] + d[2]).max(1);
             println!(
-                "  [{:>4}M] {:>6.0}s | {:.1} µs/key | flat {:.1} GiB | leaves {} | avg_leaf {} B | A/B/C {:.1}/{:.1}/{:.1} ms/batch (B={:.0}%) | RAM {:.0} MiB",
+                "  [{:>4}M] {:>6.0}s {:.1}µs/key | flat {:.1}G live {:.1}G util {:.0}% | leaves {} avg {}B ({:.1} k/leaf) | RAM {:.0}M / {} nodes",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
-                db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
+                gib(db.flat_file_len()),
+                gib(db.live_bytes()),
+                db.utilization() * 100.0,
                 ls.count,
                 ls.avg_bytes(),
-                per(da),
-                per(db_ns),
-                per(dc),
-                db_ns as f64 / tot as f64 * 100.0,
+                done as f64 / ls.count.max(1) as f64,
                 mib(live),
+                db.ram_report().frontier_nodes,
+            );
+            println!(
+                "          phase ms/batch: A {:.1} | B {:.1} | GC {:.1} | C {:.1}  (B {:.0}%, GC {:.0}%)",
+                msb(d[0]), msb(d[1]), msb(d[10]), msb(d[2]),
+                d[1] as f64 / phase_tot as f64 * 100.0,
+                d[10] as f64 / phase_tot as f64 * 100.0,
+            );
+            println!(
+                "          B-work µs/key: pread {:.1} parse {:.1} rebuild {:.1} serialize {:.1} pwrite {:.1} lock {:.1}",
+                uk(d[4]), uk(d[5]), uk(d[6]), uk(d[7]), uk(d[8]), uk(d[9]),
+            );
+            println!(
+                "          GC: {:.2} reloc/key, {} regs/batch, {:.1} ms/batch, R={}, free_regions {}",
+                d[11] as f64 / PROGRESS_EVERY as f64,
+                d[12] / dnb,
+                msb(d[10]),
+                db.gc_rate_current(),
+                db.free_regions(),
             );
             std::io::stdout().flush().ok();
             chunk_start = Instant::now();
@@ -268,8 +301,10 @@ fn main() {
         us_per(elapsed, preload as usize),
     );
     println!(
-        "  flat file: {:.1} MiB,  free_regions: {},  free: {:.1} MiB",
+        "  flat file: {:.1} MiB,  live: {:.1} MiB,  util: {:.0}%,  free_regions: {},  garbage: {:.1} MiB",
         db.flat_file_len() as f64 / 1_048_576.0,
+        db.live_bytes() as f64 / 1_048_576.0,
+        db.utilization() * 100.0,
         db.free_regions(),
         db.free_bytes() as f64 / 1_048_576.0,
     );
