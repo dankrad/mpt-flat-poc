@@ -412,6 +412,8 @@ const GC_GAIN: f64 = 4000.0;
 const GC_R_MAX: usize = 8192;
 /// Don't GC until the file is at least this big (avoid churn on tiny files).
 const GC_MIN_PAGES: u64 = 64 * REGION_PAGES;
+/// Never evacuate a region fuller than this (relocation cost not worth the space).
+const EVAC_MAX_UTIL: f64 = 0.75;
 
 /// Log-structured page allocator over fixed regions. New records append to a
 /// moving head region (sequential, coalesced writes); per-region live-page counts
@@ -425,6 +427,11 @@ const GC_MIN_PAGES: u64 = 64 * REGION_PAGES;
 struct RegionAlloc {
     /// Live pages per region; index = region number = page / REGION_PAGES.
     live: Vec<u32>,
+    /// Batch epoch each region was last opened for writing — drives age-aware
+    /// (cost-benefit) victim selection.
+    epoch_of: Vec<u32>,
+    /// Current batch epoch (bumped once per batch).
+    epoch: u32,
     /// Region currently being appended to.
     head_region: u64,
     /// Next free page (absolute) within the head region.
@@ -441,11 +448,17 @@ impl RegionAlloc {
     fn ensure_region(&mut self, r: u64) {
         if r as usize >= self.live.len() {
             self.live.resize(r as usize + 1, 0);
+            self.epoch_of.resize(r as usize + 1, 0);
         }
     }
 
+    /// Advance the batch epoch (called once per `insert_batch`).
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
     /// Open a new head region: reuse a reclaimed one if available, else a fresh
-    /// region at the current file end.
+    /// region at the current file end. Stamps the region with the current epoch.
     fn open_new_head(&mut self, end_page: &AtomicU64) {
         let r = self
             .free_regions
@@ -454,6 +467,7 @@ impl RegionAlloc {
         self.head_region = r;
         self.next_page = r * REGION_PAGES;
         self.ensure_region(r);
+        self.epoch_of[r as usize] = self.epoch;
     }
 
     /// Reserve `pages` consecutive pages at the head, opening a new head region
@@ -493,32 +507,37 @@ impl RegionAlloc {
         self.free_regions.len() as u64 * REGION_PAGES
     }
 
-    /// The `max` regions with the least (non-zero) live data — emptiest first, the
-    /// cheapest to evacuate. Excludes the head and already-free regions, and full
-    /// regions (no garbage to reclaim). Simple O(regions) scan; bucket in Stage 3.
+    /// Pick up to `max` victim regions by **cost-benefit** score (Sprite LFS):
+    /// `score = (1 - u) * age / (1 + u)`, where `u` is the region's utilization and
+    /// `age` is batches since it was written. This favors *old, settled* regions
+    /// that are mostly garbage (lasting reclaim, little relocation) and skips
+    /// freshly-emptied *hot* regions — which, in a uniform build, empty themselves
+    /// as their leaves migrate to the head and get reclaimed for free. Excludes the
+    /// head, already-free, full, and too-full (`> EVAC_MAX_UTIL`) regions. Simple
+    /// O(regions) scan; bucket in a later pass if it shows up.
     fn select_victims(&self, max: usize) -> Vec<u64> {
         if max == 0 {
             return Vec::new();
         }
+        let cap_live = (REGION_PAGES as f64 * EVAC_MAX_UTIL) as u32;
         let free: std::collections::HashSet<u64> = self.free_regions.iter().copied().collect();
-        let mut cands: Vec<(u32, u64)> = self
+        let mut cands: Vec<(f64, u64)> = self
             .live
             .iter()
             .enumerate()
             .filter_map(|(r, &live)| {
                 let r = r as u64;
-                if live == 0
-                    || live >= REGION_PAGES as u32
-                    || r == self.head_region
-                    || free.contains(&r)
-                {
-                    None
-                } else {
-                    Some((live, r))
+                if live == 0 || live > cap_live || r == self.head_region || free.contains(&r) {
+                    return None;
                 }
+                let u = live as f64 / REGION_PAGES as f64;
+                let age = self.epoch.wrapping_sub(self.epoch_of[r as usize]) as f64;
+                let score = (1.0 - u) * age / (1.0 + u);
+                Some((score, r))
             })
             .collect();
-        cands.sort_unstable();
+        // Highest score first.
+        cands.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         cands.truncate(max);
         cands.into_iter().map(|(_, r)| r).collect()
     }
@@ -990,6 +1009,9 @@ impl FlatMpt {
         let num_regions = end_page.div_ceil(REGION_PAGES);
         let mut alloc = RegionAlloc {
             live: vec![0u32; num_regions as usize],
+            // Reopened regions are "old" (epoch 0); new regions get growing epochs,
+            // so the existing data ages relative to fresh writes.
+            epoch_of: vec![0u32; num_regions as usize],
             ..RegionAlloc::default()
         };
         recompute_live(&upper, &mut alloc.live);
@@ -1093,6 +1115,9 @@ impl FlatMpt {
         if entries.is_empty() {
             return Ok(self.root());
         }
+        // Advance the GC epoch so regions written this batch are "age 0" and the
+        // cost-benefit cleaner leaves them alone until they settle.
+        self.store.seg.lock().unwrap().bump_epoch();
         let t_a = std::time::Instant::now();
         // Dedup (last write wins) and compute leaf value-hashes; buffer values.
         let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
