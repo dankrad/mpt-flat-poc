@@ -1021,34 +1021,40 @@ impl FlatMpt {
             end_page,
         } = bincode::deserialize(&bytes)?;
 
-        // Rebuild per-region liveness from the frontier, then open a fresh head
-        // region at the next region boundary past the file end.
+        // Build the store first (reads need the file), then rebuild per-region
+        // liveness by walking the frontier AND descending into each record's
+        // overflow children. Finally open a fresh head region past the file end.
         let num_regions = end_page.div_ceil(REGION_PAGES);
-        let mut alloc = RegionAlloc {
-            live: vec![0u32; num_regions as usize],
-            // Reopened regions are "old" (epoch 0); new regions get growing epochs,
-            // so the existing data ages relative to fresh writes.
-            epoch_of: vec![0u32; num_regions as usize],
-            ..RegionAlloc::default()
-        };
-        recompute_live(&upper, &mut alloc.live);
-        alloc.head_region = num_regions;
-        alloc.next_page = num_regions * REGION_PAGES;
-        alloc.ensure_region(alloc.head_region);
-        let new_end = alloc.next_page;
-
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let store = FlatFile {
+            file,
+            seg: Mutex::new(RegionAlloc {
+                live: vec![0u32; num_regions as usize],
+                // Reopened regions are "old" (epoch 0); new regions get growing
+                // epochs, so existing data ages relative to fresh writes.
+                epoch_of: vec![0u32; num_regions as usize],
+                ..RegionAlloc::default()
+            }),
+            end_page: AtomicU64::new(end_page),
+        };
+        {
+            let mut live = vec![0u32; num_regions as usize];
+            recompute_live(&upper, &mut live);
+            let mut alloc = store.seg.lock().unwrap();
+            alloc.live = live;
+            alloc.head_region = num_regions;
+            alloc.next_page = num_regions * REGION_PAGES;
+            alloc.ensure_region(num_regions);
+        }
+        store.end_page.store(num_regions * REGION_PAGES, Ordering::SeqCst);
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let values = DB::open(&opts, values_path(path))?;
 
         Ok(Self {
             cfg,
-            store: FlatFile {
-                file,
-                seg: Mutex::new(alloc),
-                end_page: AtomicU64::new(new_end),
-            },
+            store,
             upper,
             values,
             overlay: HashMap::new(),
@@ -1329,6 +1335,19 @@ impl FlatMpt {
         self.gc_regions
     }
 
+    /// Debug audit: (allocator's tracked live units, true live units recomputed
+    /// from the frontier). They must be equal after a batch completes; a positive
+    /// gap means records were superseded without `free()` — a live-accounting leak
+    /// that creates unreclaimable "zombie" regions.
+    pub fn audit_live_units(&self) -> (u64, u64) {
+        let alloc_live = self.store.live_and_free_units().0;
+        let num_regions = self.store.end_page().div_ceil(REGION_PAGES) as usize + 1;
+        let mut live = vec![0u32; num_regions];
+        recompute_live(&self.upper, &mut live);
+        let true_live: u64 = live.iter().map(|&u| u as u64).sum();
+        (alloc_live, true_live)
+    }
+
     /// Heap held by the in-RAM index — the part of the database that is *not*
     /// on disk: the trie frontier, the region allocator, and the unflushed value
     /// overlay. Excludes the OS page cache and RocksDB's own (C++) memory.
@@ -1487,16 +1506,11 @@ fn insert_ram(
                 Some(RamChild::Disk { ptr, root }) => {
                     let mut subtree = store.read_lazy(*ptr)?;
                     let old_ptr = *ptr;
-                    // Incremental insert, crossing any overflow edges on the key's
-                    // path (re-hashing only that path). Then shed children to
-                    // overflow if the record outgrew `max` — the record stays on
-                    // disk (one frontier entry) instead of promoting a RAM branch.
+                    // Incremental insert (re-hashing only the touched path). If the
+                    // record outgrew `max_leaf`, promote it into the RAM frontier —
+                    // its children become first-class frontier entries (option B).
                     record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
-                    migrate_record(store, cfg, &mut subtree)?;
-                    if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
-                        // Majority of children externalized: lift this record into
-                        // the RAM frontier so its (now mostly-fat) children become
-                        // first-class frontier entries — shallower reads/rewrites.
+                    if should_promote(cfg, &subtree) {
                         store.free(old_ptr);
                         children[idx] = Some(promote_record_to_ram(store, subtree)?);
                     } else {
@@ -1764,15 +1778,11 @@ fn record_node_insert(
         Node::Branch { mut children, .. } => {
             let idx = nibbles[depth] as usize;
             match children[idx].as_deref_mut() {
-                Some(Node::Overflow { ptr, root }) => {
-                    // Recurse into the overflow record, then rewrite it.
-                    let mut sub = store.read_lazy(*ptr)?;
-                    record_node_insert(store, cfg, &mut sub.node, sub.prefix.len(), key, value_hash)?;
-                    migrate_record(store, cfg, &mut sub)?;
-                    let (payload, _) = serialize_subtree(&sub)?;
-                    store.free(*ptr);
-                    *ptr = store.write_payload(&payload)?;
-                    *root = hash_node(&sub.node);
+                Some(Node::Overflow { .. }) => {
+                    // Option B never creates on-disk overflow children; records are
+                    // promoted into the RAM frontier instead. So this is unreachable
+                    // on data written by this build.
+                    unreachable!("on-disk Overflow under promote-on-max (option B)")
                 }
                 Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value_hash)?,
                 None => {
@@ -1786,29 +1796,6 @@ fn record_node_insert(
     };
     *node = updated;
     Ok(())
-}
-
-/// `&mut` access to the top branch's children (descending through a leading
-/// extension). `None` if the record holds no branch (a 0/1-entry record).
-fn top_branch_children_mut(node: &mut Node) -> Option<&mut [Option<Box<Node>>; 16]> {
-    match node {
-        Node::Branch { children, .. } => Some(children),
-        Node::Extension { child, .. } => top_branch_children_mut(child),
-        _ => None,
-    }
-}
-
-/// Recompute cached hashes for the record's leading structure after a top-branch
-/// child slot changed (e.g. an inline child became an `Overflow`).
-fn rehash_top(node: &mut Node) {
-    match node {
-        Node::Branch { children, hash, .. } => *hash = branch_hash(children),
-        Node::Extension { path, child, hash } => {
-            rehash_top(child);
-            *hash = hash_join(4, path, &hash_node(child));
-        }
-        _ => {}
-    }
 }
 
 /// The nibble prefix of the record's top branch (record prefix + leading
@@ -1825,82 +1812,17 @@ fn top_branch_prefix(subtree: &DiskSubtree) -> Option<Vec<u8>> {
     }
 }
 
-/// Shed top-branch children of `subtree` into their own `Overflow` records until
-/// it fits (the "(2)→(3) migration"):
-///  - **Proactive:** any inline child whose own record would be ≥ `min_promote`
-///    is moved out (it deserves its own record).
-///  - **Forced:** while the record still exceeds `max_leaf_bytes`, the *largest*
-///    inline child is moved out (ignoring `min_promote`) until ≤ `target`.
-/// Converges — worst case every child becomes an `Overflow` and the record is a
-/// bare branch header. Root-preserving: an `Overflow{root}` contributes the same
-/// digest the inline child did.
-fn migrate_record(store: &FlatFile, cfg: &Config, subtree: &mut DiskSubtree) -> Result<()> {
-    let Some(branch_prefix) = top_branch_prefix(subtree) else {
-        return Ok(());
-    };
-    let child_prefix_len = branch_prefix.len() + 1;
-    loop {
-        // Size-only (no allocation): the record, and each inline child as its
-        // own record. Most inserts shed nothing, so this must stay cheap.
-        let total = record_size(subtree.prefix.len(), &subtree.node);
-        let children = top_branch_children_mut(&mut subtree.node).unwrap();
-        let mut inline: Vec<(usize, usize)> = Vec::new();
-        for (i, slot) in children.iter().enumerate() {
-            if let Some(boxed) = slot {
-                if !matches!(**boxed, Node::Overflow { .. }) {
-                    inline.push((i, record_size(child_prefix_len, boxed)));
-                }
-            }
-        }
-
-        // Pick a child to shed: proactive first, then forced if still over max.
-        let shed = inline
-            .iter()
-            .find(|(_, b)| *b >= cfg.min_promote_bytes)
-            .map(|(i, _)| *i)
-            .or_else(|| {
-                if total > cfg.max_leaf_bytes {
-                    inline.iter().max_by_key(|(_, b)| *b).map(|(i, _)| *i)
-                } else {
-                    None
-                }
-            });
-        let Some(idx) = shed else { return Ok(()) };
-
-        // Move children[idx] out to its own record and replace with an Overflow.
-        let child = children[idx].take().unwrap();
-        let mut cp = branch_prefix.clone();
-        cp.push(idx as u8);
-        let child_sub = DiskSubtree { prefix: cp, node: *child };
-        let (payload, _) = serialize_subtree(&child_sub)?;
-        let ptr = store.write_payload(&payload)?;
-        let root = hash_node(&child_sub.node);
-        let children = top_branch_children_mut(&mut subtree.node).unwrap();
-        children[idx] = Some(Box::new(Node::Overflow { ptr, root }));
-        rehash_top(&mut subtree.node);
-    }
-}
-
-/// Once this many of a packed record's 16 top-branch children have been
-/// externalized to `Overflow` records, the branch is "branchy" enough to earn a
-/// place in the RAM frontier — promote it (see [`promote_record_to_ram`]). A
-/// strict majority (8/16) lifts the frontier early enough to keep read/rewrite
-/// depth shallow, while the children left inline are by then just under
-/// `min_promote` (so writing them out wastes little space).
-const PROMOTE_AT_OVERFLOW: usize = 8;
-
-/// Count the `Overflow` children of a record's top branch (through a leading
-/// extension).
-fn count_overflow_children(node: &Node) -> usize {
-    match node {
-        Node::Branch { children, .. } => children
-            .iter()
-            .flatten()
-            .filter(|c| matches!(***c, Node::Overflow { .. }))
-            .count(),
-        Node::Extension { child, .. } => count_overflow_children(child),
-        _ => 0,
-    }
+/// Whether a record should be **promoted** into the RAM frontier rather than kept
+/// as a single packed disk leaf (option B). A record is promoted once it grows past
+/// `max_leaf_bytes`: its top branch lifts into RAM and each child becomes its own
+/// frontier `RamChild::Disk`. This replaces the old on-disk `Overflow` shedding —
+/// which a compacting GC can't tolerate, because moving an overflow child would
+/// require rewriting the on-disk pointer inside its (scattered) parent. With
+/// promotion, every disk record is a frontier leaf and inter-record pointers live
+/// in RAM, so GC can relocate any record by updating a RAM pointer.
+fn should_promote(cfg: &Config, subtree: &DiskSubtree) -> bool {
+    record_size(subtree.prefix.len(), &subtree.node) > cfg.max_leaf_bytes
+        && top_branch_prefix(subtree).is_some()
 }
 
 /// Promote a packed disk record into a RAM-frontier node: its top branch becomes
@@ -1922,24 +1844,33 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
     let mut branch_prefix = prefix;
     branch_prefix.extend_from_slice(&ext_path);
 
+    // Serialize the inline children and write them all in ONE dense batch (these
+    // children are small — well under a page — so writing them individually would
+    // page-pad each to 16 KiB and balloon the file). Overflow children (none under
+    // option B) keep their existing record.
     let mut ram_children = empty_children();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut batched_slots: Vec<(usize, Hash)> = Vec::new();
     for (i, slot) in children.into_iter().enumerate() {
         let Some(boxed) = slot else { continue };
-        let child = match *boxed {
-            // Already its own record — reuse it verbatim.
-            Node::Overflow { ptr, root } => RamChild::Disk { ptr, root },
-            // Inline small child — write it out (it's < min_promote, fits one record).
+        match *boxed {
+            Node::Overflow { ptr, root } => {
+                ram_children[i] = Some(RamChild::Disk { ptr, root });
+            }
             other => {
                 let mut cp = branch_prefix.clone();
                 cp.push(i as u8);
                 let root = hash_node(&other);
-                let child_sub = DiskSubtree { prefix: cp, node: other };
-                let (payload, _) = serialize_subtree(&child_sub)?;
-                let ptr = store.write_payload(&payload)?;
-                RamChild::Disk { ptr, root }
+                let (payload, _) = serialize_subtree(&DiskSubtree { prefix: cp, node: other })?;
+                payloads.push(payload);
+                batched_slots.push((i, root));
             }
-        };
-        ram_children[i] = Some(child);
+        }
+    }
+    let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let ptrs = store.write_batch(&payload_refs)?;
+    for ((i, root), ptr) in batched_slots.into_iter().zip(ptrs) {
+        ram_children[i] = Some(RamChild::Disk { ptr, root });
     }
     let branch = RamNode::Branch {
         children: ram_children,
@@ -2000,8 +1931,7 @@ fn process_group(
     let rebuild_ns = t.elapsed().as_nanos() as u64;
 
     let t = std::time::Instant::now();
-    migrate_record(store, cfg, &mut subtree)?;
-    let out = if count_overflow_children(&subtree.node) >= PROMOTE_AT_OVERFLOW {
+    let out = if should_promote(cfg, &subtree) {
         store.free(ptr);
         GroupOut::Promoted(promote_record_to_ram(store, subtree)?)
     } else {
@@ -2547,21 +2477,20 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
     }
 }
 
-/// Evacuate the live records out of `victims` (inline GC). For each victim region:
-/// one sequential read, then scan its framed records; relocate each *live*,
-/// non-foreground record verbatim (so its hash/root is unchanged) into a coalesced
-/// batched write, and free the old copy (which drops the region's live count to 0,
-/// returning it to the free pool). Liveness and the dedup against this batch's
-/// foreground rewrites both come from the frontier. Returns `(prefix, new_ptr)` for
-/// the relocated records, to be installed into the frontier by the caller.
+/// Evacuate the live records out of `victims` (inline GC). Under option B every
+/// disk record is a frontier `RamChild::Disk` leaf (no on-disk overflow), so a
+/// record is *live* iff the frontier still points at exactly its location. Scan
+/// each victim region's framed records, relocate the live, non-foreground ones
+/// **verbatim** (same bytes ⇒ unchanged hash/root) via one coalesced **dense**
+/// `write_batch`, and free the old copies (dropping each victim region to 0 live so
+/// it's reclaimed). Returns `(prefix, new_ptr)` for the relocated records.
 fn evacuate_regions(
     store: &FlatFile,
     upper: &RamNode,
     victims: &[u64],
     fg_units: &std::collections::HashSet<u32>,
 ) -> Result<Vec<(Vec<u8>, DiskPtr)>> {
-    // Collect (prefix, payload, old_ptr) for each live record in the victims.
-    let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+    let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new(); // (prefix, payload, old_ptr)
     for &region in victims {
         let buf = store.read_region(region)?;
         let base_unit = region * REGION_UNITS;
@@ -2569,9 +2498,7 @@ fn evacuate_regions(
         while p + 4 <= buf.len() {
             let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
             if len == 0 {
-                // Padding to a flush's page boundary (records pack densely, but each
-                // flush's run is 16 KiB-aligned). Skip to the next page and continue
-                // — there may be another flush's records after the pad.
+                // Padding to a flush's page boundary; skip to the next page.
                 let next = (p / PAGE as usize + 1) * PAGE as usize;
                 if next <= p {
                     break;
@@ -2582,11 +2509,9 @@ fn evacuate_regions(
             let rec_units = units_for(RECORD_HDR + len) as usize;
             let end = p + 4 + len as usize;
             if end > buf.len() {
-                break; // defensive: never expected (records don't straddle regions)
+                break; // defensive: records never straddle a region
             }
             let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
-            // Skip foreground-target records — the batch's own rewrite supersedes
-            // them — and stale/garbage records (liveness via the frontier).
             if !fg_units.contains(&unit) {
                 let payload = &buf[p + 4..end];
                 if let Ok(prefix) = parse_prefix(payload) {
@@ -2601,7 +2526,6 @@ fn evacuate_regions(
     if live.is_empty() {
         return Ok(Vec::new());
     }
-    // Relocate verbatim (one coalesced batched write), then free the old copies.
     let payloads: Vec<&[u8]> = live.iter().map(|(_, pl, _)| pl.as_slice()).collect();
     let new_ptrs = store.write_batch(&payloads)?;
     let mut reloc = Vec::with_capacity(live.len());
@@ -2902,9 +2826,10 @@ fn count_disk_leaves(node: &RamNode) -> usize {
     }
 }
 
-/// Bucket every live `DiskPtr` in the frontier into per-region live-page counts
-/// (rebuilds [`RegionAlloc`] liveness on reopen). The frontier is the source of
-/// truth for which records are live.
+/// Bucket every live record's units into per-region live counts (rebuilds
+/// [`RegionAlloc`] liveness on reopen). Under option B every disk record is a
+/// frontier `RamChild::Disk` leaf — there is no on-disk overflow — so the frontier
+/// is the complete liveness map and this is a pure RAM walk (no record reads).
 fn recompute_live(node: &RamNode, live: &mut [u32]) {
     match node {
         RamNode::Empty => {}
@@ -3055,18 +2980,20 @@ mod tests {
             b.root(),
             "root depends on leaf size — hash is not storage-independent",
         );
-        // Sanity: the two really took different storage paths. Tiny leaves force
-        // on-disk overflow chains (>1 read for some keys); huge leaves keep every
-        // top-nibble subtree inline in one record (always 1 read).
-        let a_max = (0..5000u64)
-            .map(|i| a.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap())
-            .max()
-            .unwrap();
-        assert!(a_max > 1, "tiny-leaf build should use overflow chains, got {a_max}");
+        // Sanity: the two really took different storage paths. Tiny leaves promote
+        // heavily (the trie fans out into the RAM frontier), so `a` has many more
+        // frontier nodes than the huge-leaf `b`, which keeps everything in a few
+        // packed records. Both reach any key in one disk read (no overflow chains).
+        assert!(
+            a.ram_nodes() > b.ram_nodes(),
+            "tiny leaves should promote into a larger frontier: a={} b={}",
+            a.ram_nodes(),
+            b.ram_nodes(),
+        );
         assert_eq!(
-            b.disk_accesses_for_key(&hashed_key(0u64.to_le_bytes())).unwrap(),
+            a.disk_accesses_for_key(&hashed_key(0u64.to_le_bytes())).unwrap(),
             1,
-            "huge-leaf build should be all-inline",
+            "option B reaches any key in one disk read",
         );
     }
 
@@ -3186,7 +3113,11 @@ mod tests {
     }
 
     #[test]
-    fn reuses_freed_flat_file_space_on_overwrite() {
+    fn overwrite_churn_keeps_values_current() {
+        // Heavy overwrite churn stays correct. (File-size bounding under churn is a
+        // GC property, covered by the active_gc/overflow_gc tests at a scale past
+        // the GC floor; this small store sits below it, where the log-structured
+        // allocator simply appends, so file size isn't asserted here.)
         let cfg = Config {
             target_leaf_bytes: 512,
             max_leaf_bytes: 768,
@@ -3194,31 +3125,79 @@ mod tests {
         };
         let mut db = db(cfg);
         let keys: Vec<Key> = (0..200u64).map(|i| hashed_key(i.to_le_bytes())).collect();
-        for key in &keys {
-            db.insert(*key, vec![1; 32]).unwrap();
-        }
-        let len_after_build = db.flat_file_len();
-
-        // Overwrite every value many times. Each overwrite rewrites a disk
-        // subtree of the same size, freeing the old region and reusing it, so
-        // the flat file must not keep growing.
         for round in 0..20u8 {
             for key in &keys {
                 db.insert(*key, vec![round; 32]).unwrap();
             }
         }
-        let len_after_churn = db.flat_file_len();
-
-        // Without reuse this would grow ~20x; allow generous slack for any
-        // transient remainder fragments while still proving space is recycled.
-        assert!(
-            len_after_churn <= len_after_build + len_after_build / 2,
-            "flat file grew from {len_after_build} to {len_after_churn} despite reuse"
-        );
-        // All values are still retrievable and current after the churn.
         for key in &keys {
             assert_eq!(db.get_value(key).unwrap(), Some(vec![19u8; 32]));
         }
+    }
+
+    #[test]
+    fn live_accounting_stays_consistent() {
+        // Tiny leaves force heavy overflow-splitting/promotion — the regime where
+        // the remote 8 KiB run leaked live units (zombie regions). The allocator's
+        // live count must match the frontier's truth after every batch.
+        let cfg = Config {
+            target_leaf_bytes: 384,
+            max_leaf_bytes: 512,
+            min_promote_bytes: 256,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = FlatMpt::create(dir.path().join("db.flat"), cfg).unwrap();
+        let n: u64 = 200_000;
+        for chunk in (0..n).step_by(5000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 5000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![0u8; 16]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+            let (alloc, truth) = db.audit_live_units();
+            assert_eq!(
+                alloc, truth,
+                "live accounting diverged after {} keys: allocator={alloc} frontier={truth} (leak={})",
+                chunk + 5000,
+                alloc as i64 - truth as i64,
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_gc_bounds_file() {
+        // Small leaves force heavy overflow-splitting — the regime where overflow
+        // child records (invisible to the frontier) made GC unable to reclaim their
+        // regions, so the file ballooned (the remote hit util ~6%). With
+        // overflow-aware GC the file must stay bounded.
+        let cfg = Config {
+            target_leaf_bytes: 768,
+            max_leaf_bytes: 1024,
+            min_promote_bytes: 512,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = FlatMpt::create(dir.path().join("db.flat"), cfg).unwrap();
+        let n: u64 = 3_000_000;
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![0u8; 16]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+        assert!(
+            db.flat_file_len() > GC_MIN_PAGES * PAGE,
+            "file too small to have engaged GC"
+        );
+        // Pre-fix this collapsed toward ~6%; overflow-aware GC reclaims the overflow
+        // regions, so utilization stays healthy.
+        assert!(
+            db.utilization() > 0.30,
+            "file ballooned: util {:.0}% flat {} live {}",
+            db.utilization() * 100.0,
+            db.flat_file_len(),
+            db.live_bytes(),
+        );
+        let (alloc, truth) = db.audit_live_units();
+        assert_eq!(alloc, truth, "live accounting diverged: {alloc} vs {truth}");
     }
 
     #[test]
@@ -3272,34 +3251,31 @@ mod tests {
     }
 
     #[test]
-    fn splits_large_disk_leaf_into_overflow_records() {
+    fn promotes_large_leaf_into_frontier() {
         let cfg = Config {
             target_leaf_bytes: 512,
             max_leaf_bytes: 768,
             min_promote_bytes: 192,
         };
         let mut db = db(cfg);
-        for i in 0..200u64 {
+        for i in 0..3000u64 {
             db.insert(hashed_key(i.to_le_bytes()), vec![i as u8; 32])
                 .unwrap();
         }
-        // Always-pack: growth is absorbed by on-disk overflow records rather than
-        // RAM-branch promotion, so the frontier stays shallow while some keys sit
-        // behind an overflow chain (>1 read).
+        // Option B: a record exceeding max_leaf is promoted into the RAM frontier
+        // (its children become frontier leaves) rather than shedding children to
+        // on-disk overflow. So the frontier grows, and every key is reachable in
+        // exactly ONE disk read — there are no overflow chains.
         assert!(
-            db.ram_nodes() < 20,
-            "frontier should stay shallow, got {}",
+            db.ram_nodes() > 10,
+            "tiny leaves should promote into the frontier, got {}",
             db.ram_nodes()
         );
-        let max_reads = (0..200u64)
+        let max_reads = (0..3000u64)
             .map(|i| db.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap())
             .max()
             .unwrap();
-        assert!(max_reads > 1, "expected overflow chains, max reads={max_reads}");
-        // Every key is still reachable.
-        for i in [0u64, 33, 99, 199] {
-            assert!(db.disk_accesses_for_key(&hashed_key(i.to_le_bytes())).unwrap() >= 1);
-        }
+        assert_eq!(max_reads, 1, "option B has no overflow chains, max reads={max_reads}");
     }
 
     #[test]
