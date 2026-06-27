@@ -370,13 +370,14 @@ pub mod prof {
     pub use imp::{ENABLED, Guard, audit_start, audit_take, record, reset, scope, snapshot};
 }
 
-/// A `u32` first-page index (16 TiB of addressable file at 4 KiB pages) plus the
-/// record's exact byte length — eight bytes instead of the twelve a `{u64, u32}`
-/// byte offset would take. It appears per frontier leaf (RAM) and per overflow
-/// child (disk), so the four bytes matter at scale.
+/// A `u32` index in `ADDR_UNIT` (256 B) units — records are densely packed at
+/// 256 B alignment, so this addresses ~1 TiB of file — plus the record's exact
+/// byte length. Eight bytes instead of the twelve a `{u64, u32}` byte offset would
+/// take; it appears per frontier leaf (RAM) and per overflow child (disk), so the
+/// four bytes matter at scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskPtr {
-    pub page: u32,
+    pub unit: u32,
     pub len: u32,
 }
 
@@ -385,14 +386,28 @@ pub struct DiskPtr {
 /// payload itself starts at `offset() + RECORD_HDR`.
 const RECORD_HDR: u32 = 4;
 
+/// Dense-packing address granularity: records are placed at 256 B-aligned offsets
+/// (vs the 16 KiB `PAGE` they used to be padded to), cutting the per-record waste
+/// from ~71% to a few percent and shrinking the working set toward RAM-resident.
+const ADDR_UNIT: u64 = 256;
+/// 256 B units per 16 KiB page (physical write alignment) and per 128 KiB region.
+const UNITS_PER_PAGE: u64 = PAGE / ADDR_UNIT;
+const REGION_UNITS: u64 = REGION_PAGES * UNITS_PER_PAGE;
+const REGION_BYTES: usize = (REGION_PAGES * PAGE) as usize;
+
+/// 256 B units needed to hold `bytes` (a framed record).
+fn units_for(bytes: u32) -> u32 {
+    (bytes as u64).div_ceil(ADDR_UNIT) as u32
+}
+
 impl DiskPtr {
     /// Byte offset of the record's length prefix in the flat file.
     fn offset(&self) -> u64 {
-        self.page as u64 * PAGE
+        self.unit as u64 * ADDR_UNIT
     }
-    /// Whole pages the framed record (header + payload) occupies.
-    fn pages(&self) -> u32 {
-        pages_for(RECORD_HDR + self.len)
+    /// 256 B units the framed record (header + payload) occupies.
+    fn units(&self) -> u32 {
+        units_for(RECORD_HDR + self.len)
     }
 }
 
@@ -441,8 +456,8 @@ struct RegionAlloc {
 }
 
 impl RegionAlloc {
-    fn region_of(page: u64) -> u64 {
-        page / REGION_PAGES
+    fn region_of_unit(unit: u64) -> u64 {
+        unit / REGION_UNITS
     }
 
     fn ensure_region(&mut self, r: u64) {
@@ -470,41 +485,43 @@ impl RegionAlloc {
         self.epoch_of[r as usize] = self.epoch;
     }
 
-    /// Reserve `pages` consecutive pages at the head, opening a new head region
-    /// first if the run wouldn't fit. The whole run stays within one region, so
-    /// each record's region (`page / REGION_PAGES`) is well-defined.
-    fn alloc(&mut self, pages: u32, end_page: &AtomicU64) -> u64 {
-        debug_assert!(pages as u64 <= REGION_PAGES);
+    /// Reserve a page-aligned run of `run_pages` pages at the head (the physical
+    /// write is 16 KiB-aligned), crediting `live_units` of dense live data to the
+    /// region. Opens a new head region first if the run wouldn't fit, so the run
+    /// stays within one region. Returns the start page. `live_units` is the
+    /// records' true 256 B footprint — the page-rounding pad is left as garbage.
+    fn alloc(&mut self, run_pages: u32, live_units: u32, end_page: &AtomicU64) -> u64 {
+        debug_assert!(run_pages as u64 <= REGION_PAGES);
         let region_end = self.head_region * REGION_PAGES + REGION_PAGES;
-        if self.live.is_empty() || self.next_page + pages as u64 > region_end {
+        if self.live.is_empty() || self.next_page + run_pages as u64 > region_end {
             self.open_new_head(end_page);
         }
         let page = self.next_page;
-        self.next_page += pages as u64;
-        self.live[self.head_region as usize] += pages;
+        self.next_page += run_pages as u64;
+        self.live[self.head_region as usize] += live_units;
         end_page.fetch_max(self.next_page, Ordering::SeqCst);
         page
     }
 
-    /// Mark a record's pages dead; reclaim the region once it is fully dead.
-    fn free(&mut self, page: u64, pages: u32) {
-        let r = Self::region_of(page) as usize;
+    /// Mark a record's units dead; reclaim the region once it is fully dead.
+    fn free(&mut self, unit: u64, units: u32) {
+        let r = Self::region_of_unit(unit) as usize;
         if r >= self.live.len() {
             return;
         }
         let was = self.live[r];
-        self.live[r] = was.saturating_sub(pages);
+        self.live[r] = was.saturating_sub(units);
         if was > 0 && self.live[r] == 0 && r as u64 != self.head_region {
             self.free_regions.push(r as u64);
         }
     }
 
-    fn live_pages(&self) -> u64 {
-        self.live.iter().map(|&p| p as u64).sum()
+    fn live_units(&self) -> u64 {
+        self.live.iter().map(|&u| u as u64).sum()
     }
 
-    fn free_region_pages(&self) -> u64 {
-        self.free_regions.len() as u64 * REGION_PAGES
+    fn free_region_units(&self) -> u64 {
+        self.free_regions.len() as u64 * REGION_UNITS
     }
 
     /// Pick up to `max` victim regions by **cost-benefit** score (Sprite LFS):
@@ -519,7 +536,7 @@ impl RegionAlloc {
         if max == 0 {
             return Vec::new();
         }
-        let cap_live = (REGION_PAGES as f64 * EVAC_MAX_UTIL) as u32;
+        let cap_live = (REGION_UNITS as f64 * EVAC_MAX_UTIL) as u32;
         let free: std::collections::HashSet<u64> = self.free_regions.iter().copied().collect();
         let mut cands: Vec<(f64, u64)> = self
             .live
@@ -530,7 +547,7 @@ impl RegionAlloc {
                 if live == 0 || live > cap_live || r == self.head_region || free.contains(&r) {
                     return None;
                 }
-                let u = live as f64 / REGION_PAGES as f64;
+                let u = live as f64 / REGION_UNITS as f64;
                 let age = self.epoch.wrapping_sub(self.epoch_of[r as usize]) as f64;
                 let score = (1.0 - u) * age / (1.0 + u);
                 Some((score, r))
@@ -583,66 +600,72 @@ impl FlatFile {
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
-        let pages = pages_for(RECORD_HDR + total);
+        let run_pages = pages_for(RECORD_HDR + total);
+        let units = units_for(RECORD_HDR + total);
         let lt = std::time::Instant::now();
-        let page = self.seg.lock().unwrap().alloc(pages, &self.end_page);
+        let page = self.seg.lock().unwrap().alloc(run_pages, units, &self.end_page);
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
-        if page + pages as u64 > u32::MAX as u64 {
-            bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
+        let unit = page * UNITS_PER_PAGE;
+        if unit + units as u64 > u32::MAX as u64 {
+            bail!("flat file exceeds the DiskPtr addressing limit");
         }
-        let page = page as u32;
 
         // Frame: [u32 payload len][payload][zero pad to page].
-        let mut record = vec![0u8; pages as usize * PAGE as usize];
+        let mut record = vec![0u8; run_pages as usize * PAGE as usize];
         record[..4].copy_from_slice(&total.to_le_bytes());
         record[4..4 + payload.len()].copy_from_slice(payload);
 
         let _g = prof::scope(prof::Cat::FileWrite);
         let wt = std::time::Instant::now();
-        (&self.file).write_all_at(&record, page as u64 * PAGE)?;
+        (&self.file).write_all_at(&record, page * PAGE)?;
         stats::on_pwrite(wt.elapsed().as_nanos() as u64);
-        Ok(DiskPtr { page, len: total })
+        Ok(DiskPtr { unit: unit as u32, len: total })
     }
 
-    /// Coalesce several records into contiguous appended `pwrite`s, each ≤ one
-    /// region (so a write is 16 KiB-aligned and stays on the bandwidth plateau, and
-    /// no record straddles a region boundary). Returns a `DiskPtr` per payload.
+    /// Coalesce several records into contiguous appended `pwrite`s, packed densely
+    /// at 256 B alignment, each run ≤ one region (so the write is 16 KiB-aligned and
+    /// stays on the bandwidth plateau, and no record straddles a region). Returns a
+    /// `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
         let mut ptrs = Vec::with_capacity(payloads.len());
         let mut i = 0;
         while i < payloads.len() {
-            // Take a run of records whose page-sum fits in one region.
-            let mut run_pages = 0u32;
+            // Pack a run of records (256 B-aligned) whose total fits in one region.
+            let mut run_bytes = 0usize;
             let mut j = i;
             while j < payloads.len() {
-                let pc = pages_for(RECORD_HDR + payloads[j].len() as u32);
-                if j > i && run_pages + pc > REGION_PAGES as u32 {
+                let rec = aligned(RECORD_HDR as usize + payloads[j].len());
+                if j > i && run_bytes + rec > REGION_BYTES {
                     break;
                 }
-                run_pages += pc;
+                run_bytes += rec;
                 j += 1;
             }
+            let run_pages = pages_for(run_bytes as u32);
+            let live_units: u32 = payloads[i..j]
+                .iter()
+                .map(|p| units_for(RECORD_HDR + p.len() as u32))
+                .sum();
             let lt = std::time::Instant::now();
-            let page_start = self.seg.lock().unwrap().alloc(run_pages, &self.end_page);
+            let page_start = self.seg.lock().unwrap().alloc(run_pages, live_units, &self.end_page);
             stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
-            if page_start + run_pages as u64 > u32::MAX as u64 {
-                bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
+            let base_unit = page_start * UNITS_PER_PAGE;
+            if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
+                bail!("flat file exceeds the DiskPtr addressing limit");
             }
             let mut buf = vec![0u8; run_pages as usize * PAGE as usize];
-            let mut page = page_start;
-            let mut off = 0usize;
+            let mut off = 0usize; // dense byte offset within the run
             for p in &payloads[i..j] {
-                let pc = pages_for(RECORD_HDR + p.len() as u32);
-                // Frame: [u32 payload len][payload], page-aligned within the run.
+                // Frame: [u32 payload len][payload], 256 B-aligned within the run.
                 buf[off..off + 4].copy_from_slice(&(p.len() as u32).to_le_bytes());
                 buf[off + 4..off + 4 + p.len()].copy_from_slice(p);
                 ptrs.push(DiskPtr {
-                    page: page as u32,
+                    unit: (base_unit + (off / ADDR_UNIT as usize) as u64) as u32,
                     len: p.len() as u32,
                 });
                 stats::on_write(p.len());
-                page += pc as u64;
-                off += pc as usize * PAGE as usize;
+                off += aligned(RECORD_HDR as usize + p.len());
             }
             let _g = prof::scope(prof::Cat::FileWrite);
             let wt = std::time::Instant::now();
@@ -677,14 +700,6 @@ impl FlatFile {
         out
     }
 
-    /// Read a record's exact payload bytes (no parse) — used by GC to relocate a
-    /// record verbatim. The relocated copy is re-framed by `write_payload`.
-    fn read_raw(&self, ptr: DiskPtr) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; ptr.len as usize];
-        (&self.file).read_exact_at(&mut buf, ptr.offset() + RECORD_HDR as u64)?;
-        Ok(buf)
-    }
-
     /// Read one whole region (`REGION_PAGES` pages) for GC scanning. Pages past the
     /// file end read as zeros (sparse), which the scan treats as an empty tail.
     fn read_region(&self, region: u64) -> Result<Vec<u8>> {
@@ -701,7 +716,7 @@ impl FlatFile {
 
     fn free(&self, ptr: DiskPtr) {
         let lt = std::time::Instant::now();
-        self.seg.lock().unwrap().free(ptr.page as u64, ptr.pages());
+        self.seg.lock().unwrap().free(ptr.unit as u64, ptr.units());
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
     }
 
@@ -709,16 +724,18 @@ impl FlatFile {
         self.end_page.load(Ordering::SeqCst)
     }
 
-    /// Live pages and pages held in reclaimed-but-unused regions.
-    fn live_and_free_pages(&self) -> (u64, u64) {
+    /// Live units and units held in reclaimed-but-unused regions.
+    fn live_and_free_units(&self) -> (u64, u64) {
         let seg = self.seg.lock().unwrap();
-        (seg.live_pages(), seg.free_region_pages())
+        (seg.live_units(), seg.free_region_units())
     }
 
-    /// Total dead pages in the file (everything not currently live).
-    fn garbage_pages(&self) -> u64 {
-        let (live, _) = self.live_and_free_pages();
-        self.end_page().saturating_sub(live)
+    /// Total dead bytes in the file (everything not currently live).
+    fn garbage_bytes(&self) -> u64 {
+        let (live_units, _) = self.live_and_free_units();
+        (self.end_page() * UNITS_PER_PAGE)
+            .saturating_sub(live_units)
+            * ADDR_UNIT
     }
 
     /// Number of fully-reclaimed regions available for reuse.
@@ -1138,7 +1155,7 @@ impl FlatMpt {
             match find_disk_ptr_key(&self.upper, &key, 0) {
                 Some(ptr) => {
                     groups
-                        .entry(ptr.page)
+                        .entry(ptr.unit)
                         .or_insert_with(|| (ptr, key, Vec::new()))
                         .2
                         .push((key, value_hash));
@@ -1182,16 +1199,16 @@ impl FlatMpt {
         // Inline GC (after Phase B, so this batch's foreground frees are already
         // applied): evacuate the live records out of the emptiest regions and
         // collect their relocations to install alongside the foreground results.
-        // The pages this batch is already rewriting are skipped (deduped).
-        let fg_pages: std::collections::HashSet<u32> =
-            groups.iter().map(|(ptr, _, _)| ptr.page).collect();
+        // The records this batch is already rewriting are skipped (deduped by unit).
+        let fg_units: std::collections::HashSet<u32> =
+            groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
         let t_gc = std::time::Instant::now();
         let r = self.gc_rate();
         let victims = self.store.seg.lock().unwrap().select_victims(r);
         let reloc = if victims.is_empty() {
             Vec::new()
         } else {
-            evacuate_regions(&self.store, &self.upper, &victims, &fg_pages)?
+            evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
         };
         stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
 
@@ -1230,9 +1247,9 @@ impl FlatMpt {
         if end < GC_MIN_PAGES {
             return 0;
         }
-        let (live, free_pages) = self.store.live_and_free_pages();
-        let active = end.saturating_sub(free_pages).max(1);
-        let u = live as f64 / active as f64;
+        let (live_units, free_units) = self.store.live_and_free_units();
+        let active = (end * UNITS_PER_PAGE).saturating_sub(free_units).max(1);
+        let u = live_units as f64 / active as f64;
         let adj = ((TARGET_UTIL - u) * GC_GAIN).round() as i64;
         let r = (self.gc_regions as i64 + adj).clamp(0, GC_R_MAX as i64) as usize;
         self.gc_regions = r;
@@ -1279,7 +1296,7 @@ impl FlatMpt {
 
     /// Dead (non-live) bytes in the flat file. (Kept under the historical name.)
     pub fn free_bytes(&self) -> u64 {
-        self.store.garbage_pages() * PAGE
+        self.store.garbage_bytes()
     }
 
     /// Number of fully-reclaimed regions available for reuse.
@@ -2156,7 +2173,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
         }
         Node::Overflow { ptr, root } => {
             out.push(4);
-            out.extend_from_slice(&ptr.page.to_le_bytes());
+            out.extend_from_slice(&ptr.unit.to_le_bytes());
             out.extend_from_slice(&ptr.len.to_le_bytes());
             out.extend_from_slice(root);
         }
@@ -2275,11 +2292,11 @@ impl<'a> CompactReader<'a> {
                 Ok(Node::Branch { children, hash })
             }
             4 => {
-                let page = self.read_u32()?;
+                let unit = self.read_u32()?;
                 let len = self.read_u32()?;
                 let root = self.read_hash()?;
                 Ok(Node::Overflow {
-                    ptr: DiskPtr { page, len },
+                    ptr: DiskPtr { unit, len },
                     root,
                 })
             }
@@ -2407,11 +2424,11 @@ impl LazyReader {
                 Ok(Node::Branch { children, hash })
             }
             4 => {
-                let page = self.u32()?;
+                let unit = self.u32()?;
                 let len = self.u32()?;
                 let root = self.hash()?;
                 Ok(Node::Overflow {
-                    ptr: DiskPtr { page, len },
+                    ptr: DiskPtr { unit, len },
                     root,
                 })
             }
@@ -2516,36 +2533,44 @@ fn evacuate_regions(
     store: &FlatFile,
     upper: &RamNode,
     victims: &[u64],
-    fg_pages: &std::collections::HashSet<u32>,
+    fg_units: &std::collections::HashSet<u32>,
 ) -> Result<Vec<(Vec<u8>, DiskPtr)>> {
     // Collect (prefix, payload, old_ptr) for each live record in the victims.
     let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
     for &region in victims {
         let buf = store.read_region(region)?;
-        let base_page = region * REGION_PAGES;
-        let mut p = 0usize;
+        let base_unit = region * REGION_UNITS;
+        let mut p = 0usize; // byte offset within the region, always 256 B-aligned
         while p + 4 <= buf.len() {
             let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
             if len == 0 {
-                break; // unwritten tail of the region
+                // Padding to a flush's page boundary (records pack densely, but each
+                // flush's run is 16 KiB-aligned). Skip to the next page and continue
+                // — there may be another flush's records after the pad.
+                let next = (p / PAGE as usize + 1) * PAGE as usize;
+                if next <= p {
+                    break;
+                }
+                p = next;
+                continue;
             }
-            let rec_pages = pages_for(RECORD_HDR + len) as usize;
+            let rec_units = units_for(RECORD_HDR + len) as usize;
             let end = p + 4 + len as usize;
             if end > buf.len() {
                 break; // defensive: never expected (records don't straddle regions)
             }
-            let page = (base_page + (p / PAGE as usize) as u64) as u32;
+            let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
             // Skip foreground-target records — the batch's own rewrite supersedes
             // them — and stale/garbage records (liveness via the frontier).
-            if !fg_pages.contains(&page) {
+            if !fg_units.contains(&unit) {
                 let payload = &buf[p + 4..end];
                 if let Ok(prefix) = parse_prefix(payload) {
-                    if find_disk_ptr(upper, &prefix, 0) == Some(DiskPtr { page, len }) {
-                        live.push((prefix, payload.to_vec(), DiskPtr { page, len }));
+                    if find_disk_ptr(upper, &prefix, 0) == Some(DiskPtr { unit, len }) {
+                        live.push((prefix, payload.to_vec(), DiskPtr { unit, len }));
                     }
                 }
             }
-            p += rec_pages * PAGE as usize;
+            p += rec_units * ADDR_UNIT as usize;
         }
     }
     if live.is_empty() {
@@ -2864,9 +2889,9 @@ fn recompute_live(node: &RamNode, live: &mut [u32]) {
                 match c {
                     RamChild::Ram(n) => recompute_live(n, live),
                     RamChild::Disk { ptr, .. } => {
-                        let r = RegionAlloc::region_of(ptr.page as u64) as usize;
+                        let r = RegionAlloc::region_of_unit(ptr.unit as u64) as usize;
                         if r < live.len() {
-                            live[r] += ptr.pages();
+                            live[r] += ptr.units();
                         }
                     }
                 }
@@ -3038,7 +3063,7 @@ mod tests {
         // Build branch B2 with the same child as an Overflow pointer at slot 3.
         let mut c2 = empty_box_children();
         c2[3] = Some(Box::new(Node::Overflow {
-            ptr: DiskPtr { page: 1, len: 200 },
+            ptr: DiskPtr { unit: 1, len: 200 },
             root: inline_hash,
         }));
         let branch_overflow = make_branch(c2);
@@ -3054,7 +3079,7 @@ mod tests {
         match back.node {
             Node::Branch { children, .. } => match children[3].as_deref() {
                 Some(Node::Overflow { ptr, root }) => {
-                    assert_eq!(*ptr, DiskPtr { page: 1, len: 200 });
+                    assert_eq!(*ptr, DiskPtr { unit: 1, len: 200 });
                     assert_eq!(*root, inline_hash);
                 }
                 other => panic!("slot 3 not an Overflow: {other:?}"),
