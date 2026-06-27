@@ -13,22 +13,24 @@ RAM-resident so the device-read half of Phase B caches away.
 - Rust toolchain; `cargo build --release --bench large` (RocksDB builds C++, takes
   a few minutes the first time).
 
-## Launch
+## Launch (one command)
 ```sh
-# Pick a data dir with space; the checkpoint + values land here.
-export TMPDIR=/path/with/250GB
-cargo build --release --bench large
-LARGE_PRELOAD=1000000000 \
-LARGE_BATCH=10000 \
-LARGE_MAX_LEAF_KIB=16 \
-LARGE_PERSIST=1 \
-  cargo bench --bench large 2>&1 | tee /path/with/250GB/run1b.log
+./run-1b.sh /path/with/250GB           # full 1B
+./run-1b.sh /path/with/150GB 600000000 # shorter ~600M run
 ```
-- `LARGE_PERSIST=1` writes a reopenable checkpoint (`mpt-checkpoint.flat` +
-  `.meta` + `.values`) at the end.
+`run-1b.sh` builds the bench, checks free space, runs the preload at the standard
+config (`batch 10000`, `max_leaf 16 KiB`, persist on), and tees a timestamped log
+into the data dir. The checkpoint (`mpt-checkpoint.flat` + `.meta` + `.values`)
+lands there too.
 - **Kill-safe:** SIGINT/SIGTERM flushes + persists before exit (so `kill` mid-run
   leaves a reopenable checkpoint). `kill -9` does not.
 - Config logged at start; expect `max_leaf=16 KiB (target 8192, min_promote 8192)`.
+
+Equivalent manual launch (if you'd rather set it yourself):
+```sh
+TMPDIR=/path LARGE_PRELOAD=1000000000 LARGE_BATCH=10000 \
+LARGE_MAX_LEAF_KIB=16 LARGE_PERSIST=1 cargo bench --bench large 2>&1 | tee run1b.log
+```
 
 ## Reading the per-10M-key milestone block
 ```
