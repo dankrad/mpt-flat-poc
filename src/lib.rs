@@ -428,7 +428,7 @@ const GC_R_MAX: usize = 8192;
 /// Don't GC until the file is at least this big (avoid churn on tiny files).
 const GC_MIN_PAGES: u64 = 64 * REGION_PAGES;
 /// Never evacuate a region fuller than this (relocation cost not worth the space).
-const EVAC_MAX_UTIL: f64 = 0.75;
+const EVAC_MAX_UTIL: f64 = 0.30;
 
 /// Log-structured page allocator over fixed regions. New records append to a
 /// moving head region (sequential, coalesced writes); per-region live-page counts
