@@ -97,6 +97,18 @@ pub mod stats {
         B_SERIALIZE_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Split of the Phase-B read (`B_READ_NS`) into the device `pread`
+    /// (`B_READ_IO_NS`) and the lazy spine parse (`B_READ_PARSE_NS`). Summed over
+    /// threads — exposes how much of "read" is the SSD vs CPU at scale.
+    pub static B_READ_IO_NS: AtomicU64 = AtomicU64::new(0);
+    pub static B_READ_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_read_io(ns: u64) {
+        B_READ_IO_NS.fetch_add(ns, Relaxed);
+    }
+    pub fn on_read_parse(ns: u64) {
+        B_READ_PARSE_NS.fetch_add(ns, Relaxed);
+    }
+
     /// Phase-C sub-breakdown (serial): INSTALL = splice each group's result into
     /// the frontier + create structure for brand-new keys, ROOT = recompute the
     /// frontier hashes (`hash_ram` over the invalidated path — the keccac-heavy
@@ -150,6 +162,8 @@ pub mod stats {
         W_LOCK_NS.store(0, Relaxed);
         W_PWRITE_NS.store(0, Relaxed);
         B_SERIALIZE_NS.store(0, Relaxed);
+        B_READ_IO_NS.store(0, Relaxed);
+        B_READ_PARSE_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -553,12 +567,17 @@ impl FlatFile {
         let mut record = vec![0u8; ptr.len as usize];
         {
             let _g = prof::scope(prof::Cat::FileRead);
+            let it = std::time::Instant::now();
             (&self.file).read_exact_at(&mut record, ptr.offset())?;
+            stats::on_read_io(it.elapsed().as_nanos() as u64);
         }
         let _g = prof::scope(prof::Cat::Deserialize);
         // `Arc::from(Vec)` reuses the allocation (no copy); Raw children then
         // share it as zero-copy slices.
-        deserialize_subtree_lazy(Arc::from(record))
+        let pt = std::time::Instant::now();
+        let out = deserialize_subtree_lazy(Arc::from(record));
+        stats::on_read_parse(pt.elapsed().as_nanos() as u64);
+        out
     }
 
     fn free(&self, ptr: DiskPtr) {

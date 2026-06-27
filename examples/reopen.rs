@@ -62,13 +62,7 @@ fn main() {
         stats::PHASE_B_NS.load(Relaxed),
         stats::PHASE_C_NS.load(Relaxed),
     );
-    let (rd, rb, fi) = (
-        stats::B_READ_NS.load(Relaxed),
-        stats::B_REBUILD_NS.load(Relaxed),
-        stats::B_FINAL_NS.load(Relaxed),
-    );
     let tot_p = (pa + pb + pc).max(1) as f64;
-    let tot_b = (rd + rb + fi).max(1) as f64;
     let per = |ns: u64| ns as f64 / 1e6 / batches as f64; // ms/batch
 
     println!(
@@ -84,25 +78,46 @@ fn main() {
         per(pc),
         pc as f64 / tot_p * 100.0,
     );
-    println!(
-        "  Phase B (summed over threads): read {:.0}% | rebuild {:.0}% | finalize(migrate+write) {:.0}%",
-        rd as f64 / tot_b * 100.0,
-        rb as f64 / tot_b * 100.0,
-        fi as f64 / tot_b * 100.0,
-    );
-    // Within Phase B: serialize (builds the record payload — a full-leaf walk),
-    // the free-list lock (alloc+free), and the pwrite. All summed over threads.
+
+    // Phase-B drill-down. Each counter is summed across the worker threads, so it
+    // measures total CPU/IO *work* per key (thread-µs/key); dividing the summed
+    // total by the Phase-B wall time gives the effective concurrency. The seven
+    // components are disjoint and sum to the whole of Phase B:
+    //   read = pread (device) + parse (cpu);  rebuild (cpu keccak);
+    //   migrate = B_FINAL - serialize (cpu);  serialize (cpu);
+    //   alloc-lock (contention);  pwrite (device).
+    let io = stats::B_READ_IO_NS.load(Relaxed);
+    let parse = stats::B_READ_PARSE_NS.load(Relaxed);
+    let rebuild = stats::B_REBUILD_NS.load(Relaxed);
     let ser = stats::B_SERIALIZE_NS.load(Relaxed);
+    let migrate = stats::B_FINAL_NS.load(Relaxed).saturating_sub(ser);
     let lock = stats::W_LOCK_NS.load(Relaxed);
     let pw = stats::W_PWRITE_NS.load(Relaxed);
+    let summed = (io + parse + rebuild + migrate + ser + lock + pw).max(1);
+    let uk = |ns: u64| ns as f64 / 1000.0 / n as f64; // thread-µs/key
+    let pct = |ns: u64| ns as f64 / summed as f64 * 100.0;
+
     println!(
-        "  of which (summed): serialize {:.0}% ({:.1} ms/batch) | free-list lock {:.0}% ({:.1}) | pwrite {:.0}% ({:.1})",
-        ser as f64 / tot_b * 100.0,
-        per(ser),
-        lock as f64 / tot_b * 100.0,
-        per(lock),
-        pw as f64 / tot_b * 100.0,
-        per(pw),
+        "  Phase B work (thread-µs/key, summed over threads; effective concurrency {:.1}x):",
+        summed as f64 / pb.max(1) as f64,
+    );
+    println!(
+        "    read.pread (device) {:.2} ({:.0}%) | read.parse (cpu) {:.2} ({:.0}%)",
+        uk(io), pct(io), uk(parse), pct(parse),
+    );
+    println!(
+        "    rebuild (cpu)       {:.2} ({:.0}%) | migrate (cpu)     {:.2} ({:.0}%) | serialize (cpu) {:.2} ({:.0}%)",
+        uk(rebuild), pct(rebuild), uk(migrate), pct(migrate), uk(ser), pct(ser),
+    );
+    println!(
+        "    pwrite (device)     {:.2} ({:.0}%) | alloc-lock (cont) {:.2} ({:.0}%)",
+        uk(pw), pct(pw), uk(lock), pct(lock),
+    );
+    println!(
+        "  grouped: device(pread+pwrite) {:.2} ({:.0}%) | cpu(parse+rebuild+migrate+serialize) {:.2} ({:.0}%) | contention {:.2} ({:.0}%)",
+        uk(io + pw), pct(io + pw),
+        uk(parse + rebuild + migrate + ser), pct(parse + rebuild + migrate + ser),
+        uk(lock), pct(lock),
     );
     // Phase C is serial today; split it to see what a parallel version could win.
     let (ci, cr, cf) = (
