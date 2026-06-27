@@ -109,6 +109,21 @@ pub mod stats {
         B_READ_PARSE_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Inline GC: batches that ran a pass, regions reclaimed, records relocated,
+    /// and time spent in evacuation (read region + relocate), summed.
+    pub static GC_PASSES: AtomicU64 = AtomicU64::new(0);
+    pub static GC_REGIONS: AtomicU64 = AtomicU64::new(0);
+    pub static GC_RELOCATED: AtomicU64 = AtomicU64::new(0);
+    pub static GC_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_gc(regions: u64, relocated: u64, ns: u64) {
+        if regions > 0 || relocated > 0 {
+            GC_PASSES.fetch_add(1, Relaxed);
+        }
+        GC_REGIONS.fetch_add(regions, Relaxed);
+        GC_RELOCATED.fetch_add(relocated, Relaxed);
+        GC_NS.fetch_add(ns, Relaxed);
+    }
+
     /// Phase-C sub-breakdown (serial): INSTALL = splice each group's result into
     /// the frontier + create structure for brand-new keys, ROOT = recompute the
     /// frontier hashes (`hash_ram` over the invalidated path — the keccac-heavy
@@ -164,6 +179,10 @@ pub mod stats {
         B_SERIALIZE_NS.store(0, Relaxed);
         B_READ_IO_NS.store(0, Relaxed);
         B_READ_PARSE_NS.store(0, Relaxed);
+        GC_PASSES.store(0, Relaxed);
+        GC_REGIONS.store(0, Relaxed);
+        GC_RELOCATED.store(0, Relaxed);
+        GC_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -185,6 +204,13 @@ pub mod stats {
                 s += &format!(" {p}p={c}");
             }
         }
+        s += &format!(
+            "  gc: passes={} regions_reclaimed={} relocated={} ms={}",
+            GC_PASSES.load(Relaxed),
+            GC_REGIONS.load(Relaxed),
+            GC_RELOCATED.load(Relaxed),
+            GC_NS.load(Relaxed) / 1_000_000,
+        );
         s
     }
 }
@@ -354,14 +380,19 @@ pub struct DiskPtr {
     pub len: u32,
 }
 
+/// On-disk record framing: a `u32` little-endian payload length precedes the
+/// payload, so GC can scan a region record-by-record without the frontier. The
+/// payload itself starts at `offset() + RECORD_HDR`.
+const RECORD_HDR: u32 = 4;
+
 impl DiskPtr {
-    /// Byte offset of the record in the flat file.
+    /// Byte offset of the record's length prefix in the flat file.
     fn offset(&self) -> u64 {
         self.page as u64 * PAGE
     }
-    /// Whole pages the record occupies.
+    /// Whole pages the framed record (header + payload) occupies.
     fn pages(&self) -> u32 {
-        pages_for(self.len)
+        pages_for(RECORD_HDR + self.len)
     }
 }
 
@@ -370,6 +401,17 @@ impl DiskPtr {
 /// whole-region write is 16 KiB-aligned (no sub-page RMW penalty); a region is
 /// also the unit GC reclaims.
 const REGION_PAGES: u64 = 8;
+
+/// Inline-GC controller (see GC_DESIGN.md). The cleaning rate `R` (victim regions
+/// per batch) is adjusted each batch to hold `live / active` at `TARGET_UTIL`.
+const TARGET_UTIL: f64 = 0.60;
+/// Proportional gain: regions added to `R` per unit of utilization error. A 10%
+/// miss moves `R` by ~`GC_GAIN/10`. Tunable.
+const GC_GAIN: f64 = 4000.0;
+/// Per-batch cap on regions evacuated (bounds the GC stall). Tunable.
+const GC_R_MAX: usize = 8192;
+/// Don't GC until the file is at least this big (avoid churn on tiny files).
+const GC_MIN_PAGES: u64 = 64 * REGION_PAGES;
 
 /// Log-structured page allocator over fixed regions. New records append to a
 /// moving head region (sequential, coalesced writes); per-region live-page counts
@@ -450,6 +492,36 @@ impl RegionAlloc {
     fn free_region_pages(&self) -> u64 {
         self.free_regions.len() as u64 * REGION_PAGES
     }
+
+    /// The `max` regions with the least (non-zero) live data — emptiest first, the
+    /// cheapest to evacuate. Excludes the head and already-free regions, and full
+    /// regions (no garbage to reclaim). Simple O(regions) scan; bucket in Stage 3.
+    fn select_victims(&self, max: usize) -> Vec<u64> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let free: std::collections::HashSet<u64> = self.free_regions.iter().copied().collect();
+        let mut cands: Vec<(u32, u64)> = self
+            .live
+            .iter()
+            .enumerate()
+            .filter_map(|(r, &live)| {
+                let r = r as u64;
+                if live == 0
+                    || live >= REGION_PAGES as u32
+                    || r == self.head_region
+                    || free.contains(&r)
+                {
+                    None
+                } else {
+                    Some((live, r))
+                }
+            })
+            .collect();
+        cands.sort_unstable();
+        cands.truncate(max);
+        cands.into_iter().map(|(_, r)| r).collect()
+    }
 }
 
 /// Append-mostly flat file of compact-serialized [`DiskSubtree`] records, with a
@@ -492,7 +564,7 @@ impl FlatFile {
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
-        let pages = pages_for(total);
+        let pages = pages_for(RECORD_HDR + total);
         let lt = std::time::Instant::now();
         let page = self.seg.lock().unwrap().alloc(pages, &self.end_page);
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
@@ -501,8 +573,10 @@ impl FlatFile {
         }
         let page = page as u32;
 
+        // Frame: [u32 payload len][payload][zero pad to page].
         let mut record = vec![0u8; pages as usize * PAGE as usize];
-        record[..payload.len()].copy_from_slice(payload);
+        record[..4].copy_from_slice(&total.to_le_bytes());
+        record[4..4 + payload.len()].copy_from_slice(payload);
 
         let _g = prof::scope(prof::Cat::FileWrite);
         let wt = std::time::Instant::now();
@@ -522,7 +596,7 @@ impl FlatFile {
             let mut run_pages = 0u32;
             let mut j = i;
             while j < payloads.len() {
-                let pc = pages_for(payloads[j].len() as u32);
+                let pc = pages_for(RECORD_HDR + payloads[j].len() as u32);
                 if j > i && run_pages + pc > REGION_PAGES as u32 {
                     break;
                 }
@@ -539,8 +613,10 @@ impl FlatFile {
             let mut page = page_start;
             let mut off = 0usize;
             for p in &payloads[i..j] {
-                let pc = pages_for(p.len() as u32);
-                buf[off..off + p.len()].copy_from_slice(p);
+                let pc = pages_for(RECORD_HDR + p.len() as u32);
+                // Frame: [u32 payload len][payload], page-aligned within the run.
+                buf[off..off + 4].copy_from_slice(&(p.len() as u32).to_le_bytes());
+                buf[off + 4..off + 4 + p.len()].copy_from_slice(p);
                 ptrs.push(DiskPtr {
                     page: page as u32,
                     len: p.len() as u32,
@@ -569,7 +645,8 @@ impl FlatFile {
         {
             let _g = prof::scope(prof::Cat::FileRead);
             let it = std::time::Instant::now();
-            (&self.file).read_exact_at(&mut record, ptr.offset())?;
+            // Payload starts just past the framing header.
+            (&self.file).read_exact_at(&mut record, ptr.offset() + RECORD_HDR as u64)?;
             stats::on_read_io(it.elapsed().as_nanos() as u64);
         }
         let _g = prof::scope(prof::Cat::Deserialize);
@@ -579,6 +656,28 @@ impl FlatFile {
         let out = deserialize_subtree_lazy(Arc::from(record));
         stats::on_read_parse(pt.elapsed().as_nanos() as u64);
         out
+    }
+
+    /// Read a record's exact payload bytes (no parse) — used by GC to relocate a
+    /// record verbatim. The relocated copy is re-framed by `write_payload`.
+    fn read_raw(&self, ptr: DiskPtr) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; ptr.len as usize];
+        (&self.file).read_exact_at(&mut buf, ptr.offset() + RECORD_HDR as u64)?;
+        Ok(buf)
+    }
+
+    /// Read one whole region (`REGION_PAGES` pages) for GC scanning. Pages past the
+    /// file end read as zeros (sparse), which the scan treats as an empty tail.
+    fn read_region(&self, region: u64) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; REGION_PAGES as usize * PAGE as usize];
+        let off = region * REGION_PAGES * PAGE;
+        // Tolerate a short read at the very end of the file (sparse tail).
+        match (&self.file).read_exact_at(&mut buf, off) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(buf)
     }
 
     fn free(&self, ptr: DiskPtr) {
@@ -629,7 +728,8 @@ fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
     let mut record = vec![0u8; ptr.len as usize];
     {
         let _g = prof::scope(prof::Cat::FileRead);
-        file.read_exact_at(&mut record, ptr.offset())?;
+        // Payload starts just past the framing header.
+        file.read_exact_at(&mut record, ptr.offset() + RECORD_HDR as u64)?;
     }
     let _g = prof::scope(prof::Cat::Deserialize);
     deserialize_subtree(&record)
@@ -814,6 +914,9 @@ pub struct FlatMpt {
     overlay: HashMap<Key, Vec<u8>>,
     /// Path of the flat file; the value store and manifest are derived from it.
     path: PathBuf,
+    /// Inline-GC cleaning rate: victim regions to evacuate per batch, adjusted by
+    /// the proportional controller to hold utilization at `TARGET_UTIL`.
+    gc_regions: usize,
 }
 
 /// On-disk checkpoint of everything that otherwise lives only in RAM: the trie
@@ -862,6 +965,7 @@ impl FlatMpt {
             values,
             overlay: HashMap::new(),
             path: path.to_path_buf(),
+            gc_regions: 0,
         })
     }
 
@@ -910,6 +1014,7 @@ impl FlatMpt {
             values,
             overlay: HashMap::new(),
             path: path.to_path_buf(),
+            gc_regions: 0,
         })
     }
 
@@ -1048,12 +1153,33 @@ impl FlatMpt {
         };
 
         let b_ns = t_b.elapsed().as_nanos() as u64;
+
+        // Inline GC (after Phase B, so this batch's foreground frees are already
+        // applied): evacuate the live records out of the emptiest regions and
+        // collect their relocations to install alongside the foreground results.
+        // The pages this batch is already rewriting are skipped (deduped).
+        let fg_pages: std::collections::HashSet<u32> =
+            groups.iter().map(|(ptr, _, _)| ptr.page).collect();
+        let t_gc = std::time::Instant::now();
+        let r = self.gc_rate();
+        let victims = self.store.seg.lock().unwrap().select_victims(r);
+        let reloc = if victims.is_empty() {
+            Vec::new()
+        } else {
+            evacuate_regions(&self.store, &self.upper, &victims, &fg_pages)?
+        };
+        stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
+
         let t_c = std::time::Instant::now();
 
-        // Phase C (serial): splice each group's result into the frontier, then
-        // create structure for the brand-new keys. Recompute the root once.
+        // Phase C (serial): splice each group's result into the frontier, retarget
+        // the relocated records' pointers, then create structure for the brand-new
+        // keys. Recompute the root once.
         for (rep, new_child) in results {
             install_at_key(&mut self.upper, &rep, 0, new_child);
+        }
+        for (prefix, new_ptr) in reloc {
+            install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
         }
         for (key, value_hash) in fresh {
             insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash)?;
@@ -1068,6 +1194,24 @@ impl FlatMpt {
         stats::on_batch(a_ns, b_ns, t_c.elapsed().as_nanos() as u64);
         stats::on_phase_c(install_ns, root_ns, flush_ns);
         Ok(root)
+    }
+
+    /// Proportional controller for the inline-GC cleaning rate. Nudges
+    /// `gc_regions` (victims/batch) toward holding `live / active` at
+    /// `TARGET_UTIL`: below target ⇒ too much garbage ⇒ clean more; above ⇒ ease
+    /// off. Returns the rate to use this batch (0 until the file passes the floor).
+    fn gc_rate(&mut self) -> usize {
+        let end = self.store.end_page();
+        if end < GC_MIN_PAGES {
+            return 0;
+        }
+        let (live, free_pages) = self.store.live_and_free_pages();
+        let active = end.saturating_sub(free_pages).max(1);
+        let u = live as f64 / active as f64;
+        let adj = ((TARGET_UTIL - u) * GC_GAIN).round() as i64;
+        let r = (self.gc_regions as i64 + adj).clamp(0, GC_R_MAX as i64) as usize;
+        self.gc_regions = r;
+        r
     }
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
@@ -2297,6 +2441,102 @@ fn deserialize_subtree_lazy(buf: Arc<[u8]>) -> Result<DiskSubtree> {
     Ok(DiskSubtree { prefix, node })
 }
 
+/// Parse just a record payload's leading nibble-path (its `prefix`) — the path to
+/// its slot in the frontier — without parsing the subtree. Used by GC to locate a
+/// scanned record's frontier pointer.
+fn parse_prefix(payload: &[u8]) -> Result<Vec<u8>> {
+    CompactReader::new(payload).read_nibble_path()
+}
+
+/// Retarget the `DiskPtr` at `prefix`'s frontier slot to `new_ptr`, leaving its
+/// cached hash untouched (relocation is verbatim ⇒ the subtree root is unchanged).
+/// Returns whether a `Disk` slot was found and updated.
+fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_ptr: DiskPtr) -> bool {
+    match node {
+        RamNode::Empty => false,
+        RamNode::Extension { path, child, .. } => {
+            if prefix.get(depth..depth + path.len()) == Some(path.as_slice()) {
+                install_ptr_by_prefix(child, prefix, depth + path.len(), new_ptr)
+            } else {
+                false
+            }
+        }
+        RamNode::Branch { children, .. } => {
+            let idx = match prefix.get(depth) {
+                Some(&i) => i as usize,
+                None => return false,
+            };
+            match children[idx].as_mut() {
+                Some(RamChild::Disk { ptr, .. }) => {
+                    *ptr = new_ptr;
+                    true
+                }
+                Some(RamChild::Ram(child)) => {
+                    install_ptr_by_prefix(child, prefix, depth + 1, new_ptr)
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// Evacuate the live records out of `victims` (inline GC). For each victim region:
+/// one sequential read, then scan its framed records; relocate each *live*,
+/// non-foreground record verbatim (so its hash/root is unchanged) into a coalesced
+/// batched write, and free the old copy (which drops the region's live count to 0,
+/// returning it to the free pool). Liveness and the dedup against this batch's
+/// foreground rewrites both come from the frontier. Returns `(prefix, new_ptr)` for
+/// the relocated records, to be installed into the frontier by the caller.
+fn evacuate_regions(
+    store: &FlatFile,
+    upper: &RamNode,
+    victims: &[u64],
+    fg_pages: &std::collections::HashSet<u32>,
+) -> Result<Vec<(Vec<u8>, DiskPtr)>> {
+    // Collect (prefix, payload, old_ptr) for each live record in the victims.
+    let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+    for &region in victims {
+        let buf = store.read_region(region)?;
+        let base_page = region * REGION_PAGES;
+        let mut p = 0usize;
+        while p + 4 <= buf.len() {
+            let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            if len == 0 {
+                break; // unwritten tail of the region
+            }
+            let rec_pages = pages_for(RECORD_HDR + len) as usize;
+            let end = p + 4 + len as usize;
+            if end > buf.len() {
+                break; // defensive: never expected (records don't straddle regions)
+            }
+            let page = (base_page + (p / PAGE as usize) as u64) as u32;
+            // Skip foreground-target records — the batch's own rewrite supersedes
+            // them — and stale/garbage records (liveness via the frontier).
+            if !fg_pages.contains(&page) {
+                let payload = &buf[p + 4..end];
+                if let Ok(prefix) = parse_prefix(payload) {
+                    if find_disk_ptr(upper, &prefix, 0) == Some(DiskPtr { page, len }) {
+                        live.push((prefix, payload.to_vec(), DiskPtr { page, len }));
+                    }
+                }
+            }
+            p += rec_pages * PAGE as usize;
+        }
+    }
+    if live.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Relocate verbatim (one coalesced batched write), then free the old copies.
+    let payloads: Vec<&[u8]> = live.iter().map(|(_, pl, _)| pl.as_slice()).collect();
+    let new_ptrs = store.write_batch(&payloads)?;
+    let mut reloc = Vec::with_capacity(live.len());
+    for ((prefix, _, old), new) in live.into_iter().zip(new_ptrs) {
+        store.free(old);
+        reloc.push((prefix, new));
+    }
+    Ok(reloc)
+}
+
 fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {
     match node {
         RamNode::Empty => None,
@@ -2904,6 +3144,56 @@ mod tests {
         for key in &keys {
             assert_eq!(db.get_value(key).unwrap(), Some(vec![19u8; 32]));
         }
+    }
+
+    #[test]
+    fn active_gc_bounds_file_under_churn() {
+        // Build a file well past the GC floor, then overwrite every key many
+        // times. Without active GC the high-water would grow ~per round; the
+        // inline cleaner must reclaim regions for reuse so it stays bounded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+        let n: u64 = 150_000;
+        let build = |db: &mut FlatMpt, v: u8| {
+            for chunk in (0..n).step_by(10_000) {
+                let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                    .map(|i| (hashed_key(i.to_le_bytes()), vec![v; 32]))
+                    .collect();
+                db.insert_batch(batch).unwrap();
+            }
+        };
+        build(&mut db, 0);
+        let built = db.flat_file_len();
+        assert!(
+            built > GC_MIN_PAGES * PAGE,
+            "build {built} below the GC floor — raise n"
+        );
+
+        let rounds = 12u8;
+        for round in 1..=rounds {
+            build(&mut db, round);
+        }
+        let churned = db.flat_file_len();
+
+        // Active GC must have run and held the file far below the ~12x growth that
+        // churn would otherwise cause.
+        assert!(
+            stats::GC_PASSES.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "GC never ran"
+        );
+        assert!(
+            churned < built * 3,
+            "file ballooned {built} -> {churned} despite GC"
+        );
+        // Every value is current and the root still resolves.
+        for i in (0..n).step_by(7_001) {
+            assert_eq!(
+                db.get_value(&hashed_key(i.to_le_bytes())).unwrap(),
+                Some(vec![rounds; 32])
+            );
+        }
+        let _ = db.root();
     }
 
     #[test]
