@@ -73,9 +73,15 @@ fn main() {
         ram_bat,
     );
 
+    // Root equality is the correctness invariant. Flat-file size is no longer
+    // expected to match: the log-structured allocator reclaims regions on the
+    // write/free interleaving, which differs between the one-by-one and batched
+    // paths (and passive-only reclaim leaves the batched file larger until active
+    // GC compacts it). Reported for information only.
     println!(
-        "\nroot match: {}   flat match: {}",
+        "\nroot match: {}   (flat: one-by-one {:.1} MiB vs batched {:.1} MiB — informational)",
         if root_one == root_bat { "YES" } else { "*** NO ***" },
-        if flat_one == flat_bat { "YES" } else { "*** NO ***" },
+        flat_one as f64 / 1_048_576.0,
+        flat_bat as f64 / 1_048_576.0,
     );
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::FileExt,
@@ -365,92 +365,90 @@ impl DiskPtr {
     }
 }
 
-/// Tracks reclaimed regions of the flat file so new records can be placed into
-/// holes left by rewritten/split subtrees instead of always extending the file.
+/// Reclaim + write-coalesce unit: the flat file is a sequence of 128 KiB regions
+/// (8 × 16 KiB pages). 128 KiB sits on the device's write-bandwidth plateau and a
+/// whole-region write is 16 KiB-aligned (no sub-page RMW penalty); a region is
+/// also the unit GC reclaims.
+const REGION_PAGES: u64 = 8;
+
+/// Log-structured page allocator over fixed regions. New records append to a
+/// moving head region (sequential, coalesced writes); per-region live-page counts
+/// let space be reclaimed a whole region at a time. A region whose live count
+/// reaches zero returns to `free_regions` and is reused before the file is
+/// extended, so the file size stays bounded. (Stage 1a reclaims only regions that
+/// become fully dead on their own; Stage 1b adds active evacuation.)
 ///
-/// The unit is **pages**, not bytes: `by_offset` maps a free region's first page
-/// index to its length in pages. (The structure itself is unit-agnostic; the
-/// caller — [`FlatFile`] — works exclusively in pages.) Quantizing to pages keeps
-/// the size distribution tiny, so freed holes match new requests far more often
-/// and fragmentation stays low.
-///
-/// Regions are kept non-overlapping and coalesced (adjacent free regions are
-/// merged on `free`). Two indexes are maintained in lock-step: `by_offset` for
-/// coalescing with neighbours, and `by_size` (keyed by `(len, offset)`) so that
-/// best-fit allocation is O(log n) rather than a linear scan.
-///
-/// Only `by_offset` is serialized; `by_size` is rebuilt via [`reindex`] on load.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct FreeList {
-    /// first page index -> length in pages of each free region.
-    by_offset: BTreeMap<u64, u32>,
-    /// (length, first page) of each free region, for size-ordered best-fit lookup.
-    #[serde(skip)]
-    by_size: BTreeSet<(u32, u64)>,
+/// Not serialized — recomputed from the frontier on [`FlatMpt::open`].
+#[derive(Debug, Default)]
+struct RegionAlloc {
+    /// Live pages per region; index = region number = page / REGION_PAGES.
+    live: Vec<u32>,
+    /// Region currently being appended to.
+    head_region: u64,
+    /// Next free page (absolute) within the head region.
+    next_page: u64,
+    /// Fully-dead regions, reusable as the next head.
+    free_regions: Vec<u64>,
 }
 
-impl FreeList {
-    fn insert_region(&mut self, offset: u64, len: u32) {
-        self.by_offset.insert(offset, len);
-        self.by_size.insert((len, offset));
+impl RegionAlloc {
+    fn region_of(page: u64) -> u64 {
+        page / REGION_PAGES
     }
 
-    fn remove_region(&mut self, offset: u64, len: u32) {
-        self.by_offset.remove(&offset);
-        self.by_size.remove(&(len, offset));
-    }
-
-    /// Reserve `need` bytes from a free region if one is large enough.
-    /// Returns the offset of the allocation, leaving any remainder free.
-    fn alloc(&mut self, need: u32) -> Option<u64> {
-        // Best fit: smallest region with len >= need, in O(log n).
-        let (len, offset) = self.by_size.range((need, 0)..).next().copied()?;
-        self.remove_region(offset, len);
-        let remainder = len - need;
-        if remainder > 0 {
-            self.insert_region(offset + need as u64, remainder);
+    fn ensure_region(&mut self, r: u64) {
+        if r as usize >= self.live.len() {
+            self.live.resize(r as usize + 1, 0);
         }
-        Some(offset)
     }
 
-    /// Mark `[offset, offset + len)` as free, coalescing with neighbours.
-    fn free(&mut self, offset: u64, len: u32) {
-        let mut start = offset;
-        let mut size = len as u64;
+    /// Open a new head region: reuse a reclaimed one if available, else a fresh
+    /// region at the current file end.
+    fn open_new_head(&mut self, end_page: &AtomicU64) {
+        let r = self
+            .free_regions
+            .pop()
+            .unwrap_or_else(|| end_page.load(Ordering::SeqCst).div_ceil(REGION_PAGES));
+        self.head_region = r;
+        self.next_page = r * REGION_PAGES;
+        self.ensure_region(r);
+    }
 
-        // Merge with the region immediately preceding this one.
-        let pred = self
-            .by_offset
-            .range(..start)
-            .next_back()
-            .map(|(&off, &len)| (off, len));
-        if let Some((prev_off, prev_len)) = pred {
-            if prev_off + prev_len as u64 == start {
-                start = prev_off;
-                size += prev_len as u64;
-                self.remove_region(prev_off, prev_len);
-            }
+    /// Reserve `pages` consecutive pages at the head, opening a new head region
+    /// first if the run wouldn't fit. The whole run stays within one region, so
+    /// each record's region (`page / REGION_PAGES`) is well-defined.
+    fn alloc(&mut self, pages: u32, end_page: &AtomicU64) -> u64 {
+        debug_assert!(pages as u64 <= REGION_PAGES);
+        let region_end = self.head_region * REGION_PAGES + REGION_PAGES;
+        if self.live.is_empty() || self.next_page + pages as u64 > region_end {
+            self.open_new_head(end_page);
         }
-        // Merge with the region immediately following this one.
-        if let Some(next_len) = self.by_offset.get(&(start + size)).copied() {
-            self.remove_region(start + size, next_len);
-            size += next_len as u64;
+        let page = self.next_page;
+        self.next_page += pages as u64;
+        self.live[self.head_region as usize] += pages;
+        end_page.fetch_max(self.next_page, Ordering::SeqCst);
+        page
+    }
+
+    /// Mark a record's pages dead; reclaim the region once it is fully dead.
+    fn free(&mut self, page: u64, pages: u32) {
+        let r = Self::region_of(page) as usize;
+        if r >= self.live.len() {
+            return;
         }
-
-        self.insert_region(start, size as u32);
+        let was = self.live[r];
+        self.live[r] = was.saturating_sub(pages);
+        if was > 0 && self.live[r] == 0 && r as u64 != self.head_region {
+            self.free_regions.push(r as u64);
+        }
     }
 
-    fn total(&self) -> u64 {
-        self.by_offset.values().map(|&len| len as u64).sum()
+    fn live_pages(&self) -> u64 {
+        self.live.iter().map(|&p| p as u64).sum()
     }
 
-    fn region_count(&self) -> usize {
-        self.by_offset.len()
-    }
-
-    /// Rebuild the size index from `by_offset` (after deserialization).
-    fn reindex(&mut self) {
-        self.by_size = self.by_offset.iter().map(|(&off, &len)| (len, off)).collect();
+    fn free_region_pages(&self) -> u64 {
+        self.free_regions.len() as u64 * REGION_PAGES
     }
 }
 
@@ -465,10 +463,9 @@ impl FreeList {
 #[derive(Debug)]
 struct FlatFile {
     file: File,
-    free: Mutex<FreeList>,
-    /// High-water mark in pages: the next page index where fresh appends land.
-    /// Always ≥ every live/free region, so `fetch_add` hands out fresh,
-    /// non-overlapping extents without touching the free-list lock.
+    seg: Mutex<RegionAlloc>,
+    /// High-water mark in pages: one past the largest page ever written. Atomic so
+    /// reporting can read it without the region lock.
     end_page: AtomicU64,
 }
 
@@ -481,38 +478,29 @@ impl FlatFile {
     fn new(file: File) -> Self {
         Self {
             file,
-            free: Mutex::new(FreeList::default()),
+            seg: Mutex::new(RegionAlloc::default()),
             end_page: AtomicU64::new(0),
         }
     }
 
-    /// Store an already-encoded subtree payload in a page-aligned record,
-    /// preferring a reclaimed free region over extending the file. The payload is
-    /// written verbatim (no length prefix — its exact size lives in the returned
-    /// [`DiskPtr`]) in a single positioned `pwrite`, occupying `ceil(len/PAGE)`
-    /// whole pages. Reads fetch exactly `len` bytes, so the unused tail of the
-    /// last page is never read and needn't be zeroed. Safe to call concurrently:
-    /// allocation holds the free-list lock only briefly; the `pwrite` is lock-free.
+    /// Append an already-encoded subtree payload as a page-aligned record at the
+    /// head region (sequential placement). Written verbatim (no length prefix — its
+    /// size lives in the returned [`DiskPtr`]) in one positioned `pwrite` of
+    /// `ceil(len/PAGE)` whole pages; reads fetch exactly `len` bytes, so the padded
+    /// tail needn't be zeroed beyond the payload. Safe to call concurrently: the
+    /// allocation holds the region lock only briefly; the `pwrite` is lock-free.
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
         let pages = pages_for(total);
-        // Reuse a freed region if one fits; otherwise extend the file. Both yield
-        // a page range disjoint from every other in-flight allocation. Time the
-        // lock-held alloc separately from the (lock-free) pwrite to expose
-        // free-list contention between the parallel batch workers.
         let lt = std::time::Instant::now();
-        let reused = self.free.lock().unwrap().alloc(pages);
-        let page = reused.unwrap_or_else(|| self.end_page.fetch_add(pages as u64, Ordering::SeqCst));
+        let page = self.seg.lock().unwrap().alloc(pages, &self.end_page);
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
-        if page > u32::MAX as u64 {
+        if page + pages as u64 > u32::MAX as u64 {
             bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
         }
         let page = page as u32;
 
-        // Write the full page extent (payload + zero padding) so the device sees
-        // a whole, aligned write and avoids the sub-page read-modify-write penalty.
-        // Reads still fetch exactly `len` bytes, ignoring the padding.
         let mut record = vec![0u8; pages as usize * PAGE as usize];
         record[..payload.len()].copy_from_slice(payload);
 
@@ -523,37 +511,50 @@ impl FlatFile {
         Ok(DiskPtr { page, len: total })
     }
 
-    /// Prototype: write several records as ONE contiguous appended `pwrite` (no
-    /// free-list reuse — the file grows). Returns a `DiskPtr` per payload. Lets
-    /// the batch path coalesce 4-8 leaf writes into one larger sequential write.
+    /// Coalesce several records into contiguous appended `pwrite`s, each ≤ one
+    /// region (so a write is 16 KiB-aligned and stays on the bandwidth plateau, and
+    /// no record straddles a region boundary). Returns a `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
-        if payloads.is_empty() {
-            return Ok(Vec::new());
-        }
-        let page_counts: Vec<u32> = payloads.iter().map(|p| pages_for(p.len() as u32)).collect();
-        let total: u64 = page_counts.iter().map(|&c| c as u64).sum();
-        let page_start = self.end_page.fetch_add(total, Ordering::SeqCst);
-        if page_start + total > u32::MAX as u64 {
-            bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
-        }
-        let mut buf = vec![0u8; total as usize * PAGE as usize];
         let mut ptrs = Vec::with_capacity(payloads.len());
-        let mut page = page_start;
-        let mut off = 0usize;
-        for (p, &pc) in payloads.iter().zip(&page_counts) {
-            buf[off..off + p.len()].copy_from_slice(p);
-            ptrs.push(DiskPtr {
-                page: page as u32,
-                len: p.len() as u32,
-            });
-            stats::on_write(p.len());
-            page += pc as u64;
-            off += pc as usize * PAGE as usize;
+        let mut i = 0;
+        while i < payloads.len() {
+            // Take a run of records whose page-sum fits in one region.
+            let mut run_pages = 0u32;
+            let mut j = i;
+            while j < payloads.len() {
+                let pc = pages_for(payloads[j].len() as u32);
+                if j > i && run_pages + pc > REGION_PAGES as u32 {
+                    break;
+                }
+                run_pages += pc;
+                j += 1;
+            }
+            let lt = std::time::Instant::now();
+            let page_start = self.seg.lock().unwrap().alloc(run_pages, &self.end_page);
+            stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
+            if page_start + run_pages as u64 > u32::MAX as u64 {
+                bail!("flat file exceeds the 16 TiB DiskPtr addressing limit");
+            }
+            let mut buf = vec![0u8; run_pages as usize * PAGE as usize];
+            let mut page = page_start;
+            let mut off = 0usize;
+            for p in &payloads[i..j] {
+                let pc = pages_for(p.len() as u32);
+                buf[off..off + p.len()].copy_from_slice(p);
+                ptrs.push(DiskPtr {
+                    page: page as u32,
+                    len: p.len() as u32,
+                });
+                stats::on_write(p.len());
+                page += pc as u64;
+                off += pc as usize * PAGE as usize;
+            }
+            let _g = prof::scope(prof::Cat::FileWrite);
+            let wt = std::time::Instant::now();
+            (&self.file).write_all_at(&buf, page_start * PAGE)?;
+            stats::on_pwrite(wt.elapsed().as_nanos() as u64);
+            i = j;
         }
-        let _g = prof::scope(prof::Cat::FileWrite);
-        let wt = std::time::Instant::now();
-        (&self.file).write_all_at(&buf, page_start * PAGE)?;
-        stats::on_pwrite(wt.elapsed().as_nanos() as u64);
         Ok(ptrs)
     }
 
@@ -582,15 +583,29 @@ impl FlatFile {
 
     fn free(&self, ptr: DiskPtr) {
         let lt = std::time::Instant::now();
-        self.free
-            .lock()
-            .unwrap()
-            .free(ptr.page as u64, ptr.pages());
+        self.seg.lock().unwrap().free(ptr.page as u64, ptr.pages());
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
     }
 
     fn end_page(&self) -> u64 {
         self.end_page.load(Ordering::SeqCst)
+    }
+
+    /// Live pages and pages held in reclaimed-but-unused regions.
+    fn live_and_free_pages(&self) -> (u64, u64) {
+        let seg = self.seg.lock().unwrap();
+        (seg.live_pages(), seg.free_region_pages())
+    }
+
+    /// Total dead pages in the file (everything not currently live).
+    fn garbage_pages(&self) -> u64 {
+        let (live, _) = self.live_and_free_pages();
+        self.end_page().saturating_sub(live)
+    }
+
+    /// Number of fully-reclaimed regions available for reuse.
+    fn free_region_count(&self) -> usize {
+        self.seg.lock().unwrap().free_regions.len()
     }
 
     fn flush(&self) -> Result<()> {
@@ -802,13 +817,13 @@ pub struct FlatMpt {
 }
 
 /// On-disk checkpoint of everything that otherwise lives only in RAM: the trie
-/// frontier, the flat-file free list, and the high-water mark. Together with the
-/// flat file and the value store this is enough to fully reconstruct a `FlatMpt`.
+/// frontier and the high-water mark. The region allocator's liveness is recomputed
+/// from the frontier on [`FlatMpt::open`] (the frontier is the source of truth for
+/// which records are live), so the manifest stays minimal and format-stable.
 #[derive(Serialize)]
 struct ManifestRef<'a> {
     cfg: &'a Config,
     upper: &'a RamNode,
-    free: &'a FreeList,
     end_page: u64,
 }
 
@@ -816,7 +831,6 @@ struct ManifestRef<'a> {
 struct Manifest {
     cfg: Config,
     upper: RamNode,
-    free: FreeList,
     end_page: u64,
 }
 
@@ -852,8 +866,10 @@ impl FlatMpt {
     }
 
     /// Reopen a database previously written with [`FlatMpt::persist`]. Reattaches
-    /// to the existing flat file and value store (no truncation) and restores the
-    /// RAM frontier and free list from the `.meta` manifest.
+    /// to the existing flat file and value store (no truncation), restores the RAM
+    /// frontier, and rebuilds the region allocator's liveness by walking the
+    /// frontier. A fresh head region is opened past the file end so appends resume
+    /// cleanly (wasting at most the tail of the last region).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let meta = meta_path(path);
@@ -862,11 +878,21 @@ impl FlatMpt {
         let Manifest {
             cfg,
             upper,
-            mut free,
             end_page,
         } = bincode::deserialize(&bytes)?;
-        // The size index isn't serialized; rebuild it from the offset map.
-        free.reindex();
+
+        // Rebuild per-region liveness from the frontier, then open a fresh head
+        // region at the next region boundary past the file end.
+        let num_regions = end_page.div_ceil(REGION_PAGES);
+        let mut alloc = RegionAlloc {
+            live: vec![0u32; num_regions as usize],
+            ..RegionAlloc::default()
+        };
+        recompute_live(&upper, &mut alloc.live);
+        alloc.head_region = num_regions;
+        alloc.next_page = num_regions * REGION_PAGES;
+        alloc.ensure_region(alloc.head_region);
+        let new_end = alloc.next_page;
 
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut opts = Options::default();
@@ -877,8 +903,8 @@ impl FlatMpt {
             cfg,
             store: FlatFile {
                 file,
-                free: Mutex::new(free),
-                end_page: AtomicU64::new(end_page),
+                seg: Mutex::new(alloc),
+                end_page: AtomicU64::new(new_end),
             },
             upper,
             values,
@@ -917,15 +943,12 @@ impl FlatMpt {
     pub fn persist(&mut self) -> Result<()> {
         self.flush_values()?;
         self.store.sync()?;
-        let free = self.store.free.lock().unwrap();
         let manifest = ManifestRef {
             cfg: &self.cfg,
             upper: &self.upper,
-            free: &free,
             end_page: self.store.end_page(),
         };
         let bytes = bincode::serialize(&manifest)?;
-        drop(free);
 
         let meta = meta_path(&self.path);
         let mut tmp = meta.clone().into_os_string();
@@ -1079,33 +1102,32 @@ impl FlatMpt {
         stats
     }
 
-    /// Logical size of the flat file (high-water mark). Stays flat across
-    /// rewrites when freed space is reused.
+    /// Logical size of the flat file (high-water mark). Under the log-structured
+    /// allocator it grows with garbage until regions are reclaimed and reused.
     pub fn flat_file_len(&self) -> u64 {
         self.store.end_page() * PAGE
     }
 
-    /// Total bytes currently held in the flat file's free list.
+    /// Dead (non-live) bytes in the flat file. (Kept under the historical name.)
     pub fn free_bytes(&self) -> u64 {
-        self.store.free.lock().unwrap().total() * PAGE
+        self.store.garbage_pages() * PAGE
     }
 
-    /// Number of distinct free regions tracked in the flat file.
+    /// Number of fully-reclaimed regions available for reuse.
     pub fn free_regions(&self) -> usize {
-        self.store.free.lock().unwrap().region_count()
+        self.store.free_region_count()
     }
 
     /// Heap held by the in-RAM index — the part of the database that is *not*
-    /// on disk: the trie frontier, the free list, and the unflushed value
+    /// on disk: the trie frontier, the region allocator, and the unflushed value
     /// overlay. Excludes the OS page cache and RocksDB's own (C++) memory.
     pub fn ram_report(&self) -> RamReport {
         let frontier_nodes = count_ram_nodes(&self.upper);
         let frontier_bytes = frontier_bytes(&self.upper);
-        let free_regions = self.store.free.lock().unwrap().region_count();
-        // by_offset (u64->u32) and by_size ((u32,u64)) both hold one entry per
-        // region; this is the stored-data size and omits BTree node overhead.
-        let free_list_bytes = free_regions
-            * (std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<(u32, u64)>());
+        let free_regions = self.store.free_region_count();
+        // The region allocator is one u32 of live-count per region; report that.
+        let free_list_bytes =
+            self.store.seg.lock().unwrap().live.len() * std::mem::size_of::<u32>();
         let overlay_entries = self.overlay.len();
         let overlay_bytes: usize = self
             .overlay
@@ -1732,15 +1754,17 @@ enum GroupOut {
     Leaf { payload: Vec<u8>, root: Hash },
 }
 
-/// Coalesce this many leaf writes into one contiguous appended `pwrite` (the
-/// "batch 4-8 leaves" prototype).
+/// Coalesce up to this many leaf writes per pending flush. `write_batch` further
+/// splits a flush so no single `pwrite` exceeds one region (`REGION_PAGES`).
 const BATCH_LEAVES: usize = 8;
 
-/// Whether to use the append-batched write path (prototype; `MPT_BATCHED_WRITES=1`).
+/// Whether to coalesce leaf writes into batched `pwrite`s. The append allocator
+/// places every write sequentially regardless; batching just cuts syscalls. On by
+/// default; `MPT_BATCHED_WRITES=0` writes per-record for comparison.
 fn batched_writes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
 }
 
 /// Apply a whole group of keys (all routing to the disk record at `ptr`), free
@@ -2563,6 +2587,29 @@ fn count_disk_leaves(node: &RamNode) -> usize {
     }
 }
 
+/// Bucket every live `DiskPtr` in the frontier into per-region live-page counts
+/// (rebuilds [`RegionAlloc`] liveness on reopen). The frontier is the source of
+/// truth for which records are live.
+fn recompute_live(node: &RamNode, live: &mut [u32]) {
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { child, .. } => recompute_live(child, live),
+        RamNode::Branch { children, .. } => {
+            for c in children.iter().flatten() {
+                match c {
+                    RamChild::Ram(n) => recompute_live(n, live),
+                    RamChild::Disk { ptr, .. } => {
+                        let r = RegionAlloc::region_of(ptr.page as u64) as usize;
+                        if r < live.len() {
+                            live[r] += ptr.pages();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn count_ram_nodes(node: &RamNode) -> usize {
     match node {
         RamNode::Empty => 0,
@@ -2793,11 +2840,12 @@ mod tests {
             (db.root(), db.flat_file_len(), db.free_bytes(), db.ram_nodes())
         }; // drop: close the flat file and RocksDB
 
+        let _ = (flat_len, free_bytes);
         let mut db = FlatMpt::open(&path).unwrap();
-        // The frontier, free list, and root all survived the reopen.
+        // The frontier and root survive the reopen. The region allocator is
+        // recomputed from the frontier (fresh head past the file end), so
+        // flat_file_len / free_bytes legitimately differ and aren't asserted.
         assert_eq!(db.root(), root);
-        assert_eq!(db.flat_file_len(), flat_len);
-        assert_eq!(db.free_bytes(), free_bytes);
         assert_eq!(db.ram_nodes(), ram_nodes);
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(db.get_value(key).unwrap(), Some(vec![i as u8; 40]));
