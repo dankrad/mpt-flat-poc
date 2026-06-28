@@ -419,30 +419,9 @@ fn units_for(bytes: u32) -> u32 {
     (bytes as u64).div_ceil(ADDR_UNIT) as u32
 }
 
-/// High bit of `DiskPtr::unit` marks a *RAM-resident* record (bytes held in the
-/// store's in-RAM tier, addressed by the low 31 bits) rather than a flat-file
-/// offset. Used by RAM-build mode: a leaf is a normal `RamChild::Disk` whose ptr
-/// happens to point at RAM until spilled. Caps disk addressing at 2^31 units =
-/// 512 GiB (ample — a 1B-key file is ~150 GiB).
-const RAM_PTR_FLAG: u32 = 1 << 31;
-
 impl DiskPtr {
-    /// A ptr into the store's in-RAM record tier (see [`RamStore`]).
-    fn ram(index: u32, len: u32) -> Self {
-        debug_assert!(index & RAM_PTR_FLAG == 0, "RAM index overflows the flag bit");
-        DiskPtr { unit: RAM_PTR_FLAG | index, len }
-    }
-    /// Whether this ptr addresses the in-RAM tier rather than the flat file.
-    fn is_ram(&self) -> bool {
-        self.unit & RAM_PTR_FLAG != 0
-    }
-    /// Index into the in-RAM record tier (only meaningful when [`is_ram`]).
-    fn ram_index(&self) -> u32 {
-        self.unit & !RAM_PTR_FLAG
-    }
-    /// Byte offset of the record's length prefix in the flat file (disk ptrs only).
+    /// Byte offset of the record's length prefix in the flat file.
     fn offset(&self) -> u64 {
-        debug_assert!(!self.is_ram(), "offset() on a RAM ptr");
         self.unit as u64 * ADDR_UNIT
     }
     /// 256 B units the framed record (header + payload) occupies.
@@ -727,57 +706,6 @@ struct FlatFile {
     /// Page cache bypassed (O_DIRECT / F_NOCACHE) ⇒ reads/writes use aligned
     /// buffers and offset/length widening.
     direct: bool,
-    /// RAM-build tier: when `ram_mode` is set, `write_*` store records here and
-    /// return RAM-flagged ptrs instead of touching the file; reads/frees route by
-    /// the ptr flag. This makes a RAM build use the *same* parallel insert pipeline
-    /// as disk — only the record bytes' home differs. Spilled to the file (and
-    /// `ram_mode` cleared) at the memory threshold or persist. The `RwLock` lets
-    /// Phase B read records concurrently (shared) with only the rare write-back
-    /// taking the exclusive lock.
-    ram: std::sync::RwLock<RamStore>,
-    ram_mode: std::sync::atomic::AtomicBool,
-}
-
-/// In-RAM record tier: records as `Arc<[u8]>` (so reads are zero-copy — the parser
-/// borrows the `Arc` exactly as it does a disk read buffer) with a free list for
-/// reuse when a record is rewritten.
-#[derive(Debug, Default)]
-struct RamStore {
-    records: Vec<Arc<[u8]>>,
-    free: Vec<u32>,
-    live_bytes: u64,
-}
-
-impl RamStore {
-    fn push(&mut self, rec: Arc<[u8]>) -> u32 {
-        self.live_bytes += rec.len() as u64;
-        if let Some(i) = self.free.pop() {
-            self.records[i as usize] = rec;
-            i
-        } else {
-            let i = self.records.len() as u32;
-            assert!(i & RAM_PTR_FLAG == 0, "RAM record tier exceeded 2^31 records");
-            self.records.push(rec);
-            i
-        }
-    }
-    /// Store a borrowed payload (copies into a fresh `Arc`).
-    fn alloc(&mut self, payload: &[u8]) -> u32 {
-        self.push(Arc::from(payload))
-    }
-    /// Store an owned payload with no copy — `Arc::from(Vec<u8>)` reuses the Vec's
-    /// heap allocation. Used by the hot write path (`flush_leaf_batch`).
-    fn alloc_owned(&mut self, payload: Vec<u8>) -> u32 {
-        self.push(Arc::from(payload))
-    }
-    fn get(&self, i: u32) -> Arc<[u8]> {
-        self.records[i as usize].clone()
-    }
-    fn free(&mut self, i: u32) {
-        self.live_bytes -= self.records[i as usize].len() as u64;
-        self.records[i as usize] = Arc::from(&[][..]);
-        self.free.push(i);
-    }
 }
 
 /// Pages needed to hold a record of `record_bytes` (length prefix + payload).
@@ -792,13 +720,7 @@ impl FlatFile {
             seg: Mutex::new(RegionAlloc::default()),
             end_page: AtomicU64::new(0),
             direct,
-            ram: std::sync::RwLock::new(RamStore::default()),
-            ram_mode: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn ram_mode(&self) -> bool {
-        self.ram_mode.load(Ordering::Relaxed)
     }
 
     /// Read `len` payload bytes at file offset `off`. With direct I/O the request
@@ -829,17 +751,13 @@ impl FlatFile {
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
-        if self.ram_mode() {
-            let i = self.ram.write().unwrap().alloc(payload);
-            return Ok(DiskPtr::ram(i, total));
-        }
         let run_pages = pages_for(RECORD_HDR + total);
         let units = units_for(RECORD_HDR + total);
         let lt = std::time::Instant::now();
         let page = self.seg.lock().unwrap().alloc(run_pages, units, &self.end_page);
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
         let unit = page * UNITS_PER_PAGE;
-        if unit + units as u64 >= RAM_PTR_FLAG as u64 {
+        if unit + units as u64 > u32::MAX as u64 {
             bail!("flat file exceeds the DiskPtr addressing limit");
         }
 
@@ -860,18 +778,6 @@ impl FlatFile {
     /// stays on the bandwidth plateau, and no record straddles a region). Returns a
     /// `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
-        if self.ram_mode() {
-            // RAM tier needs no dense packing — store each record and return a
-            // RAM-flagged ptr. One lock for the whole batch keeps contention low.
-            let mut ram = self.ram.write().unwrap();
-            return Ok(payloads
-                .iter()
-                .map(|p| {
-                    stats::on_write(p.len());
-                    DiskPtr::ram(ram.alloc(p), p.len() as u32)
-                })
-                .collect());
-        }
         let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
         let mut ptrs = Vec::with_capacity(payloads.len());
         let mut i = 0;
@@ -896,7 +802,7 @@ impl FlatFile {
             let page_start = self.seg.lock().unwrap().alloc(run_pages, live_units, &self.end_page);
             stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
             let base_unit = page_start * UNITS_PER_PAGE;
-            if base_unit + (run_pages as u64 * UNITS_PER_PAGE) >= RAM_PTR_FLAG as u64 {
+            if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
                 bail!("flat file exceeds the DiskPtr addressing limit");
             }
             let mut buf = IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
@@ -921,20 +827,9 @@ impl FlatFile {
         Ok(ptrs)
     }
 
-    /// The record's bytes as a shared buffer: a clone of the in-RAM `Arc` for a
-    /// RAM ptr (zero-copy), or a fresh read from the file for a disk ptr.
-    fn record_bytes(&self, ptr: DiskPtr) -> Result<Arc<[u8]>> {
-        if ptr.is_ram() {
-            Ok(self.ram.read().unwrap().get(ptr.ram_index()))
-        } else {
-            Ok(Arc::from(
-                self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?,
-            ))
-        }
-    }
-
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        deserialize_subtree(&self.record_bytes(ptr)?)
+        let record = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
+        deserialize_subtree(&record)
     }
 
     /// Lazy read: parse only the spine; child subtrees stay `Raw`. Used by the
@@ -943,14 +838,16 @@ impl FlatFile {
         let record = {
             let _g = prof::scope(prof::Cat::FileRead);
             let it = std::time::Instant::now();
-            let r = self.record_bytes(ptr)?;
+            // Payload starts just past the framing header.
+            let r = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
             stats::on_read_io(it.elapsed().as_nanos() as u64);
             r
         };
         let _g = prof::scope(prof::Cat::Deserialize);
-        // Raw children share the buffer as zero-copy slices.
+        // `Arc::from(Vec)` reuses the allocation (no copy); Raw children then
+        // share it as zero-copy slices.
         let pt = std::time::Instant::now();
-        let out = deserialize_subtree_lazy(record);
+        let out = deserialize_subtree_lazy(Arc::from(record));
         stats::on_read_parse(pt.elapsed().as_nanos() as u64);
         out
     }
@@ -970,10 +867,6 @@ impl FlatFile {
     }
 
     fn free(&self, ptr: DiskPtr) {
-        if ptr.is_ram() {
-            self.ram.write().unwrap().free(ptr.ram_index());
-            return;
-        }
         let lt = std::time::Instant::now();
         self.seg.lock().unwrap().free(ptr.unit as u64, ptr.units());
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
@@ -1100,6 +993,38 @@ enum RamChild {
     // `root` is the subtree's Merkle hash; the on-disk record size is recoverable
     // from `ptr.len`, so it isn't stored here.
     Disk { ptr: DiskPtr, root: Hash },
+    /// RAM-build leaf: the serialized record bytes held as their *own* heap object
+    /// (an `Arc<[u8]>`), with no flat-file I/O. Reads clone the `Arc` (lock-free
+    /// refcount bump); a rewrite drops the old `Arc` (malloc reclaims) and installs
+    /// a new one. Spilled to a `Disk` record before persist (never serialized into
+    /// a manifest). Same Merkle root as the equivalent `Disk` leaf, so a leaf
+    /// hashes identically either way.
+    Mem(MemLeaf),
+}
+
+/// A `Mem` leaf's bytes (the same `[prefix-path][node]` payload a disk record
+/// holds) and cached root. `Arc<[u8]>` isn't serde-serializable without the `rc`
+/// feature, and a `Mem` leaf must be spilled before any manifest write anyway, so
+/// these impls deliberately error as a guard. Appending the `Mem` variant keeps
+/// bincode's existing `Ram`/`Disk` indices, so old manifests still load.
+#[derive(Debug, Clone)]
+struct MemLeaf {
+    bytes: Arc<[u8]>,
+    root: Hash,
+}
+impl Serialize for MemLeaf {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "RamChild::Mem must be spilled to disk before persist",
+        ))
+    }
+}
+impl<'de> Deserialize<'de> for MemLeaf {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> std::result::Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "manifest unexpectedly contains a RamChild::Mem leaf",
+        ))
+    }
 }
 
 // RAM-frontier nodes cache their hash in an interior-mutable `Cell` so that
@@ -1199,9 +1124,11 @@ pub struct FlatMpt {
     /// Inline-GC cleaning rate: victim regions to evacuate per batch, adjusted by
     /// the proportional controller to hold utilization at `TARGET_UTIL`.
     gc_regions: usize,
-    /// Resident-size ceiling (bytes) at which a RAM build spills its in-RAM records
-    /// to disk and reverts to disk mode. The "are we in RAM mode" flag lives on the
-    /// store (`FlatFile::ram_mode`).
+    /// RAM-build mode: new/rewritten leaves live in RAM (`RamChild::Mem`, each its
+    /// own `Arc`) with no flat-file I/O or GC. Flips to `false` after the first
+    /// spill. Enabled by `MPT_RAM_BUILD=1` at create time.
+    ram_mode: bool,
+    /// Resident-size ceiling (bytes) at which a RAM build spills to disk.
     spill_threshold: u64,
 }
 
@@ -1240,17 +1167,16 @@ impl FlatMpt {
         let _ = DB::destroy(&opts, &values_path);
         let values = DB::open(&opts, &values_path)?;
 
-        let (ram_build, spill_threshold) = ram_build_config();
-        let store = FlatFile::new(file, direct);
-        store.ram_mode.store(ram_build, Ordering::Relaxed);
+        let (ram_mode, spill_threshold) = ram_build_config();
         Ok(Self {
             cfg,
-            store,
+            store: FlatFile::new(file, direct),
             upper: RamNode::Empty,
             values,
             overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
+            ram_mode,
             spill_threshold,
         })
     }
@@ -1288,8 +1214,6 @@ impl FlatMpt {
             }),
             end_page: AtomicU64::new(end_page),
             direct,
-            ram: std::sync::RwLock::new(RamStore::default()),
-            ram_mode: std::sync::atomic::AtomicBool::new(false),
         };
         {
             let mut live = vec![0u32; num_regions as usize];
@@ -1314,8 +1238,8 @@ impl FlatMpt {
             overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
-            // A reopened database is disk-resident (its store's ram_mode is false);
-            // RAM-build mode is for fresh bulk creation only.
+            // A reopened DB is disk-resident; RAM-build mode is for fresh creation.
+            ram_mode: false,
             spill_threshold: ram_build_config().1,
         })
     }
@@ -1348,8 +1272,8 @@ impl FlatMpt {
     /// writes the manifest atomically (temp file + rename) so a crash can't leave
     /// a torn manifest.
     pub fn persist(&mut self) -> Result<()> {
-        // The manifest stores disk ptrs only; spill any RAM-tier records to the
-        // file first (they'd otherwise be lost on reopen).
+        // The manifest stores disk ptrs only; spill any in-RAM leaves to the file
+        // first (they're not serializable and would be lost on reopen).
         self.spill_mem()?;
         self.flush_values()?;
         self.store.sync()?;
@@ -1369,41 +1293,6 @@ impl FlatMpt {
         Ok(())
     }
 
-    /// If a RAM build has crossed the resident-size threshold, spill its in-RAM
-    /// records to disk and revert to disk mode for subsequent batches.
-    fn maybe_spill(&mut self) -> Result<()> {
-        if self.store.ram_mode() && process_rss_bytes() >= self.spill_threshold {
-            self.spill_mem()?;
-        }
-        Ok(())
-    }
-
-    /// Move every RAM-tier record into a flat-file record, retargeting the frontier
-    /// ptr from RAM to disk, then revert to disk mode. Streams in chunks (one dense
-    /// `write_batch` each) so transient memory stays bounded; the real disk ptrs are
-    /// installed by prefix after the walk (so its `&mut upper` borrow is released).
-    fn spill_mem(&mut self) -> Result<()> {
-        if !self.store.ram_mode() && self.store.ram.read().unwrap().records.is_empty() {
-            return Ok(());
-        }
-        // Writes must now go to the file, not back into the RAM tier.
-        self.store.ram_mode.store(false, Ordering::Relaxed);
-        const CHUNK: usize = 8192;
-        let mut buf = SpillBuf {
-            prefixes: Vec::new(),
-            payloads: Vec::new(),
-            installs: Vec::new(),
-        };
-        spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
-        flush_spill_chunk(&self.store, &mut buf)?;
-        for (prefix, ptr) in buf.installs {
-            install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr);
-        }
-        // Drop the now-empty RAM tier.
-        *self.store.ram.write().unwrap() = RamStore::default();
-        Ok(())
-    }
-
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Hash> {
         let value_hash = hash_leaf_value(&value);
         self.overlay.insert(key, value);
@@ -1411,14 +1300,8 @@ impl FlatMpt {
             self.flush_values()?;
         }
         let cfg = self.cfg.clone();
-        insert_ram(
-            &mut self.store,
-            &cfg,
-            &mut self.upper,
-            Vec::new(),
-            key,
-            value_hash,
-        )?;
+        let ram = self.ram_mode;
+        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash, ram)?;
         self.store.flush()?;
         Ok(self.root())
     }
@@ -1446,6 +1329,16 @@ impl FlatMpt {
         }
         self.flush_values()?;
         let cfg = self.cfg.clone();
+
+        // RAM-build fast path: leaves live in RAM (their own `Arc`s), so there's no
+        // disk I/O and no GC. Parallelism comes from partitioning by top nibble and
+        // fanning the serial insert across the top branch's disjoint child subtrees
+        // — no shared store, no lock. Then maybe spill if over the memory ceiling.
+        if self.ram_mode {
+            self.insert_batch_ram(leaves)?;
+            self.maybe_spill()?;
+            return Ok(self.root());
+        }
 
         // Phase A (serial, read-only): route each key to the frontier disk leaf
         // it lands in, grouping keys per leaf. Keys with no existing leaf create
@@ -1522,7 +1415,9 @@ impl FlatMpt {
             install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
         }
         for (key, value_hash) in fresh {
-            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash)?;
+            // Disk path (RAM mode early-returns via the fan-out below), so new
+            // structure is disk-backed.
+            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash, false)?;
         }
         let install_ns = t_c.elapsed().as_nanos() as u64;
         let t_flush = std::time::Instant::now();
@@ -1533,8 +1428,83 @@ impl FlatMpt {
         let root_ns = t_root.elapsed().as_nanos() as u64;
         stats::on_batch(a_ns, b_ns, t_c.elapsed().as_nanos() as u64);
         stats::on_phase_c(install_ns, root_ns, flush_ns);
-        self.maybe_spill()?;
         Ok(root)
+    }
+
+    /// RAM-build insert: partition the (deduped) keys by top nibble and fan the
+    /// serial `insert_ram` across the top branch's disjoint child subtrees, one
+    /// thread per nibble. Each leaf lives under exactly one nibble ⇒ exactly one
+    /// thread, so multiple keys to the same leaf are handled serially in that
+    /// thread — no contention, no lock, no shared store (each leaf is its own
+    /// `Arc`, freed by drop). Falls back to serial while the top isn't yet a branch
+    /// (the tiny early phase).
+    fn insert_batch_ram(&mut self, leaves: BTreeMap<Key, Hash>) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let mut buckets: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
+        for (key, vh) in leaves {
+            buckets[nibble_at(&key, 0) as usize].push((key, vh));
+        }
+        if matches!(self.upper, RamNode::Branch { .. }) {
+            let store = &self.store;
+            if let RamNode::Branch { children, hash } = &mut self.upper {
+                hash.set(None); // top branch re-hashed after the parallel inserts
+                std::thread::scope(|scope| -> Result<()> {
+                    let cfg = &cfg;
+                    let mut handles = Vec::new();
+                    for (k, slot) in children.iter_mut().enumerate() {
+                        let keys = std::mem::take(&mut buckets[k]);
+                        if keys.is_empty() {
+                            continue;
+                        }
+                        handles.push(scope.spawn(move || -> Result<()> {
+                            for (key, vh) in keys {
+                                insert_into_child(store, cfg, slot, vec![k as u8], key, vh, true)?;
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join().expect("RAM fan-out thread panicked")?;
+                    }
+                    Ok(())
+                })?;
+            }
+        } else {
+            let store = &self.store;
+            for (key, vh) in buckets.into_iter().flatten() {
+                insert_ram(store, &cfg, &mut self.upper, Vec::new(), key, vh, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// If a RAM build has crossed the resident-size threshold, spill its in-RAM
+    /// leaves to disk and revert to disk mode for subsequent batches.
+    fn maybe_spill(&mut self) -> Result<()> {
+        if self.ram_mode && process_rss_bytes() >= self.spill_threshold {
+            self.spill_mem()?;
+        }
+        Ok(())
+    }
+
+    /// Write every in-RAM `Mem` leaf to a disk record and retarget its frontier
+    /// slot to the resulting `Disk` ptr, then revert to disk mode. Streams in chunks
+    /// (one dense `write_batch` each) so transient memory stays bounded; ptrs are
+    /// installed by prefix after the walk (releasing the `&mut upper` borrow first).
+    fn spill_mem(&mut self) -> Result<()> {
+        self.ram_mode = false;
+        const CHUNK: usize = 8192;
+        let mut buf = SpillBuf {
+            prefixes: Vec::new(),
+            payloads: Vec::new(),
+            installs: Vec::new(),
+        };
+        spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+        flush_spill_chunk(&self.store, &mut buf)?;
+        for (prefix, ptr) in buf.installs {
+            install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr);
+        }
+        Ok(())
     }
 
     /// Proportional controller for the inline-GC cleaning rate. Nudges
@@ -1708,6 +1678,121 @@ fn meta_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Serialize a subtree and wrap the bytes in their own `Arc` — a RAM-build leaf.
+fn make_mem_leaf(subtree: &DiskSubtree) -> Result<RamChild> {
+    let root = hash_node(&subtree.node);
+    let (payload, _) = serialize_subtree(subtree)?;
+    Ok(RamChild::Mem(MemLeaf { bytes: Arc::from(payload), root }))
+}
+
+/// Build a leaf child: a RAM-resident `Mem` leaf in RAM-build mode (no I/O), or a
+/// serialized `Disk` record otherwise.
+fn make_leaf_child(store: &FlatFile, ram: bool, subtree: DiskSubtree) -> Result<RamChild> {
+    if ram {
+        make_mem_leaf(&subtree)
+    } else {
+        let root = hash_node(&subtree.node);
+        let (payload, _) = serialize_subtree(&subtree)?;
+        let ptr = store.write_payload(&payload)?;
+        Ok(RamChild::Disk { ptr, root })
+    }
+}
+
+/// Parse a `Mem` leaf's bytes (lazy: children stay `Raw`, zero-copy slices of the
+/// `Arc`) — the in-RAM equivalent of [`FlatFile::read_lazy`].
+fn parse_payload_lazy(bytes: Arc<[u8]>) -> Result<DiskSubtree> {
+    deserialize_subtree_lazy(bytes)
+}
+
+/// Like [`promote_record_to_ram`], but the lifted branch's children become in-RAM
+/// `Mem` leaves (each its own `Arc`) instead of serialized `Disk` records — no I/O.
+fn promote_to_mem(subtree: DiskSubtree) -> Result<RamChild> {
+    let DiskSubtree { prefix, node } = subtree;
+    let (ext_path, branch_node) = match node {
+        Node::Branch { .. } => (Vec::new(), node),
+        Node::Extension { path, child, .. } => (path, *child),
+        _ => unreachable!("promote called on a record without a top branch"),
+    };
+    let Node::Branch { children, .. } = branch_node else {
+        unreachable!("a leading extension must wrap a branch");
+    };
+    let mut branch_prefix = prefix;
+    branch_prefix.extend_from_slice(&ext_path);
+    let mut ram_children = empty_children();
+    for (i, slot) in children.into_iter().enumerate() {
+        if let Some(boxed) = slot {
+            let mut cp = branch_prefix.clone();
+            cp.push(i as u8);
+            ram_children[i] = Some(make_mem_leaf(&DiskSubtree { prefix: cp, node: *boxed })?);
+        }
+    }
+    let branch = RamNode::Branch {
+        children: ram_children,
+        hash: HashCell::new(None),
+    };
+    if ext_path.is_empty() {
+        Ok(RamChild::Ram(Box::new(branch)))
+    } else {
+        Ok(RamChild::Ram(Box::new(RamNode::Extension {
+            path: ext_path,
+            child: Box::new(branch),
+            hash: HashCell::new(None),
+        })))
+    }
+}
+
+/// Insert `key` into a branch slot — the per-slot body of `insert_ram`'s branch
+/// arm, factored out so the parallel RAM fan-out (which splits the top branch's
+/// children across threads) shares the exact same logic. `ram` selects whether a
+/// newly-created or rewritten leaf is a `Mem` (RAM) or `Disk` leaf.
+fn insert_into_child(
+    store: &FlatFile,
+    cfg: &Config,
+    slot: &mut Option<RamChild>,
+    child_prefix: Vec<u8>,
+    key: Key,
+    value_hash: Hash,
+    ram: bool,
+) -> Result<()> {
+    match slot {
+        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, value_hash, ram),
+        Some(RamChild::Mem(_)) => {
+            // In-RAM leaf: parse its bytes, apply the key, re-serialize into a new
+            // `Arc` (the old one drops here). No I/O, no shared store.
+            let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
+            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let depth = subtree.prefix.len();
+            record_node_insert(store, cfg, &mut subtree.node, depth, key, value_hash)?;
+            *slot = Some(if should_promote(cfg, &subtree) {
+                promote_to_mem(subtree)?
+            } else {
+                make_mem_leaf(&subtree)?
+            });
+            Ok(())
+        }
+        Some(RamChild::Disk { ptr, root }) => {
+            let mut subtree = store.read_lazy(*ptr)?;
+            let old_ptr = *ptr;
+            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
+            if should_promote(cfg, &subtree) {
+                store.free(old_ptr);
+                *slot = Some(promote_record_to_ram(store, subtree)?);
+            } else {
+                let (payload, _) = serialize_subtree(&subtree)?;
+                store.free(old_ptr);
+                *ptr = store.write_payload(&payload)?;
+                *root = hash_node(&subtree.node);
+            }
+            Ok(())
+        }
+        None => {
+            let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
+            *slot = Some(make_leaf_child(store, ram, subtree)?);
+            Ok(())
+        }
+    }
+}
+
 fn insert_ram(
     store: &FlatFile,
     cfg: &Config,
@@ -1715,6 +1800,7 @@ fn insert_ram(
     prefix: Vec<u8>,
     key: Key,
     value_hash: Hash,
+    ram: bool,
 ) -> Result<()> {
     let nibbles = key_nibbles(&key);
     // This node (or its subtree) is about to change, so its cached hash is stale.
@@ -1728,10 +1814,8 @@ fn insert_ram(
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
             let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
-            let (payload, _) = serialize_subtree(&subtree)?;
-            let ptr = store.write_payload(&payload)?;
             let mut children = empty_children();
-            children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+            children[idx] = Some(make_leaf_child(store, ram, subtree)?);
             *node = RamNode::Branch {
                 children,
                 hash: HashCell::new(None),
@@ -1768,9 +1852,7 @@ fn insert_ram(
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
                 let subtree = subtree_from_entries(new_prefix, vec![(key, leaf_hash(key, value_hash))]);
-                let (payload, _) = serialize_subtree(&subtree)?;
-                let ptr = store.write_payload(&payload)?;
-                children[new_idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
+                children[new_idx] = Some(make_leaf_child(store, ram, subtree)?);
 
                 let branch = RamNode::Branch {
                     children,
@@ -1789,7 +1871,7 @@ fn insert_ram(
             } else {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram(store, cfg, child, next_prefix, key, value_hash)
+                insert_ram(store, cfg, child, next_prefix, key, value_hash, ram)
             }
         }
         RamNode::Branch { children, .. } => {
@@ -1799,38 +1881,7 @@ fn insert_ram(
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            match &mut children[idx] {
-                Some(RamChild::Ram(child)) => {
-                    insert_ram(store, cfg, child, child_prefix, key, value_hash)
-                }
-                Some(RamChild::Disk { ptr, root }) => {
-                    let mut subtree = store.read_lazy(*ptr)?;
-                    let old_ptr = *ptr;
-                    // Incremental insert (re-hashing only the touched path). If the
-                    // record outgrew `max_leaf`, promote it into the RAM frontier —
-                    // its children become first-class frontier entries (option B).
-                    record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
-                    if should_promote(cfg, &subtree) {
-                        store.free(old_ptr);
-                        children[idx] = Some(promote_record_to_ram(store, subtree)?);
-                    } else {
-                        let (payload, _) = serialize_subtree(&subtree)?;
-                        // Old record is dead; reclaim before writing so the rewrite
-                        // can reuse the same region when it still fits.
-                        store.free(old_ptr);
-                        *ptr = store.write_payload(&payload)?;
-                        *root = hash_node(&subtree.node);
-                    }
-                    Ok(())
-                }
-                None => {
-                    let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
-                    let (payload, _) = serialize_subtree(&subtree)?;
-                    let ptr = store.write_payload(&payload)?;
-                    children[idx] = Some(RamChild::Disk { ptr, root: hash_node(&subtree.node) });
-                    Ok(())
-                }
-            }
+            insert_into_child(store, cfg, &mut children[idx], child_prefix, key, value_hash, ram)
         }
     }
 }
@@ -2210,11 +2261,9 @@ fn batched_writes() -> bool {
 }
 
 /// RAM-build config read once: `(enabled, spill-threshold-bytes)`. `MPT_RAM_BUILD=1`
-/// keeps fresh records in the store's RAM tier (no flat-file I/O or GC) until
-/// resident size crosses the threshold, then spills to disk and reverts to disk
-/// mode. `MPT_RAM_BUILD_GIB` overrides the threshold (default 110 GiB macOS /
-/// 55 GiB Linux). The full insert pipeline is unchanged — only where records'
-/// bytes live differs — so RAM builds keep Phase B's parallelism.
+/// keeps fresh leaves in RAM (each its own `Arc`, no flat-file I/O or GC) until
+/// resident size crosses the threshold, then spills to disk. `MPT_RAM_BUILD_GIB`
+/// overrides the threshold (default 110 GiB macOS / 55 GiB Linux).
 fn ram_build_config() -> (bool, u64) {
     use std::sync::OnceLock;
     static CFG: OnceLock<(bool, u64)> = OnceLock::new();
@@ -2229,9 +2278,9 @@ fn ram_build_config() -> (bool, u64) {
     })
 }
 
-/// Process resident size in bytes via `getrusage` (`ru_maxrss` — the peak, which
-/// tracks current usage closely during a monotonically-growing build, all the
-/// spill trigger needs). macOS reports bytes, Linux KiB.
+/// Process resident size in bytes via `getrusage` (`ru_maxrss` — peak, which
+/// tracks a growing build closely enough to trigger spills). macOS reports bytes,
+/// Linux KiB.
 fn process_rss_bytes() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
@@ -2340,19 +2389,6 @@ fn flush_leaf_batch(
     if pending.is_empty() {
         return Ok(());
     }
-    // RAM-build: move each owned serialized payload straight into the RAM tier —
-    // `Arc::from(Vec)` reuses the allocation, so no copy (the disk path below must
-    // pack into a contiguous region buffer and therefore copies).
-    if store.ram_mode() {
-        let mut ram = store.ram.write().unwrap();
-        for (rep, root, payload) in pending.drain(..) {
-            stats::on_write(payload.len());
-            let len = payload.len() as u32;
-            let ptr = DiskPtr::ram(ram.alloc_owned(payload), len);
-            out.push((rep, RamChild::Disk { ptr, root }));
-        }
-        return Ok(());
-    }
     let ptrs = {
         let payloads: Vec<&[u8]> = pending.iter().map(|(_, _, p)| p.as_slice()).collect();
         store.write_batch(&payloads)?
@@ -2379,7 +2415,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
         RamNode::Branch { children, hash } => {
             let idx = nibble_at(key, depth) as usize;
             let done = match children[idx].as_mut() {
-                Some(RamChild::Disk { .. }) => {
+                Some(RamChild::Disk { .. }) | Some(RamChild::Mem(_)) => {
                     children[idx] = Some(new);
                     true
                 }
@@ -2829,17 +2865,16 @@ fn parse_prefix(payload: &[u8]) -> Result<Vec<u8>> {
     CompactReader::new(payload).read_nibble_path()
 }
 
-/// Accumulator for [`FlatMpt::spill_mem`]: a pending chunk of RAM-tier records to
-/// write, plus the `(prefix, disk-ptr)` retargets collected across flushed chunks.
+/// Accumulator for [`FlatMpt::spill_mem`]: a pending chunk of `Mem`-leaf byte
+/// buffers to write, plus the `(prefix, disk-ptr)` retargets collected so far.
 struct SpillBuf {
     prefixes: Vec<Vec<u8>>,
     payloads: Vec<Arc<[u8]>>,
     installs: Vec<(Vec<u8>, DiskPtr)>,
 }
 
-/// Write the pending chunk to the file (one dense `write_batch`; `ram_mode` is off
-/// during spill so this lands on disk), queue each record's `(prefix, disk-ptr)`,
-/// then clear the chunk.
+/// Write the pending chunk to the file (one dense `write_batch`) and queue each
+/// record's `(prefix, disk-ptr)` for install, then clear the chunk.
 fn flush_spill_chunk(store: &FlatFile, buf: &mut SpillBuf) -> Result<()> {
     if buf.payloads.is_empty() {
         return Ok(());
@@ -2853,41 +2888,45 @@ fn flush_spill_chunk(store: &FlatFile, buf: &mut SpillBuf) -> Result<()> {
     Ok(())
 }
 
-/// Read-only walk collecting every RAM-tier leaf's `(prefix, bytes)`, flushing a
-/// `write_batch` to disk every `chunk` records. The frontier isn't mutated here —
-/// ptr retargets are applied afterward via [`install_ptr_by_prefix`] — so this
-/// takes `&RamNode` and never conflicts with the writes.
-fn spill_walk(node: &RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut SpillBuf, chunk: usize) -> Result<()> {
+/// Walk the frontier; for each `Mem` leaf take its bytes and replace the slot with
+/// a `Disk` placeholder carrying the correct root (the ptr is filled in after the
+/// walk). Flushes every `chunk` records so only one chunk of payloads is resident.
+fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut SpillBuf, chunk: usize) -> Result<()> {
     match node {
-        RamNode::Empty => {}
+        RamNode::Empty => Ok(()),
         RamNode::Extension { path, child, .. } => {
             let mut next = prefix;
             next.extend_from_slice(path);
-            spill_walk(child, next, store, buf, chunk)?;
+            spill_walk(child, next, store, buf, chunk)
         }
         RamNode::Branch { children, .. } => {
-            for (i, slot) in children.iter().enumerate() {
+            for (i, slot) in children.iter_mut().enumerate() {
                 match slot {
                     Some(RamChild::Ram(child)) => {
                         let mut cp = prefix.clone();
                         cp.push(i as u8);
                         spill_walk(child, cp, store, buf, chunk)?;
                     }
-                    Some(RamChild::Disk { ptr, .. }) if ptr.is_ram() => {
+                    Some(RamChild::Mem(_)) => {
+                        let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
                         let mut cp = prefix.clone();
                         cp.push(i as u8);
+                        *slot = Some(RamChild::Disk {
+                            ptr: DiskPtr { unit: 0, len: m.bytes.len() as u32 },
+                            root: m.root,
+                        });
                         buf.prefixes.push(cp);
-                        buf.payloads.push(store.record_bytes(*ptr)?);
+                        buf.payloads.push(m.bytes);
                         if buf.payloads.len() >= chunk {
                             flush_spill_chunk(store, buf)?;
                         }
                     }
-                    _ => {}
+                    Some(RamChild::Disk { .. }) | None => {}
                 }
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Retarget the `DiskPtr` at `prefix`'s frontier slot to `new_ptr`, leaving its
@@ -2913,6 +2952,7 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
                     *ptr = new_ptr;
                     true
                 }
+                Some(RamChild::Mem(_)) => false,
                 Some(RamChild::Ram(child)) => {
                     install_ptr_by_prefix(child, prefix, depth + 1, new_ptr)
                 }
@@ -2996,6 +3036,7 @@ fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr
             match children[idx].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr(child, nibbles, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
+                RamChild::Mem(_) => None,
             }
         }
     }
@@ -3023,6 +3064,7 @@ fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr>
             match children[nibble_at(key, depth) as usize].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr_key(child, key, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
+                RamChild::Mem(_) => None,
             }
         }
     }
@@ -3066,6 +3108,7 @@ fn hash_ram(node: &RamNode) -> Hash {
                 children.iter().flatten().map(|child| match child {
                     RamChild::Ram(node) => hash_ram(node),
                     RamChild::Disk { root, .. } => *root,
+                    RamChild::Mem(m) => m.root,
                 }),
             );
             hash.set(Some(computed));
@@ -3132,6 +3175,7 @@ fn ram_child_hash(child: &RamChild) -> Hash {
     match child {
         RamChild::Ram(node) => hash_ram(node),
         RamChild::Disk { root, .. } => *root,
+        RamChild::Mem(m) => m.root,
     }
 }
 
@@ -3143,7 +3187,8 @@ fn ram_child_stale(child: &RamChild) -> bool {
             RamNode::Empty => false,
             RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.get().is_none(),
         },
-        RamChild::Disk { .. } => false,
+        // A Mem leaf's hash is current (set when its bytes were serialized).
+        RamChild::Disk { .. } | RamChild::Mem(_) => false,
     }
 }
 
@@ -3269,6 +3314,13 @@ fn collect_leaf_stats(node: &RamNode, stats: &mut LeafStats) {
                         let pages = ((ptr.len as u64).div_ceil(PAGE).max(1)).min(8) as usize;
                         stats.page_hist[pages] += 1;
                     }
+                    RamChild::Mem(m) => {
+                        stats.count += 1;
+                        let b = m.bytes.len() as u64;
+                        stats.total_bytes += b;
+                        let pages = (b.div_ceil(PAGE).max(1)).min(8) as usize;
+                        stats.page_hist[pages] += 1;
+                    }
                     RamChild::Ram(n) => collect_leaf_stats(n, stats),
                 }
             }
@@ -3285,6 +3337,7 @@ fn count_disk_leaves(node: &RamNode) -> usize {
             .flatten()
             .map(|c| match c {
                 RamChild::Disk { .. } => 1,
+                RamChild::Mem(_) => 1,
                 RamChild::Ram(n) => count_disk_leaves(n),
             })
             .sum(),
@@ -3303,9 +3356,8 @@ fn recompute_live(node: &RamNode, live: &mut [u32]) {
             for c in children.iter().flatten() {
                 match c {
                     RamChild::Ram(n) => recompute_live(n, live),
-                    // A RAM-tier record occupies no disk units. (Only reachable
-                    // mid-build; spilled to disk before any reopen/audit.)
-                    RamChild::Disk { ptr, .. } if ptr.is_ram() => {}
+                    // Mem leaves occupy no disk units (spilled before any reopen).
+                    RamChild::Mem(_) => {}
                     RamChild::Disk { ptr, .. } => {
                         let r = RegionAlloc::region_of_unit(ptr.unit as u64) as usize;
                         if r < live.len() {
@@ -3384,11 +3436,10 @@ mod tests {
 
     #[test]
     fn ram_build_matches_disk_build() {
-        // A RAM build (records in the store's RAM tier, reached through the *same*
-        // insert pipeline as disk) must yield the byte-identical Merkle root of a
-        // disk build — before spilling, after spilling, and after persist+reopen.
-        // Tiny leaves force heavy promotion so the path is well exercised.
-        use std::sync::atomic::Ordering::Relaxed;
+        // A RAM build (leaves held as their own Arcs, reached through the parallel
+        // top-nibble fan-out) must yield the byte-identical Merkle root of a disk
+        // build — before spilling, after spilling, and after persist+reopen. Tiny
+        // leaves force heavy promotion so the path is well exercised.
         let cfg = Config {
             target_leaf_bytes: 512,
             max_leaf_bytes: 1024,
@@ -3403,10 +3454,10 @@ mod tests {
         }
         let root_disk = disk.root();
 
-        // RAM build, no spill (huge threshold): every leaf stays RAM-resident.
+        // RAM build, no spill (huge threshold): every leaf stays a Mem(Arc).
         let tmp = NamedTempFile::new().unwrap();
         let mut ram = FlatMpt::create(tmp.path(), cfg.clone()).unwrap();
-        ram.store.ram_mode.store(true, Relaxed);
+        ram.ram_mode = true;
         ram.spill_threshold = u64::MAX;
         let mut buf = Vec::new();
         for i in 0..N {
@@ -3416,14 +3467,13 @@ mod tests {
             }
         }
         ram.insert_batch(buf).unwrap();
-        assert!(ram.store.ram_mode(), "should not have spilled at u64::MAX threshold");
-        assert!(ram.store.ram.read().unwrap().live_bytes > 0, "records should be in the RAM tier");
+        assert!(ram.ram_mode, "should not have spilled at u64::MAX threshold");
         assert_eq!(ram.store.end_page(), 0, "RAM build must not touch the flat file");
         assert_eq!(ram.root(), root_disk, "RAM build root differs from disk build");
 
-        // Spill RAM tier -> disk; root unchanged, leaves now reachable on disk.
+        // Spill Mem -> disk; root unchanged, leaves now reachable on disk.
         ram.spill_mem().unwrap();
-        assert!(!ram.store.ram_mode());
+        assert!(!ram.ram_mode);
         assert_eq!(ram.root(), root_disk, "root changed across spill");
         assert_eq!(
             ram.disk_accesses_for_key(&key(0)).unwrap(),

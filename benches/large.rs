@@ -263,9 +263,13 @@ fn main() {
                 d[1] as f64 / phase_tot as f64 * 100.0,
                 d[10] as f64 / phase_tot as f64 * 100.0,
             );
+            // Effective Phase-B concurrency = summed thread-time / wall-time. ~= the
+            // number of cores actually kept busy (cap = worker threads).
+            let b_work_ns = d[4] + d[5] + d[6] + d[7] + d[8] + d[9];
             println!(
-                "          B-work µs/key: pread {:.1} parse {:.1} rebuild {:.1} serialize {:.1} pwrite {:.1} lock {:.1}",
+                "          B-work µs/key: pread {:.1} parse {:.1} rebuild {:.1} serialize {:.1} pwrite {:.1} lock {:.1}  (B concurrency {:.1}x)",
                 uk(d[4]), uk(d[5]), uk(d[6]), uk(d[7]), uk(d[8]), uk(d[9]),
+                b_work_ns as f64 / d[1].max(1) as f64,
             );
             println!(
                 "          GC: {:.2} reloc/key, {} regs/batch, {:.1} ms/batch, R={}, free_regions {}",
