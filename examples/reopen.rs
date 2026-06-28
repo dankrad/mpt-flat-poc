@@ -131,8 +131,22 @@ fn main() {
         per(cr),
         per(cf),
     );
+    // GC runs between Phase B and C and is timed separately (not in A/B/C above).
+    let gc_ns = stats::GC_NS.load(Relaxed);
+    let gc_reloc = stats::GC_RELOCATED.load(Relaxed);
+    let gc_regs = stats::GC_REGIONS.load(Relaxed);
+    println!(
+        "  GC: {:.1} ms/batch ({:.0}% of wall) | {:.2} reloc/key | {} regions reclaimed",
+        per(gc_ns),
+        gc_ns as f64 / 1e9 / secs * 100.0,
+        gc_reloc as f64 / n as f64,
+        gc_regs,
+    );
 
-    // Re-persist so the on-disk manifest matches the mutated flat file (otherwise
-    // the next reopen reads freed/overwritten regions).
-    db.persist().unwrap();
+    // Re-persist only when asked (REOPEN_PERSIST=1). Skipping it keeps the
+    // checkpoint pristine so the same 1B base can be reused for repeated A/B runs
+    // (the appended records become orphans the next run's allocator overwrites).
+    if std::env::var("REOPEN_PERSIST").as_deref() == Ok("1") {
+        db.persist().unwrap();
+    }
 }

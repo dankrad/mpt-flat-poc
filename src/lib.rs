@@ -34,6 +34,20 @@ pub mod stats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     pub static WRITES: AtomicU64 = AtomicU64::new(0);
+    /// Total payload bytes written (sum of record sizes; excludes page/coalesce
+    /// padding) — divide by keys for the logical write amplification.
+    pub static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Deep-promotion accounting: number of promotion events, the child records
+    /// they wrote out, and those children's total bytes. `PROMOTE_CHILD_BYTES /
+    /// WRITE_BYTES` is the share of write volume spent on promotion rebalancing.
+    pub static PROMOTE_EVENTS: AtomicU64 = AtomicU64::new(0);
+    pub static PROMOTE_CHILDREN: AtomicU64 = AtomicU64::new(0);
+    pub static PROMOTE_CHILD_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub fn on_promote(children: u64, bytes: u64) {
+        PROMOTE_EVENTS.fetch_add(1, Relaxed);
+        PROMOTE_CHILDREN.fetch_add(children, Relaxed);
+        PROMOTE_CHILD_BYTES.fetch_add(bytes, Relaxed);
+    }
     pub static SPLITS: AtomicU64 = AtomicU64::new(0);
     pub static MAX_RECORD: AtomicU64 = AtomicU64::new(0);
     pub static MIN_SPLIT_TRIGGER: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -139,6 +153,7 @@ pub mod stats {
 
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
+        WRITE_BYTES.fetch_add(total as u64, Relaxed);
         MAX_RECORD.fetch_max(total as u64, Relaxed);
         let pages = total.div_ceil(super::PAGE as usize).min(16);
         PAGE_HIST[pages].fetch_add(1, Relaxed);
@@ -158,6 +173,10 @@ pub mod stats {
 
     pub fn reset() {
         WRITES.store(0, Relaxed);
+        WRITE_BYTES.store(0, Relaxed);
+        PROMOTE_EVENTS.store(0, Relaxed);
+        PROMOTE_CHILDREN.store(0, Relaxed);
+        PROMOTE_CHILD_BYTES.store(0, Relaxed);
         SPLITS.store(0, Relaxed);
         MAX_RECORD.store(0, Relaxed);
         MIN_SPLIT_TRIGGER.store(u64::MAX, Relaxed);
@@ -1182,10 +1201,7 @@ impl FlatMpt {
         let results: Vec<(Key, RamChild)> = if groups.len() < 64 {
             process_chunk(store, &cfg, &groups, batched)?
         } else {
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(8);
+            let threads = worker_count();
             let chunk = groups.len().div_ceil(threads);
             std::thread::scope(|scope| {
                 let handles: Vec<_> = groups
@@ -1249,6 +1265,13 @@ impl FlatMpt {
     /// `TARGET_UTIL`: below target ⇒ too much garbage ⇒ clean more; above ⇒ ease
     /// off. Returns the rate to use this batch (0 until the file passes the floor).
     fn gc_rate(&mut self) -> usize {
+        // Kill switch for A/B comparison: MPT_GC_DISABLE=1 turns off all inline
+        // compaction (no victims selected, no relocation), so the flat file only
+        // ever grows. Cached once.
+        static GC_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *GC_OFF.get_or_init(|| std::env::var("MPT_GC_DISABLE").as_deref() == Ok("1")) {
+            return 0;
+        }
         let end = self.store.end_page();
         if end < GC_MIN_PAGES {
             return 0;
@@ -1559,10 +1582,11 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
 /// different position in the tree (only the stored `path` does) — which is what
 /// lets a divergence re-home a leaf without re-hashing it.
 fn leaf_hash(key: Key, value_hash: Hash) -> Hash {
-    let mut bytes = vec![3];
-    bytes.extend_from_slice(&key);
-    bytes.extend_from_slice(&value_hash);
-    keccak(&bytes)
+    let mut h = Keccak256::new();
+    h.update([3u8]);
+    h.update(key);
+    h.update(value_hash);
+    keccak_finalize(h)
 }
 
 /// A leaf holding the suffix `path` (key nibbles from its position to depth 64)
@@ -1590,13 +1614,8 @@ fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
     // the branch, so this stays collision-resistant; it just shrinks the keccak
     // input (513 bytes fixed -> 3 + 32*popcount) for the sparse branches that
     // dominate, cutting the path-rehash work.
-    let mut bytes = vec![5];
     let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-    bytes.extend_from_slice(&bitmap.to_le_bytes());
-    for child in children.iter().flatten() {
-        bytes.extend_from_slice(&hash_node(child));
-    }
-    keccak(&bytes)
+    branch_hash_streaming(bitmap, children.iter().flatten().map(|c| hash_node(c)))
 }
 
 /// Pack a child-presence iterator (16 slots) into a little-endian bitmap.
@@ -1868,6 +1887,10 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
         }
     }
     let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    stats::on_promote(
+        payload_refs.len() as u64,
+        payload_refs.iter().map(|p| p.len() as u64).sum(),
+    );
     let ptrs = store.write_batch(&payload_refs)?;
     for ((i, root), ptr) in batched_slots.into_iter().zip(ptrs) {
         ram_children[i] = Some(RamChild::Disk { ptr, root });
@@ -1907,6 +1930,26 @@ fn batched_writes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
+}
+
+/// Number of Phase-B worker threads (each issues one blocking pread at a time, so
+/// this is effectively the read queue depth). Defaults to min(cores, 8);
+/// `MPT_WORKERS=N` overrides — used to explore the device QD curve.
+fn worker_count() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MPT_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(8)
+            })
+    })
 }
 
 /// Apply a whole group of keys (all routing to the disk record at `ptr`), free
@@ -2615,17 +2658,14 @@ fn hash_ram(node: &RamNode) -> Hash {
             // sparse encoding as `branch_hash`: bitmap + present children's hashes
             // only, so RAM and disk branches with the same structure still hash
             // identically (storage-independent root).
-            let mut bytes = vec![5];
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-            bytes.extend_from_slice(&bitmap.to_le_bytes());
-            for child in children.iter().flatten() {
-                let h = match child {
+            let computed = branch_hash_streaming(
+                bitmap,
+                children.iter().flatten().map(|child| match child {
                     RamChild::Ram(node) => hash_ram(node),
                     RamChild::Disk { root, .. } => *root,
-                };
-                bytes.extend_from_slice(&h);
-            }
-            let computed = keccak(&bytes);
+                }),
+            );
             hash.set(Some(computed));
             computed
         }
@@ -2676,13 +2716,8 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
                     .map(|h| h.join().expect("frontier hash thread panicked"))
                     .collect()
             });
-            let mut bytes = vec![5];
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-            bytes.extend_from_slice(&bitmap.to_le_bytes());
-            for h in &child_hashes {
-                bytes.extend_from_slice(h);
-            }
-            let computed = keccak(&bytes);
+            let computed = branch_hash_streaming(bitmap, child_hashes.into_iter());
             hash.set(Some(computed));
             computed
         }
@@ -2726,16 +2761,18 @@ fn hash_node(node: &Node) -> Hash {
 }
 
 fn hash_join(tag: u8, path: &[u8], child: &Hash) -> Hash {
-    let mut bytes = vec![tag, path.len() as u8];
-    bytes.extend_from_slice(path);
-    bytes.extend_from_slice(child);
-    keccak(&bytes)
+    let mut h = Keccak256::new();
+    h.update([tag, path.len() as u8]);
+    h.update(path);
+    h.update(child);
+    keccak_finalize(h)
 }
 
 fn hash_leaf_value(value: &[u8]) -> Hash {
-    let mut bytes = vec![6];
-    bytes.extend_from_slice(value);
-    keccak(&bytes)
+    let mut h = Keccak256::new();
+    h.update([6u8]);
+    h.update(value);
+    keccak_finalize(h)
 }
 
 fn keccak(bytes: &[u8]) -> Hash {
@@ -2743,6 +2780,32 @@ fn keccak(bytes: &[u8]) -> Hash {
     let output: Hash = Keccak256::digest(bytes).into();
     prof::record(output);
     output
+}
+
+/// Finalize a streaming keccak with the same profiling hooks as [`keccak`], but
+/// without the per-call scratch `Vec`: callers `update()` the tag and payload
+/// pieces straight into the sponge. Absorbing is concatenation-equivalent, so the
+/// digest is byte-identical to `keccak(&[tag, ..payload])` — only the heap
+/// allocation (and its memcpy) disappears, which is the dominant per-hash cost in
+/// the cache-resident regime.
+fn keccak_finalize(hasher: Keccak256) -> Hash {
+    let _g = prof::scope(prof::Cat::Keccak);
+    let output: Hash = hasher.finalize().into();
+    prof::record(output);
+    output
+}
+
+/// Sparse branch digest `keccak(5 ‖ bitmap_le ‖ present-child-hashes)` streamed
+/// into the sponge. Shared by all three branch hashers (disk `Node`, RAM serial,
+/// RAM parallel) so they stay byte-identical.
+fn branch_hash_streaming(bitmap: u16, child_hashes: impl Iterator<Item = Hash>) -> Hash {
+    let mut h = Keccak256::new();
+    h.update([5u8]);
+    h.update(bitmap.to_le_bytes());
+    for ch in child_hashes {
+        h.update(ch);
+    }
+    keccak_finalize(h)
 }
 
 /// Hash of the empty/absent node. It is a constant, so compute it once instead

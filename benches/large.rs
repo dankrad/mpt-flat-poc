@@ -180,7 +180,7 @@ fn main() {
     use mpt_flat_poc::stats;
     // Per-interval deltas: read each counter, subtract the previous milestone's
     // value. Indices documented in `snap()`.
-    let snap = || -> [u64; 14] {
+    let snap = || -> [u64; 18] {
         [
             stats::PHASE_A_NS.load(Relaxed),      // 0
             stats::PHASE_B_NS.load(Relaxed),      // 1
@@ -196,6 +196,10 @@ fn main() {
             stats::GC_RELOCATED.load(Relaxed),    // 11 records relocated
             stats::GC_REGIONS.load(Relaxed),      // 12 regions reclaimed
             stats::B_FINAL_NS.load(Relaxed),      // 13 migrate+serialize+promote
+            stats::WRITE_BYTES.load(Relaxed),     // 14 total payload bytes written
+            stats::PROMOTE_EVENTS.load(Relaxed),  // 15 deep-promotion events
+            stats::PROMOTE_CHILDREN.load(Relaxed), // 16 children written by promotions
+            stats::PROMOTE_CHILD_BYTES.load(Relaxed), // 17 those children's bytes
         ]
     };
     let mut prev = snap();
@@ -231,7 +235,7 @@ fn main() {
             let live = live_heap().saturating_sub(heap_before);
             let ls = db.leaf_stats();
             let cur = snap();
-            let d: [u64; 14] = std::array::from_fn(|k| cur[k].saturating_sub(prev[k]));
+            let d: [u64; 18] = std::array::from_fn(|k| cur[k].saturating_sub(prev[k]));
             prev = cur;
             let dnb = d[3].max(1); // batches this interval
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -270,6 +274,20 @@ fn main() {
                 msb(d[10]),
                 db.gc_rate_current(),
                 db.free_regions(),
+            );
+            // Deep-promotion tax this interval: how often records promote, the
+            // child records each promotion writes (and their avg size), and the
+            // share of total write volume that promotion rebalancing accounts for.
+            let wbytes = d[14].max(1);
+            println!(
+                "          promote: {} events ({:.3}/Kkey), {} children ({:.1}/event, avg {}B), {:.1}% of write bytes | write-amp {:.0}B/key",
+                d[15],
+                d[15] as f64 * 1000.0 / PROGRESS_EVERY as f64,
+                d[16],
+                d[16] as f64 / d[15].max(1) as f64,
+                d[17] / d[16].max(1),
+                d[17] as f64 / wbytes as f64 * 100.0,
+                d[14] as f64 / PROGRESS_EVERY as f64,
             );
             std::io::stdout().flush().ok();
             chunk_start = Instant::now();
@@ -342,6 +360,22 @@ fn main() {
         mib(r.overlay_bytes),
     );
     println!("  split/write stats: {}", mpt_flat_poc::stats::dump());
+    // Cumulative deep-promotion tax over the whole preload.
+    let (pe, pc, pcb, wb) = (
+        stats::PROMOTE_EVENTS.load(Relaxed),
+        stats::PROMOTE_CHILDREN.load(Relaxed),
+        stats::PROMOTE_CHILD_BYTES.load(Relaxed),
+        stats::WRITE_BYTES.load(Relaxed),
+    );
+    println!(
+        "  deep promotion: {pe} events ({:.1} keys/event), {pc} children written (avg {} B, {:.1}/event), {:.1}% of {:.1} GiB written | write-amp {:.0} B/key",
+        preload as f64 / pe.max(1) as f64,
+        pcb / pc.max(1),
+        pc as f64 / pe.max(1) as f64,
+        pcb as f64 / wb.max(1) as f64 * 100.0,
+        wb as f64 / (1024.0 * 1024.0 * 1024.0),
+        wb as f64 / preload as f64,
+    );
     println!();
 
     // When building a checkpoint, stop here: phases 1/2 below would mutate the
