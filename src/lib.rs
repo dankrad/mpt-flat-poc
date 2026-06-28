@@ -1479,7 +1479,7 @@ impl FlatMpt {
     /// If a RAM build has crossed the resident-size threshold, spill its in-RAM
     /// leaves to disk and revert to disk mode for subsequent batches.
     fn maybe_spill(&mut self) -> Result<()> {
-        if self.ram_mode && process_rss_bytes() >= self.spill_threshold {
+        if self.ram_mode && process_footprint_bytes() >= self.spill_threshold {
             self.spill_mem()?;
         }
         Ok(())
@@ -2280,14 +2280,17 @@ fn value_db_opts() -> (Options, Cache) {
 
 /// RAM-build config read once: `(enabled, spill-threshold-bytes)`. `MPT_RAM_BUILD=1`
 /// keeps fresh leaves in RAM (each its own `Arc`, no flat-file I/O or GC) until
-/// resident size crosses the threshold, then spills to disk. `MPT_RAM_BUILD_GIB`
-/// overrides the threshold (default 110 GiB macOS / 55 GiB Linux).
+/// memory footprint crosses the threshold, then spills to disk. `MPT_RAM_BUILD_GIB`
+/// overrides the threshold. Defaults leave real headroom below installed RAM for
+/// RocksDB, the page cache, and the spill-time transient — the footprint per key
+/// runs higher than a naive value-size estimate (a 1B run measured ~214 B/key),
+/// so the threshold must trip well before the box gets tight.
 fn ram_build_config() -> (bool, u64) {
     use std::sync::OnceLock;
     static CFG: OnceLock<(bool, u64)> = OnceLock::new();
     *CFG.get_or_init(|| {
         let on = std::env::var("MPT_RAM_BUILD").as_deref() == Ok("1");
-        let default_gib: u64 = if cfg!(target_os = "macos") { 110 } else { 55 };
+        let default_gib: u64 = if cfg!(target_os = "macos") { 85 } else { 45 };
         let gib = std::env::var("MPT_RAM_BUILD_GIB")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2296,16 +2299,50 @@ fn ram_build_config() -> (bool, u64) {
     })
 }
 
-/// Process resident size in bytes via `getrusage` (`ru_maxrss` — peak, which
-/// tracks a growing build closely enough to trigger spills). macOS reports bytes,
-/// Linux KiB.
-fn process_rss_bytes() -> u64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
-        return 0;
+/// Process memory footprint in bytes — the real committed memory *including*
+/// compressed and swapped pages, not just what is currently resident in RAM.
+///
+/// This is what must drive spill decisions. Under memory pressure the resident
+/// set is pinned at physical RAM while the true footprint keeps growing into the
+/// compressor / swap, so a resident-only metric (`getrusage`'s `ru_maxrss`)
+/// plateaus and never crosses the threshold — the build then thrashes into swap
+/// instead of spilling. Measured directly in a 1B run: `ru_maxrss` sat at 35 GiB
+/// while the real footprint was ~107 GiB (35 resident + 43 compressed + 29 swap).
+///
+/// macOS: `ri_phys_footprint` from `proc_pid_rusage` (what Activity Monitor's
+/// "Memory" column reports; counts compressed memory). Linux: `VmRSS + VmSwap`
+/// from `/proc/self/status`.
+pub fn process_footprint_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut ri: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V0,
+                &mut ri as *mut _ as *mut libc::rusage_info_t,
+            )
+        };
+        if rc == 0 { ri.ri_phys_footprint } else { 0 }
     }
-    let maxrss = ru.ru_maxrss.max(0) as u64;
-    if cfg!(target_os = "macos") { maxrss } else { maxrss * 1024 }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // VmRSS + VmSwap from /proc/self/status (both in kB).
+        let mut total = 0u64;
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                let rest = line
+                    .strip_prefix("VmRSS:")
+                    .or_else(|| line.strip_prefix("VmSwap:"));
+                if let Some(rest) = rest {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                        total += kb * 1024;
+                    }
+                }
+            }
+        }
+        total
+    }
 }
 
 /// Number of Phase-B worker threads (each issues one blocking pread at a time, so

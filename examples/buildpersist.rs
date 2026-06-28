@@ -6,12 +6,12 @@
 //!   MPT_RAM_BUILD=1 MPT_RAM_BUILD_GIB=300 \
 //!     cargo run --release --example buildpersist -- 100000000 /path/ckpt.flat
 
-use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, hex};
+use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, hex, process_footprint_bytes};
 use std::time::Instant;
 
-// Diagnostic: does a churn-friendly allocator cut the build's RSS? The default
-// system allocator may retain freed memory from the heavy per-insert Arc/Vec
-// churn across the fan-out threads.
+// Diagnostic: does a churn-friendly allocator cut the build's footprint? The
+// default system allocator may retain freed memory from the heavy per-insert
+// Arc/Vec churn across the fan-out threads.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -19,11 +19,11 @@ fn key(i: u64) -> Key {
     hashed_key(i.to_le_bytes())
 }
 
-fn rss_gib() -> f64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let b = if cfg!(target_os = "macos") { ru.ru_maxrss as f64 } else { ru.ru_maxrss as f64 * 1024.0 };
-    b / (1024.0 * 1024.0 * 1024.0)
+// Real committed footprint (resident + compressed + swapped), the same metric
+// that drives the spill trigger — NOT ru_maxrss, which plateaus at physical RAM
+// once the OS starts compressing/swapping and hides the true growth.
+fn mem_gib() -> f64 {
+    process_footprint_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 fn main() {
@@ -44,11 +44,11 @@ fn main() {
         }
         if (i + 1) % 10_000_000 == 0 {
             eprintln!(
-                "[{:>4}M] {:>6.0}s  {:.2} us/key (chunk)  rss {:.1} GiB  flat {:.1} GiB",
+                "[{:>4}M] {:>6.0}s  {:.2} us/key (chunk)  mem {:.1} GiB  flat {:.1} GiB",
                 (i + 1) / 1_000_000,
                 t.elapsed().as_secs_f64(),
                 last.elapsed().as_micros() as f64 / 10_000_000.0,
-                rss_gib(),
+                mem_gib(),
                 db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
             );
             last = Instant::now();
@@ -60,10 +60,10 @@ fn main() {
     let build = t.elapsed();
     let root = db.root();
     eprintln!(
-        "built {n} keys in {:.1}s ({:.2} us/key), rss {:.1} GiB\n  root={}",
+        "built {n} keys in {:.1}s ({:.2} us/key), mem {:.1} GiB\n  root={}",
         build.as_secs_f64(),
         build.as_micros() as f64 / n as f64,
-        rss_gib(),
+        mem_gib(),
         hex(root),
     );
     let ps = Instant::now();
