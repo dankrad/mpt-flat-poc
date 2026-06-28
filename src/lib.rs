@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{BlockBasedOptions, Cache, DB, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
@@ -1162,8 +1162,7 @@ impl FlatMpt {
         // RocksDB instance lives in a sibling directory. `create` is a fresh
         // start, so discard any leftover store from a previous run at this path.
         let values_path = values_path(path);
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let (opts, _cache) = value_db_opts();
         let _ = DB::destroy(&opts, &values_path);
         let values = DB::open(&opts, &values_path)?;
 
@@ -1226,8 +1225,7 @@ impl FlatMpt {
         }
         store.end_page.store(num_regions * REGION_PAGES, Ordering::SeqCst);
 
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let (opts, _cache) = value_db_opts();
         let values = DB::open(&opts, values_path(path))?;
 
         Ok(Self {
@@ -2258,6 +2256,26 @@ fn batched_writes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
+}
+
+/// RocksDB options with a bounded (~5 GiB) memory footprint for the value store.
+/// RocksDB does not shrink to free RAM on its own; left default, its index + filter
+/// blocks grow *resident and unbounded* with the dataset, inflating process RSS and
+/// tripping the RAM-build spill threshold long before the trie fills it. We pin a
+/// fixed block cache (4 GiB) that also holds the index/filter blocks, and cap total
+/// memtable memory (~1 GiB). The value bytes themselves live in on-disk SSTs, not
+/// RSS. Returns the `Cache` so the caller keeps it alive until `DB::open`.
+fn value_db_opts() -> (Options, Cache) {
+    let cache = Cache::new_lru_cache(4 * (1 << 30)); // 4 GiB
+    let mut bbt = BlockBasedOptions::default();
+    bbt.set_block_cache(&cache);
+    bbt.set_cache_index_and_filter_blocks(true);
+    bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_block_based_table_factory(&bbt);
+    opts.set_db_write_buffer_size(1 << 30); // ~1 GiB total across memtables
+    (opts, cache)
 }
 
 /// RAM-build config read once: `(enabled, spill-threshold-bytes)`. `MPT_RAM_BUILD=1`

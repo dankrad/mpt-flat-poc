@@ -9,6 +9,12 @@
 use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, hex};
 use std::time::Instant;
 
+// Diagnostic: does a churn-friendly allocator cut the build's RSS? The default
+// system allocator may retain freed memory from the heavy per-insert Arc/Vec
+// churn across the fan-out threads.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn key(i: u64) -> Key {
     hashed_key(i.to_le_bytes())
 }
