@@ -419,9 +419,30 @@ fn units_for(bytes: u32) -> u32 {
     (bytes as u64).div_ceil(ADDR_UNIT) as u32
 }
 
+/// High bit of `DiskPtr::unit` marks a *RAM-resident* record (bytes held in the
+/// store's in-RAM tier, addressed by the low 31 bits) rather than a flat-file
+/// offset. Used by RAM-build mode: a leaf is a normal `RamChild::Disk` whose ptr
+/// happens to point at RAM until spilled. Caps disk addressing at 2^31 units =
+/// 512 GiB (ample — a 1B-key file is ~150 GiB).
+const RAM_PTR_FLAG: u32 = 1 << 31;
+
 impl DiskPtr {
-    /// Byte offset of the record's length prefix in the flat file.
+    /// A ptr into the store's in-RAM record tier (see [`RamStore`]).
+    fn ram(index: u32, len: u32) -> Self {
+        debug_assert!(index & RAM_PTR_FLAG == 0, "RAM index overflows the flag bit");
+        DiskPtr { unit: RAM_PTR_FLAG | index, len }
+    }
+    /// Whether this ptr addresses the in-RAM tier rather than the flat file.
+    fn is_ram(&self) -> bool {
+        self.unit & RAM_PTR_FLAG != 0
+    }
+    /// Index into the in-RAM record tier (only meaningful when [`is_ram`]).
+    fn ram_index(&self) -> u32 {
+        self.unit & !RAM_PTR_FLAG
+    }
+    /// Byte offset of the record's length prefix in the flat file (disk ptrs only).
     fn offset(&self) -> u64 {
+        debug_assert!(!self.is_ram(), "offset() on a RAM ptr");
         self.unit as u64 * ADDR_UNIT
     }
     /// 256 B units the framed record (header + payload) occupies.
@@ -706,6 +727,49 @@ struct FlatFile {
     /// Page cache bypassed (O_DIRECT / F_NOCACHE) ⇒ reads/writes use aligned
     /// buffers and offset/length widening.
     direct: bool,
+    /// RAM-build tier: when `ram_mode` is set, `write_*` store records here and
+    /// return RAM-flagged ptrs instead of touching the file; reads/frees route by
+    /// the ptr flag. This makes a RAM build use the *same* parallel insert pipeline
+    /// as disk — only the record bytes' home differs. Spilled to the file (and
+    /// `ram_mode` cleared) at the memory threshold or persist. The `RwLock` lets
+    /// Phase B read records concurrently (shared) with only the rare write-back
+    /// taking the exclusive lock.
+    ram: std::sync::RwLock<RamStore>,
+    ram_mode: std::sync::atomic::AtomicBool,
+}
+
+/// In-RAM record tier: records as `Arc<[u8]>` (so reads are zero-copy — the parser
+/// borrows the `Arc` exactly as it does a disk read buffer) with a free list for
+/// reuse when a record is rewritten.
+#[derive(Debug, Default)]
+struct RamStore {
+    records: Vec<Arc<[u8]>>,
+    free: Vec<u32>,
+    live_bytes: u64,
+}
+
+impl RamStore {
+    fn alloc(&mut self, payload: &[u8]) -> u32 {
+        self.live_bytes += payload.len() as u64;
+        let rec: Arc<[u8]> = Arc::from(payload);
+        if let Some(i) = self.free.pop() {
+            self.records[i as usize] = rec;
+            i
+        } else {
+            let i = self.records.len() as u32;
+            assert!(i & RAM_PTR_FLAG == 0, "RAM record tier exceeded 2^31 records");
+            self.records.push(rec);
+            i
+        }
+    }
+    fn get(&self, i: u32) -> Arc<[u8]> {
+        self.records[i as usize].clone()
+    }
+    fn free(&mut self, i: u32) {
+        self.live_bytes -= self.records[i as usize].len() as u64;
+        self.records[i as usize] = Arc::from(&[][..]);
+        self.free.push(i);
+    }
 }
 
 /// Pages needed to hold a record of `record_bytes` (length prefix + payload).
@@ -720,7 +784,13 @@ impl FlatFile {
             seg: Mutex::new(RegionAlloc::default()),
             end_page: AtomicU64::new(0),
             direct,
+            ram: std::sync::RwLock::new(RamStore::default()),
+            ram_mode: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn ram_mode(&self) -> bool {
+        self.ram_mode.load(Ordering::Relaxed)
     }
 
     /// Read `len` payload bytes at file offset `off`. With direct I/O the request
@@ -751,13 +821,17 @@ impl FlatFile {
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
         let total = payload.len() as u32;
         stats::on_write(total as usize);
+        if self.ram_mode() {
+            let i = self.ram.write().unwrap().alloc(payload);
+            return Ok(DiskPtr::ram(i, total));
+        }
         let run_pages = pages_for(RECORD_HDR + total);
         let units = units_for(RECORD_HDR + total);
         let lt = std::time::Instant::now();
         let page = self.seg.lock().unwrap().alloc(run_pages, units, &self.end_page);
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
         let unit = page * UNITS_PER_PAGE;
-        if unit + units as u64 > u32::MAX as u64 {
+        if unit + units as u64 >= RAM_PTR_FLAG as u64 {
             bail!("flat file exceeds the DiskPtr addressing limit");
         }
 
@@ -778,6 +852,18 @@ impl FlatFile {
     /// stays on the bandwidth plateau, and no record straddles a region). Returns a
     /// `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        if self.ram_mode() {
+            // RAM tier needs no dense packing — store each record and return a
+            // RAM-flagged ptr. One lock for the whole batch keeps contention low.
+            let mut ram = self.ram.write().unwrap();
+            return Ok(payloads
+                .iter()
+                .map(|p| {
+                    stats::on_write(p.len());
+                    DiskPtr::ram(ram.alloc(p), p.len() as u32)
+                })
+                .collect());
+        }
         let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
         let mut ptrs = Vec::with_capacity(payloads.len());
         let mut i = 0;
@@ -802,7 +888,7 @@ impl FlatFile {
             let page_start = self.seg.lock().unwrap().alloc(run_pages, live_units, &self.end_page);
             stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
             let base_unit = page_start * UNITS_PER_PAGE;
-            if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
+            if base_unit + (run_pages as u64 * UNITS_PER_PAGE) >= RAM_PTR_FLAG as u64 {
                 bail!("flat file exceeds the DiskPtr addressing limit");
             }
             let mut buf = IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
@@ -827,9 +913,20 @@ impl FlatFile {
         Ok(ptrs)
     }
 
+    /// The record's bytes as a shared buffer: a clone of the in-RAM `Arc` for a
+    /// RAM ptr (zero-copy), or a fresh read from the file for a disk ptr.
+    fn record_bytes(&self, ptr: DiskPtr) -> Result<Arc<[u8]>> {
+        if ptr.is_ram() {
+            Ok(self.ram.read().unwrap().get(ptr.ram_index()))
+        } else {
+            Ok(Arc::from(
+                self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?,
+            ))
+        }
+    }
+
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        let record = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
-        deserialize_subtree(&record)
+        deserialize_subtree(&self.record_bytes(ptr)?)
     }
 
     /// Lazy read: parse only the spine; child subtrees stay `Raw`. Used by the
@@ -838,16 +935,14 @@ impl FlatFile {
         let record = {
             let _g = prof::scope(prof::Cat::FileRead);
             let it = std::time::Instant::now();
-            // Payload starts just past the framing header.
-            let r = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
+            let r = self.record_bytes(ptr)?;
             stats::on_read_io(it.elapsed().as_nanos() as u64);
             r
         };
         let _g = prof::scope(prof::Cat::Deserialize);
-        // `Arc::from(Vec)` reuses the allocation (no copy); Raw children then
-        // share it as zero-copy slices.
+        // Raw children share the buffer as zero-copy slices.
         let pt = std::time::Instant::now();
-        let out = deserialize_subtree_lazy(Arc::from(record));
+        let out = deserialize_subtree_lazy(record);
         stats::on_read_parse(pt.elapsed().as_nanos() as u64);
         out
     }
@@ -867,6 +962,10 @@ impl FlatFile {
     }
 
     fn free(&self, ptr: DiskPtr) {
+        if ptr.is_ram() {
+            self.ram.write().unwrap().free(ptr.ram_index());
+            return;
+        }
         let lt = std::time::Instant::now();
         self.seg.lock().unwrap().free(ptr.unit as u64, ptr.units());
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
@@ -1092,6 +1191,10 @@ pub struct FlatMpt {
     /// Inline-GC cleaning rate: victim regions to evacuate per batch, adjusted by
     /// the proportional controller to hold utilization at `TARGET_UTIL`.
     gc_regions: usize,
+    /// Resident-size ceiling (bytes) at which a RAM build spills its in-RAM records
+    /// to disk and reverts to disk mode. The "are we in RAM mode" flag lives on the
+    /// store (`FlatFile::ram_mode`).
+    spill_threshold: u64,
 }
 
 /// On-disk checkpoint of everything that otherwise lives only in RAM: the trie
@@ -1129,14 +1232,18 @@ impl FlatMpt {
         let _ = DB::destroy(&opts, &values_path);
         let values = DB::open(&opts, &values_path)?;
 
+        let (ram_build, spill_threshold) = ram_build_config();
+        let store = FlatFile::new(file, direct);
+        store.ram_mode.store(ram_build, Ordering::Relaxed);
         Ok(Self {
             cfg,
-            store: FlatFile::new(file, direct),
+            store,
             upper: RamNode::Empty,
             values,
             overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
+            spill_threshold,
         })
     }
 
@@ -1173,6 +1280,8 @@ impl FlatMpt {
             }),
             end_page: AtomicU64::new(end_page),
             direct,
+            ram: std::sync::RwLock::new(RamStore::default()),
+            ram_mode: std::sync::atomic::AtomicBool::new(false),
         };
         {
             let mut live = vec![0u32; num_regions as usize];
@@ -1197,6 +1306,9 @@ impl FlatMpt {
             overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
+            // A reopened database is disk-resident (its store's ram_mode is false);
+            // RAM-build mode is for fresh bulk creation only.
+            spill_threshold: ram_build_config().1,
         })
     }
 
@@ -1228,6 +1340,9 @@ impl FlatMpt {
     /// writes the manifest atomically (temp file + rename) so a crash can't leave
     /// a torn manifest.
     pub fn persist(&mut self) -> Result<()> {
+        // The manifest stores disk ptrs only; spill any RAM-tier records to the
+        // file first (they'd otherwise be lost on reopen).
+        self.spill_mem()?;
         self.flush_values()?;
         self.store.sync()?;
         let manifest = ManifestRef {
@@ -1243,6 +1358,41 @@ impl FlatMpt {
         let tmp = PathBuf::from(tmp);
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &meta)?;
+        Ok(())
+    }
+
+    /// If a RAM build has crossed the resident-size threshold, spill its in-RAM
+    /// records to disk and revert to disk mode for subsequent batches.
+    fn maybe_spill(&mut self) -> Result<()> {
+        if self.store.ram_mode() && process_rss_bytes() >= self.spill_threshold {
+            self.spill_mem()?;
+        }
+        Ok(())
+    }
+
+    /// Move every RAM-tier record into a flat-file record, retargeting the frontier
+    /// ptr from RAM to disk, then revert to disk mode. Streams in chunks (one dense
+    /// `write_batch` each) so transient memory stays bounded; the real disk ptrs are
+    /// installed by prefix after the walk (so its `&mut upper` borrow is released).
+    fn spill_mem(&mut self) -> Result<()> {
+        if !self.store.ram_mode() && self.store.ram.read().unwrap().records.is_empty() {
+            return Ok(());
+        }
+        // Writes must now go to the file, not back into the RAM tier.
+        self.store.ram_mode.store(false, Ordering::Relaxed);
+        const CHUNK: usize = 8192;
+        let mut buf = SpillBuf {
+            prefixes: Vec::new(),
+            payloads: Vec::new(),
+            installs: Vec::new(),
+        };
+        spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+        flush_spill_chunk(&self.store, &mut buf)?;
+        for (prefix, ptr) in buf.installs {
+            install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr);
+        }
+        // Drop the now-empty RAM tier.
+        *self.store.ram.write().unwrap() = RamStore::default();
         Ok(())
     }
 
@@ -1375,6 +1525,7 @@ impl FlatMpt {
         let root_ns = t_root.elapsed().as_nanos() as u64;
         stats::on_batch(a_ns, b_ns, t_c.elapsed().as_nanos() as u64);
         stats::on_phase_c(install_ns, root_ns, flush_ns);
+        self.maybe_spill()?;
         Ok(root)
     }
 
@@ -2050,6 +2201,38 @@ fn batched_writes() -> bool {
     *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
 }
 
+/// RAM-build config read once: `(enabled, spill-threshold-bytes)`. `MPT_RAM_BUILD=1`
+/// keeps fresh records in the store's RAM tier (no flat-file I/O or GC) until
+/// resident size crosses the threshold, then spills to disk and reverts to disk
+/// mode. `MPT_RAM_BUILD_GIB` overrides the threshold (default 110 GiB macOS /
+/// 55 GiB Linux). The full insert pipeline is unchanged — only where records'
+/// bytes live differs — so RAM builds keep Phase B's parallelism.
+fn ram_build_config() -> (bool, u64) {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<(bool, u64)> = OnceLock::new();
+    *CFG.get_or_init(|| {
+        let on = std::env::var("MPT_RAM_BUILD").as_deref() == Ok("1");
+        let default_gib: u64 = if cfg!(target_os = "macos") { 110 } else { 55 };
+        let gib = std::env::var("MPT_RAM_BUILD_GIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_gib);
+        (on, gib * (1 << 30))
+    })
+}
+
+/// Process resident size in bytes via `getrusage` (`ru_maxrss` — the peak, which
+/// tracks current usage closely during a monotonically-growing build, all the
+/// spill trigger needs). macOS reports bytes, Linux KiB.
+fn process_rss_bytes() -> u64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0;
+    }
+    let maxrss = ru.ru_maxrss.max(0) as u64;
+    if cfg!(target_os = "macos") { maxrss } else { maxrss * 1024 }
+}
+
 /// Number of Phase-B worker threads (each issues one blocking pread at a time, so
 /// this is effectively the read queue depth). Defaults to min(cores, 8);
 /// `MPT_WORKERS=N` overrides — used to explore the device QD curve.
@@ -2625,6 +2808,67 @@ fn parse_prefix(payload: &[u8]) -> Result<Vec<u8>> {
     CompactReader::new(payload).read_nibble_path()
 }
 
+/// Accumulator for [`FlatMpt::spill_mem`]: a pending chunk of RAM-tier records to
+/// write, plus the `(prefix, disk-ptr)` retargets collected across flushed chunks.
+struct SpillBuf {
+    prefixes: Vec<Vec<u8>>,
+    payloads: Vec<Arc<[u8]>>,
+    installs: Vec<(Vec<u8>, DiskPtr)>,
+}
+
+/// Write the pending chunk to the file (one dense `write_batch`; `ram_mode` is off
+/// during spill so this lands on disk), queue each record's `(prefix, disk-ptr)`,
+/// then clear the chunk.
+fn flush_spill_chunk(store: &FlatFile, buf: &mut SpillBuf) -> Result<()> {
+    if buf.payloads.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&[u8]> = buf.payloads.iter().map(|p| &p[..]).collect();
+    let ptrs = store.write_batch(&refs)?;
+    for (prefix, ptr) in buf.prefixes.drain(..).zip(ptrs) {
+        buf.installs.push((prefix, ptr));
+    }
+    buf.payloads.clear();
+    Ok(())
+}
+
+/// Read-only walk collecting every RAM-tier leaf's `(prefix, bytes)`, flushing a
+/// `write_batch` to disk every `chunk` records. The frontier isn't mutated here —
+/// ptr retargets are applied afterward via [`install_ptr_by_prefix`] — so this
+/// takes `&RamNode` and never conflicts with the writes.
+fn spill_walk(node: &RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut SpillBuf, chunk: usize) -> Result<()> {
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { path, child, .. } => {
+            let mut next = prefix;
+            next.extend_from_slice(path);
+            spill_walk(child, next, store, buf, chunk)?;
+        }
+        RamNode::Branch { children, .. } => {
+            for (i, slot) in children.iter().enumerate() {
+                match slot {
+                    Some(RamChild::Ram(child)) => {
+                        let mut cp = prefix.clone();
+                        cp.push(i as u8);
+                        spill_walk(child, cp, store, buf, chunk)?;
+                    }
+                    Some(RamChild::Disk { ptr, .. }) if ptr.is_ram() => {
+                        let mut cp = prefix.clone();
+                        cp.push(i as u8);
+                        buf.prefixes.push(cp);
+                        buf.payloads.push(store.record_bytes(*ptr)?);
+                        if buf.payloads.len() >= chunk {
+                            flush_spill_chunk(store, buf)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Retarget the `DiskPtr` at `prefix`'s frontier slot to `new_ptr`, leaving its
 /// cached hash untouched (relocation is verbatim ⇒ the subtree root is unchanged).
 /// Returns whether a `Disk` slot was found and updated.
@@ -3038,6 +3282,9 @@ fn recompute_live(node: &RamNode, live: &mut [u32]) {
             for c in children.iter().flatten() {
                 match c {
                     RamChild::Ram(n) => recompute_live(n, live),
+                    // A RAM-tier record occupies no disk units. (Only reachable
+                    // mid-build; spilled to disk before any reopen/audit.)
+                    RamChild::Disk { ptr, .. } if ptr.is_ram() => {}
                     RamChild::Disk { ptr, .. } => {
                         let r = RegionAlloc::region_of_unit(ptr.unit as u64) as usize;
                         if r < live.len() {
@@ -3112,6 +3359,63 @@ mod tests {
 
     fn db(cfg: Config) -> FlatMpt {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
+    }
+
+    #[test]
+    fn ram_build_matches_disk_build() {
+        // A RAM build (records in the store's RAM tier, reached through the *same*
+        // insert pipeline as disk) must yield the byte-identical Merkle root of a
+        // disk build — before spilling, after spilling, and after persist+reopen.
+        // Tiny leaves force heavy promotion so the path is well exercised.
+        use std::sync::atomic::Ordering::Relaxed;
+        let cfg = Config {
+            target_leaf_bytes: 512,
+            max_leaf_bytes: 1024,
+            min_promote_bytes: 256,
+        };
+        const N: u64 = 20_000;
+        let key = |i: u64| hashed_key(i.to_le_bytes());
+
+        let mut disk = db(cfg.clone());
+        for i in 0..N {
+            disk.insert(key(i), vec![7u8; 32]).unwrap();
+        }
+        let root_disk = disk.root();
+
+        // RAM build, no spill (huge threshold): every leaf stays RAM-resident.
+        let tmp = NamedTempFile::new().unwrap();
+        let mut ram = FlatMpt::create(tmp.path(), cfg.clone()).unwrap();
+        ram.store.ram_mode.store(true, Relaxed);
+        ram.spill_threshold = u64::MAX;
+        let mut buf = Vec::new();
+        for i in 0..N {
+            buf.push((key(i), vec![7u8; 32]));
+            if buf.len() == 1000 {
+                ram.insert_batch(std::mem::take(&mut buf)).unwrap();
+            }
+        }
+        ram.insert_batch(buf).unwrap();
+        assert!(ram.store.ram_mode(), "should not have spilled at u64::MAX threshold");
+        assert!(ram.store.ram.read().unwrap().live_bytes > 0, "records should be in the RAM tier");
+        assert_eq!(ram.store.end_page(), 0, "RAM build must not touch the flat file");
+        assert_eq!(ram.root(), root_disk, "RAM build root differs from disk build");
+
+        // Spill RAM tier -> disk; root unchanged, leaves now reachable on disk.
+        ram.spill_mem().unwrap();
+        assert!(!ram.store.ram_mode());
+        assert_eq!(ram.root(), root_disk, "root changed across spill");
+        assert_eq!(
+            ram.disk_accesses_for_key(&key(0)).unwrap(),
+            1,
+            "spilled leaves should be reachable in one disk read",
+        );
+
+        // Persist + reopen round-trips to the same root.
+        let path = tmp.path().to_path_buf();
+        ram.persist().unwrap();
+        drop(ram);
+        let reopened = FlatMpt::open(&path).unwrap();
+        assert_eq!(reopened.root(), root_disk, "reopened RAM-built DB root differs");
     }
 
     #[test]
