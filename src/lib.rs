@@ -1355,14 +1355,24 @@ impl FlatMpt {
                 None => fresh.push((key, value_hash)),
             }
         }
-        let groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
+        let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
+        // Sort by file offset so each worker's chunk is a contiguous file range and
+        // reads ascend in place — turning the per-leaf random reads into sequential
+        // ones, and letting the bulk path coalesce neighbours into one big read.
+        let coalesce = fold_coalesce();
+        let bulk = coalesce && groups.len() >= FOLD_BULK_GROUPS;
+        if coalesce && groups.len() >= 64 {
+            groups.sort_unstable_by_key(|(ptr, _, _)| ptr.unit);
+        }
         let a_ns = t_a.elapsed().as_nanos() as u64;
         let t_b = std::time::Instant::now();
 
         // Phase B (parallel): each group reads its record, applies its keys
         // (record_node_insert + migrate + possible promotion), and produces the
         // replacement RamChild — all the per-record CPU + I/O off the serial path.
-        // Groups touch disjoint subtrees; the store is thread-safe.
+        // Groups touch disjoint subtrees; the store is thread-safe. With many
+        // groups (sorted above) each worker folds its file range via coalesced
+        // multi-MB span reads (sequential) instead of one `pread` per leaf.
         let store = &self.store;
         let batched = batched_writes();
         let results: Vec<(Key, RamChild)> = if groups.len() < 64 {
@@ -1373,7 +1383,15 @@ impl FlatMpt {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = groups
                     .chunks(chunk)
-                    .map(|c| scope.spawn(|| process_chunk(store, &cfg, c, batched)))
+                    .map(|c| {
+                        scope.spawn(|| {
+                            if coalesce {
+                                process_chunk_coalesced(store, &cfg, c, batched)
+                            } else {
+                                process_chunk(store, &cfg, c, batched)
+                            }
+                        })
+                    })
                     .collect();
                 let mut out = Vec::with_capacity(groups.len());
                 for h in handles {
@@ -1392,7 +1410,7 @@ impl FlatMpt {
         let fg_units: std::collections::HashSet<u32> =
             groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
         let t_gc = std::time::Instant::now();
-        let r = self.gc_rate();
+        let r = if bulk { 0 } else { self.gc_rate() };
         let victims = self.store.seg.lock().unwrap().select_victims(r);
         let reloc = if victims.is_empty() {
             Vec::new()
@@ -2249,6 +2267,21 @@ enum GroupOut {
 /// splits a flush so no single `pwrite` exceeds one region (`REGION_PAGES`).
 const BATCH_LEAVES: usize = 8;
 
+/// Bulk-fold (sequential merge) tuning. When a batch touches many leaves, the
+/// disk path sorts the per-leaf groups by file offset and reads consecutive ones
+/// in a single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
+/// ≤ `FOLD_MAX_GAP`. Dense runs are thus read a whole region at a time (sequential
+/// bandwidth, ~13 GB/s) instead of one random `pread` per leaf; sparse runs fall
+/// back to ~per-record reads automatically (the next leaf is too far to coalesce).
+/// All leaves in a span share one buffer `Arc` and parse zero-copy. At/above
+/// `FOLD_BULK_GROUPS` touched leaves the inline GC is skipped — a bulk merge is
+/// already rewriting most of the live set, so concurrent random evacuation only
+/// fights the sequential pass.
+const FOLD_SPAN_BYTES: u64 = 8 << 20; // ≤ 8 MiB per coalesced read
+const FOLD_MAX_GAP: u64 = 1 << 20; // coalesce across gaps ≤ 1 MiB
+const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the bulk write path
+const FOLD_BULK_GROUPS: usize = 1 << 16; // ≥ this many groups ⇒ bulk merge (skip GC)
+
 /// Whether to coalesce leaf writes into batched `pwrite`s. The append allocator
 /// places every write sequentially regardless; batching just cuts syscalls. On by
 /// default; `MPT_BATCHED_WRITES=0` writes per-record for comparison.
@@ -2256,6 +2289,15 @@ fn batched_writes() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
+}
+
+/// Whether the disk batch path sorts groups by file offset and reads them via
+/// coalesced multi-MB spans (the sequential-merge fold). On by default;
+/// `MPT_FOLD=0` reverts to the original unsorted per-leaf `pread` path for A/B.
+fn fold_coalesce() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_FOLD").ok().as_deref() != Some("0"))
 }
 
 /// RocksDB options with a bounded (~5 GiB) memory footprint for the value store.
@@ -2376,9 +2418,24 @@ fn process_group(
     keys: &[(Key, Hash)],
 ) -> Result<GroupOut> {
     let t = std::time::Instant::now();
-    let mut subtree = store.read_lazy(ptr)?;
+    let subtree = store.read_lazy(ptr)?;
     let read_ns = t.elapsed().as_nanos() as u64;
+    fold_group(store, cfg, ptr, subtree, keys, read_ns)
+}
 
+/// Apply a group's keys to an already-read record subtree, free the old record,
+/// and return the outcome (the leaf payload to write, or a promotion). Shared by
+/// the per-leaf read path (`process_group`) and the coalesced span path
+/// (`process_chunk_coalesced`); `read_ns` is the read time to attribute (already
+/// amortized across the span on the coalesced path).
+fn fold_group(
+    store: &FlatFile,
+    cfg: &Config,
+    ptr: DiskPtr,
+    mut subtree: DiskSubtree,
+    keys: &[(Key, Hash)],
+    read_ns: u64,
+) -> Result<GroupOut> {
     let depth = subtree.prefix.len();
     let t = std::time::Instant::now();
     for (key, value_hash) in keys {
@@ -2401,6 +2458,64 @@ fn process_group(
         }
     };
     stats::on_group(read_ns, rebuild_ns, t.elapsed().as_nanos() as u64);
+    Ok(out)
+}
+
+/// Bulk-fold a chunk of groups **pre-sorted by `ptr.unit`** (file offset). Walks
+/// the chunk coalescing consecutive leaves into spans of ≤ `FOLD_SPAN_BYTES`
+/// (breaking at gaps > `FOLD_MAX_GAP`), reads each span in one `pread`, then folds
+/// every leaf in it — parsing each record zero-copy from the shared span buffer
+/// (`Arc` clone, no per-record copy). Updated leaves are written back via the same
+/// batched-append path as `process_chunk`. Reads each touched leaf once, in file
+/// order ⇒ sequential I/O; memory is bounded to one span + one pending write run.
+fn process_chunk_coalesced(
+    store: &FlatFile,
+    cfg: &Config,
+    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    batched: bool,
+) -> Result<Vec<(Key, RamChild)>> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut pending: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+    let rec_end = |p: &DiskPtr| p.offset() + RECORD_HDR as u64 + p.len as u64;
+    let mut i = 0;
+    while i < chunk.len() {
+        // Grow a read span over consecutive leaves while they stay close enough
+        // (gap ≤ FOLD_MAX_GAP) and the span stays ≤ FOLD_SPAN_BYTES.
+        let start = chunk[i].0.offset();
+        let mut j = i;
+        while j + 1 < chunk.len() {
+            let gap = chunk[j + 1].0.offset().saturating_sub(rec_end(&chunk[j].0));
+            if gap > FOLD_MAX_GAP || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
+                break;
+            }
+            j += 1;
+        }
+        let span_len = (rec_end(&chunk[j].0) - start) as usize;
+        let t = std::time::Instant::now();
+        let span: Arc<[u8]> = Arc::from(store.read_payload(start, span_len)?);
+        stats::on_read_io(t.elapsed().as_nanos() as u64);
+
+        for (ptr, rep, keys) in &chunk[i..=j] {
+            // Payload sits just past this record's length prefix within the span.
+            let rel = (ptr.offset() - start) as usize + RECORD_HDR as usize;
+            let subtree = deserialize_subtree_lazy_at(span.clone(), rel, ptr.len as usize)?;
+            match fold_group(store, cfg, *ptr, subtree, keys, 0)? {
+                GroupOut::Promoted(rc) => out.push((*rep, rc)),
+                GroupOut::Leaf { payload, root } if batched => {
+                    pending.push((*rep, root, payload));
+                    if pending.len() >= FOLD_WRITE_LEAVES {
+                        flush_leaf_batch(store, &mut pending, &mut out)?;
+                    }
+                }
+                GroupOut::Leaf { payload, root } => {
+                    let new_ptr = store.write_payload(&payload)?;
+                    out.push((*rep, RamChild::Disk { ptr: new_ptr, root }));
+                }
+            }
+        }
+        i = j + 1;
+    }
+    flush_leaf_batch(store, &mut pending, &mut out)?;
     Ok(out)
 }
 
@@ -2909,6 +3024,25 @@ fn deserialize_subtree_lazy(buf: Arc<[u8]>) -> Result<DiskSubtree> {
     let node = r.node()?;
     if r.pos != end {
         bail!("trailing bytes in flat-file record");
+    }
+    Ok(DiskSubtree { prefix, node })
+}
+
+/// Parse one record's subtree lazily from within a larger shared buffer — a
+/// coalesced span read covering many records. The record payload occupies
+/// `buf[off .. off+len]`; `Raw` children reference `buf` (every record in the span
+/// shares the one allocation, so no per-record copy). Mirrors
+/// [`deserialize_subtree_lazy`] but bounded to the record's sub-range.
+fn deserialize_subtree_lazy_at(buf: Arc<[u8]>, off: usize, len: usize) -> Result<DiskSubtree> {
+    let end = off
+        .checked_add(len)
+        .filter(|e| *e <= buf.len())
+        .ok_or_else(|| anyhow!("span record out of range"))?;
+    let mut r = LazyReader::at(buf, off);
+    let prefix = r.nibble_path()?;
+    let node = r.node()?;
+    if r.pos != end {
+        bail!("trailing bytes in span record");
     }
     Ok(DiskSubtree { prefix, node })
 }
@@ -3615,6 +3749,57 @@ mod tests {
             .insert_batch(vec![(key, b"first".to_vec()), (key, b"second".to_vec())])
             .unwrap();
         assert_eq!(batched.get_value(&key).unwrap(), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn bulk_fold_coalesced_matches_one_by_one() {
+        // The coalesced span-read fold (taken when a batch touches ≥ 64 leaves)
+        // must produce the byte-identical root and values as one-by-one inserts.
+        // Tiny leaves + many keys fan out to thousands of disk leaves across many
+        // regions; churn (rewrites) leaves freed holes so spans have gaps — so this
+        // exercises span growth, gap breaks, and zero-copy parse from a shared
+        // buffer. A 4000-key batch touches well over 64 leaves ⇒ the bulk path.
+        let cfg = Config {
+            target_leaf_bytes: 128,
+            max_leaf_bytes: 256,
+            min_promote_bytes: 64,
+        };
+        let pairs: Vec<(Key, Vec<u8>)> = (0..12000u64)
+            .map(|i| (hashed_key(i.to_le_bytes()), vec![i as u8; 24]))
+            .collect();
+
+        let mut one = db(cfg.clone());
+        for (k, v) in &pairs {
+            one.insert(*k, v.clone()).unwrap();
+        }
+
+        // Two large batches (each ≫ 64 groups) so the coalesced reader dominates,
+        // plus an overwrite batch so some leaves are folded a second time.
+        let mut bulk = db(cfg.clone());
+        bulk.insert_batch(pairs[..6000].to_vec()).unwrap();
+        bulk.insert_batch(pairs[6000..].to_vec()).unwrap();
+        bulk.insert_batch(pairs[..4000].to_vec()).unwrap(); // re-fold existing leaves
+
+        assert_eq!(one.root(), bulk.root(), "coalesced fold root must match one-by-one");
+        assert!(
+            count_disk_leaves(&bulk.upper) >= 64,
+            "test must exercise the coalesced path (≥64 leaves)"
+        );
+        for (k, v) in &pairs {
+            assert_eq!(bulk.get_value(k).unwrap(), Some(v.clone()));
+        }
+
+        // Survives persist + reopen.
+        let path = NamedTempFile::new().unwrap().path().to_path_buf();
+        let mut p = FlatMpt::create(&path, cfg.clone()).unwrap();
+        for chunk in pairs.chunks(4096) {
+            p.insert_batch(chunk.to_vec()).unwrap();
+        }
+        let root = p.root();
+        p.persist().unwrap();
+        drop(p);
+        let reopened = FlatMpt::open(&path).unwrap();
+        assert_eq!(reopened.root(), root, "root must survive reopen after a bulk fold");
     }
 
     #[test]
