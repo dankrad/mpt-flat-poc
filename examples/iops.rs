@@ -54,7 +54,70 @@ fn main() {
     run(&f, "rand write", blocks, block, ops, threads, true);
     run(&f, "rand read ", blocks, block, ops, threads, false);
 
+    // mmap random reads, for comparison with the O_DIRECT pread numbers above.
+    // The fill/writes were uncached (O_DIRECT/F_NOCACHE), so the file is not in
+    // the page cache: the first mmap touch of each page faults from the device
+    // (cold = device-level), then we warm the whole file and repeat (cached).
+    mmap_reads(&path, file_bytes, blocks, block, ops, threads);
+
     std::fs::remove_file(&path).ok();
+}
+
+fn mmap_reads(path: &std::path::Path, file_bytes: u64, blocks: u64, block: usize, ops: u64, threads: usize) {
+    use std::os::unix::io::AsRawFd;
+    let f = OpenOptions::new().read(true).open(path).unwrap();
+    let len = file_bytes as usize;
+    let map = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0)
+    };
+    assert!(map != libc::MAP_FAILED, "mmap failed");
+    unsafe { libc::madvise(map, len, libc::MADV_RANDOM) };
+    let addr = map as usize;
+
+    // Cold: pages aren't cached yet, so faults hit the device. Fewer ops keeps
+    // self-warming low (coverage ≈ ops/blocks), so it stays mostly device reads.
+    run_mmap(addr, "mmap read  (cold)", blocks, block, (ops / 4).max(1), threads);
+
+    // Warm: fault the whole file in (sequential), then random reads hit RAM.
+    {
+        let s = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+        let mut acc = 0u64;
+        let mut i = 0usize;
+        while i < len {
+            acc += s[i] as u64;
+            i += 4096;
+        }
+        std::hint::black_box(acc);
+    }
+    run_mmap(addr, "mmap read  (warm)", blocks, block, ops, threads);
+
+    unsafe { libc::munmap(map, len) };
+}
+
+fn run_mmap(addr: usize, label: &str, blocks: u64, block: usize, ops: u64, threads: usize) {
+    let per = ops / threads as u64;
+    let span = blocks as usize * block;
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        for tid in 0..threads {
+            s.spawn(move || {
+                let map = unsafe { std::slice::from_raw_parts(addr as *const u8, span) };
+                let mut st = 0x9e3779b97f4a7c15u64 ^ (tid as u64).wrapping_mul(0x100000001b3);
+                let mut buf = vec![0u8; block];
+                let mut acc = 0u64;
+                for _ in 0..per {
+                    st = st
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let off = ((st >> 16) % blocks) as usize * block;
+                    buf.copy_from_slice(&map[off..off + block]);
+                    acc += buf[0] as u64;
+                }
+                std::hint::black_box(acc);
+            });
+        }
+    });
+    report(label, per * threads as u64, block, t.elapsed().as_secs_f64());
 }
 
 #[allow(clippy::too_many_arguments)]

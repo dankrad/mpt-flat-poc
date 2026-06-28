@@ -2106,10 +2106,15 @@ fn record_size(prefix_len: usize, node: &Node) -> usize {
 /// addressing [`DiskPtr`]). Returns the payload and its exact byte length.
 fn serialize_subtree(subtree: &DiskSubtree) -> Result<(Vec<u8>, usize)> {
     let _g = prof::scope(prof::Cat::Serialize);
-    let mut payload = Vec::new();
+    // Pre-size exactly: `record_size` is an allocation-free walk (O(1) per `Raw`
+    // child) equal to the final length, so the payload never reallocates as
+    // `write_node` fills it — replacing ~log2(size) grow-and-copy doublings with
+    // one exact allocation.
+    let total = record_size(subtree.prefix.len(), &subtree.node);
+    let mut payload = Vec::with_capacity(total);
     write_nibble_path(&mut payload, &subtree.prefix)?;
     write_node(&mut payload, &subtree.node)?;
-    let total = payload.len();
+    debug_assert_eq!(payload.len(), total, "record_size must equal serialized length");
     Ok((payload, total))
 }
 
@@ -2260,6 +2265,17 @@ impl<'a> CompactReader<'a> {
         Ok(path)
     }
 
+    /// Advance past a nibble path without materializing it — for header scans
+    /// (e.g. [`extract_hash`]) that only need the trailing hash, not the path.
+    fn skip_nibble_path(&mut self) -> Result<()> {
+        let len = self.read_u8()? as usize;
+        if len > 64 {
+            bail!("compact subtree nibble path too long");
+        }
+        self.read_bytes(len.div_ceil(2))?;
+        Ok(())
+    }
+
     fn read_node(&mut self) -> Result<Node> {
         match self.read_u8()? {
             0 => Ok(Node::Empty),
@@ -2401,11 +2417,14 @@ impl LazyReader {
                     }
                     let len = lens[ti] as usize;
                     ti += 1;
-                    // ext/branch subtrees become zero-copy `Raw` — jump over them via
-                    // the table (no scan), reading only the child's header hash. Small
-                    // terminal nodes (leaf/overflow/empty) are parsed fully.
+                    // leaf/ext/branch subtrees become zero-copy `Raw` — jump over
+                    // them via the table (no scan), reading only the child's header
+                    // hash, with no per-child path allocation. A batch usually touches
+                    // one child; `record_node_insert` expands that `Raw` on descent
+                    // (others stay `Raw` and serialize back verbatim). Only the tiny
+                    // terminal tags (empty/overflow) are parsed fully.
                     match self.peek_u8()? {
-                        2 | 3 => {
+                        1 | 2 | 3 => {
                             let off = self.pos;
                             let hash = extract_hash(&self.buf[off..off + len])?;
                             self.pos += len;
@@ -2442,7 +2461,7 @@ fn extract_hash(bytes: &[u8]) -> Result<Hash> {
     match r.read_u8()? {
         0 => Ok(empty_hash()),
         1 | 2 => {
-            let _ = r.read_nibble_path()?;
+            r.skip_nibble_path()?;
             r.read_hash()
         }
         3 => {
