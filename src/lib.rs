@@ -749,9 +749,8 @@ struct RamStore {
 }
 
 impl RamStore {
-    fn alloc(&mut self, payload: &[u8]) -> u32 {
-        self.live_bytes += payload.len() as u64;
-        let rec: Arc<[u8]> = Arc::from(payload);
+    fn push(&mut self, rec: Arc<[u8]>) -> u32 {
+        self.live_bytes += rec.len() as u64;
         if let Some(i) = self.free.pop() {
             self.records[i as usize] = rec;
             i
@@ -761,6 +760,15 @@ impl RamStore {
             self.records.push(rec);
             i
         }
+    }
+    /// Store a borrowed payload (copies into a fresh `Arc`).
+    fn alloc(&mut self, payload: &[u8]) -> u32 {
+        self.push(Arc::from(payload))
+    }
+    /// Store an owned payload with no copy — `Arc::from(Vec<u8>)` reuses the Vec's
+    /// heap allocation. Used by the hot write path (`flush_leaf_batch`).
+    fn alloc_owned(&mut self, payload: Vec<u8>) -> u32 {
+        self.push(Arc::from(payload))
     }
     fn get(&self, i: u32) -> Arc<[u8]> {
         self.records[i as usize].clone()
@@ -2330,6 +2338,19 @@ fn flush_leaf_batch(
     out: &mut Vec<(Key, RamChild)>,
 ) -> Result<()> {
     if pending.is_empty() {
+        return Ok(());
+    }
+    // RAM-build: move each owned serialized payload straight into the RAM tier —
+    // `Arc::from(Vec)` reuses the allocation, so no copy (the disk path below must
+    // pack into a contiguous region buffer and therefore copies).
+    if store.ram_mode() {
+        let mut ram = store.ram.write().unwrap();
+        for (rep, root, payload) in pending.drain(..) {
+            stats::on_write(payload.len());
+            let len = payload.len() as u32;
+            let ptr = DiskPtr::ram(ram.alloc_owned(payload), len);
+            out.push((rep, RamChild::Disk { ptr, root }));
+        }
         return Ok(());
     }
     let ptrs = {
