@@ -579,6 +579,115 @@ impl RegionAlloc {
     }
 }
 
+/// Direct-I/O alignment for buffer address, file offset, and length. 4096 covers
+/// Linux `O_DIRECT` on ext4/xfs (and is a divisor of `PAGE`, so page-aligned
+/// writes already satisfy it). macOS `F_NOCACHE` imposes no alignment, but we use
+/// the same aligned path on both so it's exercised by the macOS test suite.
+const DIO_ALIGN: u64 = 4096;
+
+/// Bypass the page cache for flat-file I/O (`MPT_DIRECT_IO=1`), decided once at
+/// open time. Direct reads go straight to the device, which scales far better
+/// under many threads when the working set exceeds RAM — there's no per-file
+/// page-cache fault lock to serialize on (see `examples/mmapseg`, and the
+/// O_DIRECT-vs-buffered gap in `examples/iops`). The trade is losing the page
+/// cache for data that *does* fit RAM, so this is a disk-bound-only win.
+fn direct_io() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_DIRECT_IO").as_deref() == Ok("1"))
+}
+
+/// Open the flat file, optionally with the page cache bypassed (Linux `O_DIRECT`
+/// open flag; macOS `F_NOCACHE` via `fcntl`).
+fn open_flat(path: &Path, create: bool, direct: bool) -> Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    if create {
+        o.create(true).truncate(true);
+    }
+    #[cfg(target_os = "linux")]
+    if direct {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_DIRECT);
+    }
+    let f = o.open(path)?;
+    #[cfg(target_os = "macos")]
+    if direct {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+    }
+    let _ = direct;
+    Ok(f)
+}
+
+/// A heap buffer aligned to [`DIO_ALIGN`] (and zero-initialized) — required for
+/// the O_DIRECT buffer-address constraint. Derefs to `[u8]`.
+struct AlignedBuf {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+    len: usize,
+}
+impl AlignedBuf {
+    fn new(len: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(len.max(1), DIO_ALIGN as usize).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "aligned alloc failed");
+        Self { ptr, layout, len }
+    }
+}
+impl std::ops::Deref for AlignedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl std::ops::DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// A read/write buffer that is a plain `Vec` for buffered I/O or a [`DIO_ALIGN`]-
+/// aligned buffer for direct I/O. Derefs to `[u8]` so the framing code is the
+/// same either way.
+enum IoBuf {
+    Heap(Vec<u8>),
+    Aligned(AlignedBuf),
+}
+impl IoBuf {
+    fn zeroed(len: usize, direct: bool) -> Self {
+        if direct {
+            IoBuf::Aligned(AlignedBuf::new(len))
+        } else {
+            IoBuf::Heap(vec![0u8; len])
+        }
+    }
+}
+impl std::ops::Deref for IoBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            IoBuf::Heap(v) => v,
+            IoBuf::Aligned(a) => a,
+        }
+    }
+}
+impl std::ops::DerefMut for IoBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            IoBuf::Heap(v) => v,
+            IoBuf::Aligned(a) => a,
+        }
+    }
+}
+
 /// Append-mostly flat file of compact-serialized [`DiskSubtree`] records, with a
 /// [`FreeList`] so that space freed by rewrites can be reused.
 ///
@@ -594,6 +703,9 @@ struct FlatFile {
     /// High-water mark in pages: one past the largest page ever written. Atomic so
     /// reporting can read it without the region lock.
     end_page: AtomicU64,
+    /// Page cache bypassed (O_DIRECT / F_NOCACHE) ⇒ reads/writes use aligned
+    /// buffers and offset/length widening.
+    direct: bool,
 }
 
 /// Pages needed to hold a record of `record_bytes` (length prefix + payload).
@@ -602,11 +714,31 @@ fn pages_for(record_bytes: u32) -> u32 {
 }
 
 impl FlatFile {
-    fn new(file: File) -> Self {
+    fn new(file: File, direct: bool) -> Self {
         Self {
             file,
             seg: Mutex::new(RegionAlloc::default()),
             end_page: AtomicU64::new(0),
+            direct,
+        }
+    }
+
+    /// Read `len` payload bytes at file offset `off`. With direct I/O the request
+    /// is widened to [`DIO_ALIGN`] boundaries into an aligned buffer (O_DIRECT
+    /// requires aligned offset+length+buffer) and the payload copied out; buffered
+    /// I/O reads exactly `len` into a tight `Vec` (kept zero-copy via `Arc`).
+    fn read_payload(&self, off: u64, len: usize) -> Result<Vec<u8>> {
+        if self.direct {
+            let lo = off & !(DIO_ALIGN - 1);
+            let hi = (off + len as u64 + DIO_ALIGN - 1) & !(DIO_ALIGN - 1);
+            let mut abuf = AlignedBuf::new((hi - lo) as usize);
+            (&self.file).read_exact_at(&mut abuf, lo)?;
+            let pad = (off - lo) as usize;
+            Ok(abuf[pad..pad + len].to_vec())
+        } else {
+            let mut v = vec![0u8; len];
+            (&self.file).read_exact_at(&mut v, off)?;
+            Ok(v)
         }
     }
 
@@ -630,7 +762,7 @@ impl FlatFile {
         }
 
         // Frame: [u32 payload len][payload][zero pad to page].
-        let mut record = vec![0u8; run_pages as usize * PAGE as usize];
+        let mut record = IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
         record[..4].copy_from_slice(&total.to_le_bytes());
         record[4..4 + payload.len()].copy_from_slice(payload);
 
@@ -673,7 +805,7 @@ impl FlatFile {
             if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
                 bail!("flat file exceeds the DiskPtr addressing limit");
             }
-            let mut buf = vec![0u8; run_pages as usize * PAGE as usize];
+            let mut buf = IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
             let mut off = 0usize; // dense byte offset within the run
             for p in &payloads[i..j] {
                 // Frame: [u32 payload len][payload], 256 B-aligned within the run.
@@ -696,20 +828,21 @@ impl FlatFile {
     }
 
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        read_record(&self.file, ptr)
+        let record = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
+        deserialize_subtree(&record)
     }
 
     /// Lazy read: parse only the spine; child subtrees stay `Raw`. Used by the
     /// insert path, where a record is touched on one key's path per call.
     fn read_lazy(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        let mut record = vec![0u8; ptr.len as usize];
-        {
+        let record = {
             let _g = prof::scope(prof::Cat::FileRead);
             let it = std::time::Instant::now();
             // Payload starts just past the framing header.
-            (&self.file).read_exact_at(&mut record, ptr.offset() + RECORD_HDR as u64)?;
+            let r = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
             stats::on_read_io(it.elapsed().as_nanos() as u64);
-        }
+            r
+        };
         let _g = prof::scope(prof::Cat::Deserialize);
         // `Arc::from(Vec)` reuses the allocation (no copy); Raw children then
         // share it as zero-copy slices.
@@ -721,8 +854,8 @@ impl FlatFile {
 
     /// Read one whole region (`REGION_PAGES` pages) for GC scanning. Pages past the
     /// file end read as zeros (sparse), which the scan treats as an empty tail.
-    fn read_region(&self, region: u64) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; REGION_PAGES as usize * PAGE as usize];
+    fn read_region(&self, region: u64) -> Result<IoBuf> {
+        let mut buf = IoBuf::zeroed(REGION_PAGES as usize * PAGE as usize, self.direct);
         let off = region * REGION_PAGES * PAGE;
         // Tolerate a short read at the very end of the file (sparse tail).
         match (&self.file).read_exact_at(&mut buf, off) {
@@ -779,19 +912,6 @@ impl FlatFile {
 /// Read and decode one record by pointer, using only `&File` (a positioned
 /// `pread` + decode) so it can run on any thread. `read_exact_at` is a `pread`,
 /// which is safe to call concurrently on the same file from multiple threads.
-fn read_record(file: &File, ptr: DiskPtr) -> Result<DiskSubtree> {
-    let mut record = vec![0u8; ptr.len as usize];
-    {
-        let _g = prof::scope(prof::Cat::FileRead);
-        // Payload starts just past the framing header.
-        file.read_exact_at(&mut record, ptr.offset() + RECORD_HDR as u64)?;
-    }
-    let _g = prof::scope(prof::Cat::Deserialize);
-    deserialize_subtree(&record)
-}
-
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -998,12 +1118,8 @@ impl FlatMpt {
             bail!("invalid split thresholds");
         }
         let path = path.as_ref();
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let direct = direct_io();
+        let file = open_flat(path, true, direct)?;
 
         // RocksDB instance lives in a sibling directory. `create` is a fresh
         // start, so discard any leftover store from a previous run at this path.
@@ -1015,7 +1131,7 @@ impl FlatMpt {
 
         Ok(Self {
             cfg,
-            store: FlatFile::new(file),
+            store: FlatFile::new(file, direct),
             upper: RamNode::Empty,
             values,
             overlay: HashMap::new(),
@@ -1044,7 +1160,8 @@ impl FlatMpt {
         // liveness by walking the frontier AND descending into each record's
         // overflow children. Finally open a fresh head region past the file end.
         let num_regions = end_page.div_ceil(REGION_PAGES);
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let direct = direct_io();
+        let file = open_flat(path, false, direct)?;
         let store = FlatFile {
             file,
             seg: Mutex::new(RegionAlloc {
@@ -1055,6 +1172,7 @@ impl FlatMpt {
                 ..RegionAlloc::default()
             }),
             end_page: AtomicU64::new(end_page),
+            direct,
         };
         {
             let mut live = vec![0u32; num_regions as usize];
@@ -2994,6 +3112,43 @@ mod tests {
 
     fn db(cfg: Config) -> FlatMpt {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
+    }
+
+    #[test]
+    fn direct_io_records_round_trip() {
+        // Validate the direct-I/O aligned read/write path (offset/length widening)
+        // independent of the MPT_DIRECT_IO env: build a FlatFile with direct=true
+        // and round-trip records that sit at 256 B-aligned (not 4096-aligned)
+        // offsets with assorted lengths, several straddling 4096 boundaries.
+        let tmp = NamedTempFile::new().unwrap();
+        let f = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        let store = FlatFile::new(f, true);
+        let payloads: Vec<Vec<u8>> = (0..40usize)
+            .map(|i| {
+                let n = 50 + i * 211; // spans sub-page to multi-page
+                (0..n).map(|j| (i as u8).wrapping_add(j as u8)).collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        let ptrs = store.write_batch(&refs).unwrap();
+        for (p, ptr) in payloads.iter().zip(&ptrs) {
+            let got = store
+                .read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)
+                .unwrap();
+            assert_eq!(&got, p, "direct aligned read must return the written payload");
+        }
+        // Single-record (page-padded) write path too.
+        let single = vec![0x5au8; 9000];
+        let ptr = store.write_payload(&single).unwrap();
+        let got = store
+            .read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)
+            .unwrap();
+        assert_eq!(got, single);
     }
 
     #[test]
