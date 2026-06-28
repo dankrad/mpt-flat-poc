@@ -577,6 +577,25 @@ impl RegionAlloc {
         cands.truncate(max);
         cands.into_iter().map(|(_, r)| r).collect()
     }
+
+    /// Opportunistic victim selection: from the regions this batch already read a
+    /// leaf out of (`touched` — so their bytes are likely still page-cache-hot from
+    /// the foreground reads), pick those under `max_util` live. GC then only ever
+    /// re-reads regions the foreground already paid to fetch — no separate cold
+    /// random-read pass (the cost that doesn't scale with read QD) — and piggybacks
+    /// the relocation. Cheap and self-limiting: it cleans exactly the regions the
+    /// insert churn is emptying.
+    fn select_opportunistic(&self, touched: &std::collections::HashSet<u64>, max_util: f64) -> Vec<u64> {
+        let cap_live = (REGION_UNITS as f64 * max_util) as u32;
+        touched
+            .iter()
+            .copied()
+            .filter(|&r| {
+                let live = self.live.get(r as usize).copied().unwrap_or(0);
+                live > 0 && live <= cap_live && r != self.head_region && !self.free_regions.contains(&r)
+            })
+            .collect()
+    }
 }
 
 /// Direct-I/O alignment for buffer address, file offset, and length. 4096 covers
@@ -1373,52 +1392,62 @@ impl FlatMpt {
         // Groups touch disjoint subtrees; the store is thread-safe. With many
         // groups (sorted above) each worker folds its file range via coalesced
         // multi-MB span reads (sequential) instead of one `pread` per leaf.
-        let store = &self.store;
         let batched = batched_writes();
-        let results: Vec<(Key, RamChild)> = if groups.len() < 64 {
-            process_chunk(store, &cfg, &groups, batched)?
+        // Opportunistic GC fuses evacuation into Phase B: candidate (touched,
+        // under-util) regions are read once and serve both the insert fold and the
+        // evacuation, so no region is read twice. Otherwise: normal Phase B, then a
+        // separate evacuation pass over the rate-selected emptiest regions.
+        let opp = gc_opportunistic() && groups.len() >= 64;
+        let results: Vec<(Key, RamChild)>;
+        let reloc: Vec<(Vec<u8>, DiskPtr)>;
+        if opp {
+            let (res, rl) = process_opportunistic(&self.store, &self.upper, &cfg, &groups, batched)?;
+            stats::on_gc(0, rl.len() as u64, 0);
+            results = res;
+            reloc = rl;
         } else {
-            let threads = worker_count();
-            let chunk = groups.len().div_ceil(threads);
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = groups
-                    .chunks(chunk)
-                    .map(|c| {
-                        scope.spawn(|| {
-                            if coalesce {
-                                process_chunk_coalesced(store, &cfg, c, batched)
-                            } else {
-                                process_chunk(store, &cfg, c, batched)
-                            }
+            let store = &self.store;
+            results = if groups.len() < 64 {
+                process_chunk(store, &cfg, &groups, batched)?
+            } else {
+                let threads = worker_count();
+                let chunk = groups.len().div_ceil(threads);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = groups
+                        .chunks(chunk)
+                        .map(|c| {
+                            scope.spawn(|| {
+                                if coalesce {
+                                    process_chunk_coalesced(store, &cfg, c, batched)
+                                } else {
+                                    process_chunk(store, &cfg, c, batched)
+                                }
+                            })
                         })
-                    })
-                    .collect();
-                let mut out = Vec::with_capacity(groups.len());
-                for h in handles {
-                    out.extend(h.join().expect("batch group thread panicked")?);
-                }
-                Ok::<_, anyhow::Error>(out)
-            })?
-        };
+                        .collect();
+                    let mut out = Vec::with_capacity(groups.len());
+                    for h in handles {
+                        out.extend(h.join().expect("batch group thread panicked")?);
+                    }
+                    Ok::<_, anyhow::Error>(out)
+                })?
+            };
+            // Inline GC: evacuate live records out of the emptiest regions, skipping
+            // the records this batch already rewrote (deduped by unit).
+            let fg_units: std::collections::HashSet<u32> =
+                groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
+            let t_gc = std::time::Instant::now();
+            let r = if bulk { 0 } else { self.gc_rate() };
+            let victims = self.store.seg.lock().unwrap().select_victims(r);
+            reloc = if victims.is_empty() {
+                Vec::new()
+            } else {
+                evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
+            };
+            stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
+        }
 
         let b_ns = t_b.elapsed().as_nanos() as u64;
-
-        // Inline GC (after Phase B, so this batch's foreground frees are already
-        // applied): evacuate the live records out of the emptiest regions and
-        // collect their relocations to install alongside the foreground results.
-        // The records this batch is already rewriting are skipped (deduped by unit).
-        let fg_units: std::collections::HashSet<u32> =
-            groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
-        let t_gc = std::time::Instant::now();
-        let r = if bulk { 0 } else { self.gc_rate() };
-        let victims = self.store.seg.lock().unwrap().select_victims(r);
-        let reloc = if victims.is_empty() {
-            Vec::new()
-        } else {
-            evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
-        };
-        stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
-
         let t_c = std::time::Instant::now();
 
         // Phase C (serial): splice each group's result into the frontier, retarget
@@ -2298,6 +2327,28 @@ fn fold_coalesce() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MPT_FOLD").ok().as_deref() != Some("0"))
+}
+
+/// `MPT_GC_OPP=1` switches inline GC to opportunistic mode: instead of selecting
+/// the globally-emptiest regions (cold random reads that don't scale with read
+/// QD), it evacuates only the regions this batch already read from that are under
+/// `MPT_GC_OPP_UTIL` (default 0.30) live — those are page-cache-hot, so GC rides
+/// the foreground reads. Overrides the rate-based selector and the bulk skip.
+fn gc_opportunistic() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_GC_OPP").as_deref() == Ok("1"))
+}
+
+fn gc_opp_util() -> f64 {
+    use std::sync::OnceLock;
+    static U: OnceLock<f64> = OnceLock::new();
+    *U.get_or_init(|| {
+        std::env::var("MPT_GC_OPP_UTIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.30)
+    })
 }
 
 /// RocksDB options with a bounded (~5 GiB) memory footprint for the value store.
@@ -3208,6 +3259,164 @@ fn evacuate_regions(
         reloc.push((prefix, new));
     }
     Ok(reloc)
+}
+
+/// Opportunistic GC fused with the foreground read. For a touched, under-util
+/// region this batch needs anyway, read the 128 KiB region ONCE and serve both
+/// jobs from that single buffer: fold the batch's keys into the foreground leaves
+/// found in it, and relocate the region's other still-live records — instead of
+/// reading the 5 KiB foreground leaf and then re-reading the whole region for GC.
+/// Returns the foreground replacements and the relocations to install.
+fn evac_and_fold_region(
+    store: &FlatFile,
+    cfg: &Config,
+    upper: &RamNode,
+    region: u64,
+    fg: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    batched: bool,
+) -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
+    let t = std::time::Instant::now();
+    let buf = store.read_region(region)?;
+    stats::on_read_io(t.elapsed().as_nanos() as u64);
+    let base_unit = region * REGION_UNITS;
+    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Hash)>)> =
+        fg.iter().map(|g| (g.0.unit, g)).collect();
+
+    let mut results: Vec<(Key, RamChild)> = Vec::new();
+    let mut leaf_pending: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+    let mut reloc_pending: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+
+    let mut p = 0usize;
+    while p + 4 <= buf.len() {
+        let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+        if len == 0 {
+            let next = (p / PAGE as usize + 1) * PAGE as usize;
+            if next <= p {
+                break;
+            }
+            p = next;
+            continue;
+        }
+        let rec_units = units_for(RECORD_HDR + len) as usize;
+        let end = p + 4 + len as usize;
+        if end > buf.len() {
+            break; // records never straddle a region
+        }
+        let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
+        let ptr = DiskPtr { unit, len };
+        if let Some(g) = fg_by_unit.get(&unit) {
+            // Foreground leaf: fold this batch's keys. Copy just this record into an
+            // Arc so the lazy parse's Raw children can borrow it (5 KiB, not 128).
+            let rec: Arc<[u8]> = Arc::from(&buf[p + 4..end]);
+            let subtree = deserialize_subtree_lazy_at(rec, 0, len as usize)?;
+            match fold_group(store, cfg, ptr, subtree, &g.2, 0)? {
+                GroupOut::Promoted(rc) => results.push((g.1, rc)),
+                GroupOut::Leaf { payload, root } if batched => {
+                    leaf_pending.push((g.1, root, payload));
+                }
+                GroupOut::Leaf { payload, root } => {
+                    let np = store.write_payload(&payload)?;
+                    results.push((g.1, RamChild::Disk { ptr: np, root }));
+                }
+            }
+        } else {
+            // Other live record in this low-util region: relocate it (skip stale).
+            let payload = &buf[p + 4..end];
+            if let Ok(prefix) = parse_prefix(payload) {
+                if find_disk_ptr(upper, &prefix, 0) == Some(ptr) {
+                    reloc_pending.push((prefix, payload.to_vec(), ptr));
+                }
+            }
+        }
+        p += rec_units * ADDR_UNIT as usize;
+    }
+    flush_leaf_batch(store, &mut leaf_pending, &mut results)?;
+
+    let mut reloc = Vec::with_capacity(reloc_pending.len());
+    if !reloc_pending.is_empty() {
+        let payloads: Vec<&[u8]> = reloc_pending.iter().map(|(_, pl, _)| pl.as_slice()).collect();
+        let new_ptrs = store.write_batch(&payloads)?;
+        for ((prefix, _, old), new) in reloc_pending.into_iter().zip(new_ptrs) {
+            store.free(old);
+            reloc.push((prefix, new));
+        }
+    }
+    Ok((results, reloc))
+}
+
+/// Phase B for opportunistic GC: candidate (touched, under-util) regions are read
+/// once and processed by [`evac_and_fold_region`] (fused insert + evacuation); all
+/// other groups take the normal coalesced-read fold. Both run in parallel. Returns
+/// the foreground replacements and the GC relocations.
+fn process_opportunistic(
+    store: &FlatFile,
+    upper: &RamNode,
+    cfg: &Config,
+    groups: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    batched: bool,
+) -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
+    let cand: std::collections::HashSet<u64> = {
+        let touched: std::collections::HashSet<u64> =
+            groups.iter().map(|(p, _, _)| p.unit as u64 / REGION_UNITS).collect();
+        store
+            .seg
+            .lock()
+            .unwrap()
+            .select_opportunistic(&touched, gc_opp_util())
+            .into_iter()
+            .collect()
+    };
+    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>> =
+        std::collections::HashMap::new();
+    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = Vec::new();
+    for g in groups {
+        let region = g.0.unit as u64 / REGION_UNITS;
+        if cand.contains(&region) {
+            by_region.entry(region).or_default().push(g.clone());
+        } else {
+            normal.push(g.clone());
+        }
+    }
+    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>)> =
+        by_region.into_iter().collect();
+    region_jobs.sort_unstable_by_key(|(r, _)| *r); // sequential region reads
+    let threads = worker_count();
+
+    std::thread::scope(|scope| -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
+        let nchunk = normal.len().div_ceil(threads).max(1);
+        let normal_handles: Vec<_> = normal
+            .chunks(nchunk)
+            .map(|c| scope.spawn(|| process_chunk_coalesced(store, cfg, c, batched)))
+            .collect();
+        let rchunk = region_jobs.len().div_ceil(threads).max(1);
+        let region_handles: Vec<_> = region_jobs
+            .chunks(rchunk.max(1))
+            .map(|rc| {
+                scope.spawn(move || -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
+                    let mut res = Vec::new();
+                    let mut rel = Vec::new();
+                    for (region, fgs) in rc {
+                        let (r, rl) = evac_and_fold_region(store, cfg, upper, *region, fgs, batched)?;
+                        res.extend(r);
+                        rel.extend(rl);
+                    }
+                    Ok((res, rel))
+                })
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        let mut reloc = Vec::new();
+        for h in normal_handles {
+            results.extend(h.join().expect("normal fold thread panicked")?);
+        }
+        for h in region_handles {
+            let (r, rl) = h.join().expect("region evac thread panicked")?;
+            results.extend(r);
+            reloc.extend(rl);
+        }
+        Ok((results, reloc))
+    })
 }
 
 fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {
