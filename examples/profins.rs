@@ -42,6 +42,20 @@ fn main() {
     }
     let wall = t.elapsed().as_secs_f64();
 
+    // One-writer device-busy: wall in read phase + write phase vs total.
+    let ow_read = stats::OW_READ_NS.load(Relaxed);
+    let ow_write = stats::OW_WRITE_NS.load(Relaxed);
+    if ow_read + ow_write > 0 {
+        let total_ns = wall * 1e9;
+        println!(
+            "\n  one-writer device: read {:.2} us/key + write {:.2} us/key = {:.0}% of wall busy ({:.0}% idle: route/install/value)",
+            ow_read as f64 / 1000.0 / n as f64,
+            ow_write as f64 / 1000.0 / n as f64,
+            (ow_read + ow_write) as f64 / total_ns * 100.0,
+            (1.0 - (ow_read + ow_write) as f64 / total_ns) * 100.0,
+        );
+    }
+
     let pa = stats::PHASE_A_NS.load(Relaxed);
     let pb = stats::PHASE_B_NS.load(Relaxed);
     let pc = stats::PHASE_C_NS.load(Relaxed);

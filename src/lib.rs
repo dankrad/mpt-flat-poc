@@ -151,6 +151,16 @@ pub mod stats {
         C_FLUSH_NS.fetch_add(flush_ns, Relaxed);
     }
 
+    /// One-writer path: wall time the device spends in the read phase (all readers)
+    /// vs the write phase (single writer). `(OW_READ_NS + OW_WRITE_NS) / total wall`
+    /// is the device-busy fraction — how close to "always reading or writing".
+    pub static OW_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static OW_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_one_writer(read_ns: u64, write_ns: u64) {
+        OW_READ_NS.fetch_add(read_ns, Relaxed);
+        OW_WRITE_NS.fetch_add(write_ns, Relaxed);
+    }
+
     pub fn on_write(total: usize) {
         WRITES.fetch_add(1, Relaxed);
         WRITE_BYTES.fetch_add(total as u64, Relaxed);
@@ -193,6 +203,8 @@ pub mod stats {
         C_INSTALL_NS.store(0, Relaxed);
         C_ROOT_NS.store(0, Relaxed);
         C_FLUSH_NS.store(0, Relaxed);
+        OW_READ_NS.store(0, Relaxed);
+        OW_WRITE_NS.store(0, Relaxed);
         W_LOCK_NS.store(0, Relaxed);
         W_PWRITE_NS.store(0, Relaxed);
         B_SERIALIZE_NS.store(0, Relaxed);
@@ -1279,7 +1291,13 @@ impl FlatMpt {
         for (key, value) in &self.overlay {
             batch.put(key, value);
         }
-        self.values.write(batch)?;
+        if wal_disabled() {
+            let mut wo = rocksdb::WriteOptions::default();
+            wo.disable_wal(true);
+            self.values.write_opt(batch, &wo)?;
+        } else {
+            self.values.write(batch)?;
+        }
         self.overlay.clear();
         Ok(())
     }
@@ -1293,6 +1311,9 @@ impl FlatMpt {
         // first (they're not serializable and would be lost on reopen).
         self.spill_mem()?;
         self.flush_values()?;
+        // With the WAL disabled, values live only in the memtable until flushed —
+        // flush them to SST so the checkpoint is durable (no-op cost when WAL is on).
+        self.values.flush()?;
         self.store.sync()?;
         let manifest = ManifestRef {
             cfg: &self.cfg,
@@ -1338,13 +1359,18 @@ impl FlatMpt {
         self.store.seg.lock().unwrap().bump_epoch();
         let t_a = std::time::Instant::now();
         // Dedup (last write wins) and compute leaf value-hashes; buffer values.
+        let sv = skip_values();
         let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
         for (key, value) in entries {
             let value_hash = hash_leaf_value(&value);
-            self.overlay.insert(key, value);
+            if !sv {
+                self.overlay.insert(key, value);
+            }
             leaves.insert(key, value_hash);
         }
-        self.flush_values()?;
+        if !sv {
+            self.flush_values()?;
+        }
         let cfg = self.cfg.clone();
 
         // RAM-build fast path: leaves live in RAM (their own `Arc`s), so there's no
@@ -1400,7 +1426,49 @@ impl FlatMpt {
         let opp = gc_opportunistic() && groups.len() >= 64;
         let results: Vec<(Key, RamChild)>;
         let reloc: Vec<(Vec<u8>, DiskPtr)>;
-        if opp {
+        if one_writer() && groups.len() >= 64 {
+            // Phase B as many parallel readers (read+fold to payloads) + ONE writer
+            // that appends them all in a single sequential `write_batch` — avoids the
+            // inter-worker append contention (concurrent appends run ~1.1 GB/s vs a
+            // single stream's ~3.5). Phased read-all-then-write-all: overlapping the
+            // two would contend for the one device. No inline GC on this path.
+            let store = &self.store;
+            let threads = worker_count();
+            let chunk = groups.len().div_ceil(threads);
+            // Read phase: all readers fold to payloads (device reading).
+            let t_read = std::time::Instant::now();
+            #[allow(clippy::type_complexity)]
+            let folded: Vec<(Vec<(Key, Hash, Vec<u8>)>, Vec<(Key, RamChild)>)> =
+                std::thread::scope(|scope| -> Result<_> {
+                    let handles: Vec<_> = groups
+                        .chunks(chunk)
+                        .map(|c| scope.spawn(|| process_chunk_fold(store, &cfg, c)))
+                        .collect();
+                    let mut out = Vec::with_capacity(handles.len());
+                    for h in handles {
+                        out.push(h.join().expect("fold reader thread panicked")?);
+                    }
+                    Ok(out)
+                })?;
+            let read_ns = t_read.elapsed().as_nanos() as u64;
+            let mut res: Vec<(Key, RamChild)> = Vec::with_capacity(groups.len());
+            let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+            for (ls, prom) in folded {
+                res.extend(prom);
+                leaves.extend(ls);
+            }
+            // Write phase: one big sequential `write_batch` of every new leaf.
+            let t_write = std::time::Instant::now();
+            let payloads: Vec<&[u8]> = leaves.iter().map(|(_, _, p)| p.as_slice()).collect();
+            let ptrs = store.write_batch(&payloads)?;
+            let write_ns = t_write.elapsed().as_nanos() as u64;
+            stats::on_one_writer(read_ns, write_ns);
+            for ((rep, root, _), ptr) in leaves.iter().zip(ptrs) {
+                res.push((*rep, RamChild::Disk { ptr, root: *root }));
+            }
+            results = res;
+            reloc = Vec::new();
+        } else if opp {
             let (res, rl) = process_opportunistic(&self.store, &self.upper, &cfg, &groups, batched)?;
             stats::on_gc(0, rl.len() as u64, 0);
             results = res;
@@ -2320,6 +2388,35 @@ fn batched_writes() -> bool {
     *ON.get_or_init(|| std::env::var("MPT_BATCHED_WRITES").ok().as_deref() != Some("0"))
 }
 
+/// `MPT_ONE_WRITER=1`: split the disk batch path into many parallel readers that
+/// read+fold leaves into payloads, then ONE writer that appends them all in a
+/// single sequential `write_batch`. N concurrent appends contend on the file and
+/// run *slower* than one stream (~1.1 vs ~3.5 GB/s measured), so funnelling the
+/// writes through one stream is ~1.5x faster overall. Phased (read-all then
+/// write-all) beats overlapping them — both share the one device. No inline GC yet.
+fn one_writer() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_ONE_WRITER").as_deref() == Ok("1"))
+}
+
+/// `MPT_SKIP_VALUES=1` — diagnostic: skip the RocksDB value writes. (run) −
+/// (run with skip-values) isolates the value-store cost.
+fn skip_values() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_SKIP_VALUES").as_deref() == Ok("1"))
+}
+
+/// `MPT_NO_WAL=1`: write values with the WAL disabled. Durability then rests on the
+/// checkpoint (`persist` flushes the memtable to SST + fsyncs) — the same recovery
+/// model as the flat file's manifest. Removes the per-batch WAL serialize + write.
+fn wal_disabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_NO_WAL").as_deref() == Ok("1"))
+}
+
 /// Whether the disk batch path sorts groups by file offset and reads them via
 /// coalesced multi-MB spans (the sequential-merge fold). On by default;
 /// `MPT_FOLD=0` reverts to the original unsorted per-leaf `pread` path for A/B.
@@ -2568,6 +2665,49 @@ fn process_chunk_coalesced(
     }
     flush_leaf_batch(store, &mut pending, &mut out)?;
     Ok(out)
+}
+
+/// Reader stage for the one-writer path: same coalesced span reads + fold as
+/// `process_chunk_coalesced`, but instead of writing each new leaf it returns its
+/// `(rep, root, payload)` for a single downstream writer to append sequentially —
+/// concurrent appends from many workers contend and run slower than one stream.
+/// (`fold_group` still frees the old record — cheap, uncontended.) Promotions are
+/// written in-stage (rare) and returned as finished `RamChild`s.
+#[allow(clippy::type_complexity)]
+fn process_chunk_fold(
+    store: &FlatFile,
+    cfg: &Config,
+    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+) -> Result<(Vec<(Key, Hash, Vec<u8>)>, Vec<(Key, RamChild)>)> {
+    let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+    let mut promoted: Vec<(Key, RamChild)> = Vec::new();
+    let rec_end = |p: &DiskPtr| p.offset() + RECORD_HDR as u64 + p.len as u64;
+    let mut i = 0;
+    while i < chunk.len() {
+        let start = chunk[i].0.offset();
+        let mut j = i;
+        while j + 1 < chunk.len() {
+            let gap = chunk[j + 1].0.offset().saturating_sub(rec_end(&chunk[j].0));
+            if gap > FOLD_MAX_GAP || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
+                break;
+            }
+            j += 1;
+        }
+        let span_len = (rec_end(&chunk[j].0) - start) as usize;
+        let t = std::time::Instant::now();
+        let span: Arc<[u8]> = Arc::from(store.read_payload(start, span_len)?);
+        stats::on_read_io(t.elapsed().as_nanos() as u64);
+        for (ptr, rep, keys) in &chunk[i..=j] {
+            let rel = (ptr.offset() - start) as usize + RECORD_HDR as usize;
+            let subtree = deserialize_subtree_lazy_at(span.clone(), rel, ptr.len as usize)?;
+            match fold_group(store, cfg, *ptr, subtree, keys, 0)? {
+                GroupOut::Promoted(rc) => promoted.push((*rep, rc)),
+                GroupOut::Leaf { payload, root } => leaves.push((*rep, root, payload)),
+            }
+        }
+        i = j + 1;
+    }
+    Ok((leaves, promoted))
 }
 
 /// Process a chunk of groups, returning the replacement `(rep_key, RamChild)` for
