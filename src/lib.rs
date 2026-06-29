@@ -1406,9 +1406,8 @@ impl FlatMpt {
         let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
         // Sort by file offset so each worker's chunk is a contiguous file range and
         // reads ascend in place — turning the per-leaf random reads into sequential
-        // ones, and letting the bulk path coalesce neighbours into one big read.
+        // ones, and letting large batches coalesce neighbours into one big read.
         let coalesce = fold_coalesce();
-        let bulk = coalesce && groups.len() >= FOLD_BULK_GROUPS;
         if coalesce && groups.len() >= 64 {
             groups.sort_unstable_by_key(|(ptr, _, _)| ptr.unit);
         }
@@ -1524,7 +1523,10 @@ impl FlatMpt {
             let fg_units: std::collections::HashSet<u32> =
                 groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
             let t_gc = std::time::Instant::now();
-            let r = if bulk { 0 } else { self.gc_rate() };
+            // GC runs every batch (including large/coalesced ones) so the file stays
+            // bounded; `MPT_GC_DISABLE=1` turns it off explicitly for one-shot bulk
+            // loads that don't care about reclaim.
+            let r = self.gc_rate();
             let victims = self.store.seg.lock().unwrap().select_victims(r);
             reloc = if victims.is_empty() {
                 Vec::new()
@@ -1580,6 +1582,18 @@ impl FlatMpt {
         let mut buckets: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
         for (key, vh) in leaves {
             buckets[nibble_at(&key, 0) as usize].push((key, vh));
+        }
+        // Fan the top into a 16-way branch with a single serial insert if it isn't
+        // one yet, so the *rest* of even the first batch takes the parallel path.
+        // Without this, a fresh build runs its entire first batch serially (a 100M
+        // first batch = minutes on one core) just to bootstrap the top branch.
+        if !matches!(self.upper, RamNode::Branch { .. }) {
+            for b in buckets.iter_mut() {
+                if let Some((key, vh)) = b.pop() {
+                    insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, vh, true)?;
+                    break;
+                }
+            }
         }
         if matches!(self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
@@ -2388,20 +2402,17 @@ enum GroupOut {
 /// splits a flush so no single `pwrite` exceeds one region (`REGION_PAGES`).
 const BATCH_LEAVES: usize = 8;
 
-/// Bulk-fold (sequential merge) tuning. When a batch touches many leaves, the
-/// disk path sorts the per-leaf groups by file offset and reads consecutive ones
-/// in a single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
+/// Fold (sequential-merge) tuning. When a batch touches many leaves, the disk
+/// path sorts the per-leaf groups by file offset and reads consecutive ones in a
+/// single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
 /// ≤ `FOLD_MAX_GAP`. Dense runs are thus read a whole region at a time (sequential
-/// bandwidth, ~13 GB/s) instead of one random `pread` per leaf; sparse runs fall
-/// back to ~per-record reads automatically (the next leaf is too far to coalesce).
-/// All leaves in a span share one buffer `Arc` and parse zero-copy. At/above
-/// `FOLD_BULK_GROUPS` touched leaves the inline GC is skipped — a bulk merge is
-/// already rewriting most of the live set, so concurrent random evacuation only
-/// fights the sequential pass.
+/// bandwidth) instead of one random `pread` per leaf; sparse runs fall back to
+/// ~per-record reads automatically (the next leaf is too far to coalesce). All
+/// leaves in a span share one buffer `Arc` and parse zero-copy. Inline GC runs on
+/// every batch regardless of size (use `MPT_GC_DISABLE=1` for gc-off bulk loads).
 const FOLD_SPAN_BYTES: u64 = 8 << 20; // ≤ 8 MiB per coalesced read
 const FOLD_MAX_GAP: u64 = 1 << 20; // coalesce across gaps ≤ 1 MiB
-const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the bulk write path
-const FOLD_BULK_GROUPS: usize = 1 << 16; // ≥ this many groups ⇒ bulk merge (skip GC)
+const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the batched write path
 
 /// Whether to coalesce leaf writes into batched `pwrite`s. The append allocator
 /// places every write sequentially regardless; batching just cuts syscalls. On by
@@ -2519,7 +2530,25 @@ fn value_db_opts() -> (Options, Cache) {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.set_block_based_table_factory(&bbt);
-    opts.set_db_write_buffer_size(1 << 30); // ~1 GiB total across memtables
+    // Bulk-load tuning for the value store. The build's dominant serial cost used
+    // to be `flush_values`: writing one big value `WriteBatch` per insert batch
+    // into the default skiplist memtable, which pays ~1.9 us/value of cache-miss-
+    // heavy random inserts and gets *worse* as the memtable grows (so big batches
+    // hurt — a 100M-key batch was ~37 us/key). The vector memtable makes the write
+    // path an O(1) append and defers the sort to the background flush, cutting the
+    // value flush ~20x (to ~0.1 us/key). Its poor point-read performance never
+    // matters here: values are write-only during the build. The remaining knobs
+    // give it plural memtables + parallel background jobs so flushes stay off the
+    // write path, and a relaxed L0 trigger so the bulk load never throttles.
+    opts.set_allow_concurrent_memtable_write(false); // required by the vector rep
+    opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
+    opts.set_write_buffer_size(256 << 20); // 256 MiB memtables (flush often, in bg)
+    opts.set_max_write_buffer_number(6); // plenty buffered while bg threads flush
+    opts.set_min_write_buffer_number_to_merge(1);
+    opts.set_max_background_jobs(8); // parallel flush + compaction
+    opts.set_max_subcompactions(4);
+    opts.set_level_zero_slowdown_writes_trigger(-1); // don't slow down on L0 buildup
+    opts.set_level_zero_stop_writes_trigger(1 << 20); // effectively never stop
     (opts, cache)
 }
 

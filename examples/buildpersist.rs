@@ -33,13 +33,17 @@ fn main() {
     let cfg = Config { target_leaf_bytes: max / 2, max_leaf_bytes: max, min_promote_bytes: max / 2 };
 
     let mut db = FlatMpt::create(&path, cfg).unwrap();
-    const B: u64 = 10_000;
+    // Insert batch size. Large batches let the disk-tail fold coalesce its reads
+    // into big sequential ones (much faster than 10k-sparse); GC still runs so the
+    // file stays bounded. MPT_BUILD_BATCH overrides (default 1M).
+    let b: u64 = std::env::var("MPT_BUILD_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    eprintln!("batch = {b}");
     let t = Instant::now();
     let mut last = Instant::now();
-    let mut buf: Vec<(Key, Vec<u8>)> = Vec::with_capacity(B as usize);
+    let mut buf: Vec<(Key, Vec<u8>)> = Vec::with_capacity(b.min(10_000_000) as usize);
     for i in 0..n {
         buf.push((key(i), vec![0u8; 32]));
-        if buf.len() as u64 == B {
+        if buf.len() as u64 == b {
             db.insert_batch(std::mem::take(&mut buf)).unwrap();
         }
         if (i + 1) % 10_000_000 == 0 {

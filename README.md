@@ -82,7 +82,11 @@ dense packing cut the 1B file from 256 → ~154 GiB.)
 The trie only ever manipulates a `value_hash` (keccak of the value); the real
 bytes live in an embedded RocksDB in `<flatfile>.values/`. Inserts buffer values
 in a RAM overlay and flush them as one `WriteBatch`; `get_value` checks the
-overlay first so reads see the latest write.
+overlay first so reads see the latest write. The store is tuned for write-only
+bulk load (`value_db_opts`): a **vector memtable** makes the flush an O(1) append
+(the sort is deferred to the background SST flush), which cut the value flush ~20×
+— it was the build's dominant serial cost with the default skiplist memtable
+(~1.9 µs/value of cache-miss-heavy random inserts, *worse* as the memtable grows).
 
 ### Persistence (`persist` / `open`, the `.meta` manifest)
 The flat file and value store hold the data, but the *index* tying them together
@@ -109,10 +113,15 @@ writable trie (cached hashes and all). A crash reopens at the last checkpoint.
    the root once.
 
 **RAM-build mode** (`MPT_RAM_BUILD=1`, used by `build-tree.sh`): new/rewritten
-leaves live in RAM as their own `Arc`s with no flat-file I/O or GC — ~1.8 µs/key.
-When the process footprint crosses a threshold it **spills** the leaves to disk
-and reverts to the disk path. This makes building huge trees fast: the first
-several hundred million keys are pure-RAM.
+leaves live in RAM as their own `Arc`s with no flat-file I/O or GC. The batch is
+partitioned by top nibble and the insert is **fanned across the top branch's 16
+disjoint child subtrees** (one thread each, no shared store, no lock); a fresh
+tree is bootstrapped into a 16-way branch with a single serial insert so even the
+first batch parallelizes. When the process footprint crosses a threshold it
+**spills** the leaves to disk and reverts to the disk path. Building huge trees is
+fast: a 1B-key tree (16 KiB leaves, 100M-key batches) builds in ~1420 s (~1.4
+µs/key) — pure-RAM until the spill (~500M keys at a 70 GiB ceiling), then the disk
+path with bounded GC (~7 GiB flat growth per 100M-key batch).
 
 **The disk path** has been profiled and tuned (see **Tuning**); the headline
 findings: per-key compute is hidden under read I/O, reads are near the device
