@@ -1,14 +1,37 @@
 # mpt-flat-poc
 
 A proof-of-concept **Merkle Patricia Trie (MPT)** with a *flat* storage layout: a
-small in-RAM "frontier" of the trie sits on top of larger **subtrees serialized
-into a single flat file**, while the actual key→value payloads live in an
-embedded **RocksDB** store. It explores how to keep an authenticated key/value
-trie mostly on disk while bounding RAM usage and keeping per-insert hashing
-work proportional to what actually changed.
+small in-RAM "frontier" of the trie sits on top of larger **subtrees packed into a
+single flat file**, while the actual key→value payloads live in an embedded
+**RocksDB** store. It explores how to keep an authenticated key/value trie mostly
+on disk while bounding RAM, keeping per-insert hashing proportional to what
+actually changed, and building/updating trees of ~10⁹ keys fast.
 
 This is a benchmarking/learning artifact, not a production database. Keys are
 fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
+
+---
+
+## Quick start
+
+```bash
+# Build a tree of any size to a reopenable checkpoint (RAM-build, spills to disk):
+scripts/build-tree.sh /data/tree.flat 1000000000
+
+# Benchmark batch inserts into it (on a throwaway clone; prints us/key):
+scripts/batch-bench.sh /data/tree.flat 10000000 10000
+
+# Grow it by N more keys and re-checkpoint in place:
+scripts/grow-tree.sh /data/tree.flat 100000000
+```
+
+A checkpoint is three siblings: `tree.flat` (packed subtrees), `tree.flat.meta`
+(the manifest/index), and `tree.flat.values/` (RocksDB). Reopen with
+`FlatMpt::open`. The scripts auto-build the needed binaries and set good default
+tuning; every knob is overridable via the environment (see **Tuning** below).
+
+> **Disk note:** run with `$TMPDIR`/output on a real SSD, not tmpfs. A 1B-key tree
+> is ~150 GiB flat + ~33 GiB values.
 
 ---
 
@@ -17,106 +40,124 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
 ```
                     FlatMpt (src/lib.rs)
    ┌───────────────────────────────────────────────────────────┐
-   │                                                             │
    │   upper: RamNode            ← in-RAM trie "frontier"        │
-   │   ┌───────────┐               (Branch / Extension nodes,    │
-   │   │  Branch   │                each caching its own hash)   │
+   │   ┌───────────┐               (Branch / Extension, each     │
+   │   │  Branch   │                caching its own hash)        │
    │   └─────┬─────┘                                             │
-   │      ┌──┴───────────┐                                       │
-   │  RamChild::Disk   RamChild::Ram                             │
-   │   { ptr, root }     (Box<RamNode>)                          │
+   │     ┌───┴────────────┬───────────────┐                     │
+   │  RamChild::Disk   RamChild::Ram   RamChild::Mem             │
+   │   {ptr, root}     (Box<RamNode>)   (Arc<[u8]>, RAM-build)   │
    │        │                                                    │
    └────────┼────────────────────────────────────────────────-─┘
-            │ DiskPtr { offset, len }
+            │ DiskPtr { unit, len }   (256 B-aligned)
             ▼
    store: FlatFile  ──────────────────────  values: rocksdb::DB
    ┌──────────────────────────────┐         ┌──────────────────────┐
-   │ flat file of DiskSubtree      │         │  key → value bytes    │
-   │ records  [len][compact bytes] │         │  (the trie only ever  │
-   │ + FreeList (reuse of holes)   │         │   stores value_hash)  │
+   │ 128 KiB regions of records    │         │  key → value bytes    │
+   │ [len][compact subtree], dense │         │  (the trie only ever  │
+   │ 256 B packing + region GC     │         │   stores value_hash)  │
    └──────────────────────────────┘         └──────────────────────┘
 ```
 
-There are **three storage tiers**, each with a distinct job:
+Three storage tiers:
 
 ### 1. The RAM frontier (`RamNode` / `upper`)
-The top of the trie is held in memory. Its nodes are `Branch` (16-way) and
-`Extension` (shared-nibble path) — the same shapes as a classic MPT. A branch
-slot points either to another in-RAM node (`RamChild::Ram`) or to a subtree that
-has been pushed to disk (`RamChild::Disk`, holding a `DiskPtr`, the subtree's
-cached `root` hash, and its byte size).
-
-The frontier stays small on purpose: large subtrees are written to disk and
-represented by a single `RamChild::Disk` pointer. `ram_nodes()` reports the
-current frontier size, and several tests assert it stays bounded.
+The top of the trie is held in memory as `Branch` (16-way) and `Extension`
+(shared-nibble) nodes, each caching its Merkle hash. A branch slot points to
+another in-RAM node (`RamChild::Ram`), to a disk-resident subtree
+(`RamChild::Disk { ptr, root }`), or — during a RAM build — to an in-RAM leaf
+held as its own `Arc<[u8]>` (`RamChild::Mem`). The frontier stays bounded (~0.9
+B/key at 1B): large subtrees live on disk behind a single pointer.
 
 ### 2. The flat file (`FlatFile` / `store`)
-Disk subtrees are compact-encoded `DiskSubtree` records appended to one flat file
-as `[len: u32][payload]`. A `DiskPtr { offset, len }` addresses a record. The
-payload keeps the subtree's cached Merkle hashes, but avoids bincode's enum,
-`Vec`, `Option`, and `Box` overhead for the hot disk records.
-
-Crucially, the file is **not** purely append-only: a `FreeList` tracks regions
-vacated by rewritten/split subtrees. New writes prefer a best-fit free region
-(splitting off any remainder) and only extend the file when nothing fits; freed
-regions are coalesced with their neighbours. This keeps the file from growing
-unboundedly as the same keys are overwritten.
+Disk subtrees are compact-encoded `DiskSubtree` records (`[u32 len][payload]`),
+**densely packed at 256 B-aligned offsets** (a `DiskPtr { unit, len }` addresses
+one). The file is a sequence of **128 KiB regions**; a log-structured allocator
+appends records and an inline, self-tuning **garbage collector** evacuates the
+emptiest regions to reclaim space, so the file doesn't grow unboundedly under
+overwrite/split churn. (Earlier the records were 1-page-padded with a free-list;
+dense packing cut the 1B file from 256 → ~154 GiB.)
 
 ### 3. The value store (`rocksdb::DB` / `values`)
-The trie itself only ever manipulates a `value_hash` (a keccak of the value).
-The real value bytes are kept in an embedded RocksDB instance that lives in a
-sibling `<flatfile>.values` directory. Inserts buffer values in a small RAM
-overlay and flush them to RocksDB as a single `WriteBatch` every `VALUE_BATCH`
-inserts (and on `flush`/`persist`); `get_value` consults the overlay first, so
-reads always observe the latest write. Batching the writes is ~10% faster than
-one `put` per insert.
+The trie only ever manipulates a `value_hash` (keccak of the value); the real
+bytes live in an embedded RocksDB in `<flatfile>.values/`. Inserts buffer values
+in a RAM overlay and flush them as one `WriteBatch`; `get_value` checks the
+overlay first so reads see the latest write.
 
-### Persistence (`persist` / `open` and the `.meta` manifest)
-The flat file and value store hold their data on disk, but the *index* tying
-them together — the `upper` frontier (structure, disk pointers, cached hashes),
-the `FreeList`, and the high-water `end` — lives only in RAM. `persist()`
-checkpoints that index into a sibling `<flatfile>.meta` manifest: it fsyncs the
-flat file, then writes the bincode-serialized `Manifest` atomically (temp file +
-rename). `open(path)` reverses this — it loads the manifest and **reattaches** to
-the existing flat file and RocksDB without truncating them, fully restoring a
-writable trie (cached hashes and all). `create()` remains the from-scratch path
-(it truncates the flat file and recreates the value store).
+### Persistence (`persist` / `open`, the `.meta` manifest)
+The flat file and value store hold the data, but the *index* tying them together
+— the frontier (structure, disk pointers, cached hashes) and the allocator's
+high-water mark — lives in RAM. `persist()` checkpoints it: it spills any in-RAM
+(`Mem`) leaves to the flat file, flushes the RocksDB memtable to SST, fsyncs the
+flat file, then writes the bincode `Manifest` atomically (temp + rename).
+`open(path)` reattaches to the existing files without truncating, restoring a
+writable trie (cached hashes and all). A crash reopens at the last checkpoint.
 
 ---
 
-## How an insert flows
+## How inserts flow
 
-`FlatMpt::insert(key, value)`:
+`insert_batch(entries)` is the workhorse (single `insert` is a 1-element batch):
 
-1. `value_hash = hash_leaf_value(value)`, then buffer `key -> value` in the RAM
-   overlay (flushed to RocksDB in `WriteBatch` chunks).
-2. `insert_ram` walks/mutates the RAM frontier down to the relevant branch slot:
-   - **Empty slot** → create a single-entry `DiskSubtree`, write it, install a `RamChild::Disk`.
-   - **`RamChild::Disk`** → read the subtree, **incrementally insert** the new
-     entry into its `Node` tree (`node_insert`), and either rewrite it in place
-     (reusing freed space) or, if it exceeds `Config::max_leaf_bytes`,
-     `split_subtree` it back up into the RAM frontier.
-   - **`RamChild::Ram`** → recurse.
-3. `store.flush()` and return the new root via `root()`.
+1. **Phase A (route):** hash each value, buffer it for RocksDB, and walk the RAM
+   frontier to find the disk leaf each key lands in, grouping keys per leaf.
+2. **Phase B (per-leaf, parallel):** each group reads its leaf record, applies
+   its keys (`record_node_insert` — re-hashing only the touched path), and either
+   rewrites the leaf or, if it exceeds `max_leaf_bytes`, **promotes** it into more
+   frontier structure.
+3. **Phase C (install):** splice the new records into the frontier and recompute
+   the root once.
 
-### Hashing & memoization (why per-insert hashing is "essential")
-Recomputing the whole trie hash on every insert is the naive cost. This PoC
-avoids it on both tiers:
+**RAM-build mode** (`MPT_RAM_BUILD=1`, used by `build-tree.sh`): new/rewritten
+leaves live in RAM as their own `Arc`s with no flat-file I/O or GC — ~1.8 µs/key.
+When the process footprint crosses a threshold it **spills** the leaves to disk
+and reverts to the disk path. This makes building huge trees fast: the first
+several hundred million keys are pure-RAM.
 
-- **Disk subtrees:** every `Node` caches its own Merkle hash, computed once at
-  construction (`make_leaf` / `make_extension` / `make_branch`) and serialized to
-  disk. `node_insert` mutates a subtree in place and recomputes hashes **only
-  along the changed root-to-leaf path**; untouched sibling subtrees are reused
-  verbatim with their cached hashes.
-- **RAM frontier:** `RamNode` caches its hash in a `Cell`. An insert calls
-  `invalidate_ram` as it descends, clearing caches only on the touched path;
-  `hash_ram`/`root` then recompute just those and reuse the rest. Disk children
-  contribute their already-cached `root`, so they're never re-hashed.
-- The empty-node hash `keccak(&[0])` is a constant, computed once (`empty_hash`).
+**The disk path** has been profiled and tuned (see **Tuning**); the headline
+findings: per-key compute is hidden under read I/O, reads are near the device
+limit, and the real costs are *write-append contention* (fixed by a single
+sequential writer) and the *synchronous value write* (hidden by overlapping it
+with reads).
 
-The net effect: a steady-state insert performs only the keccak calls that are
-genuinely new (≈ path length), not a count that scales with subtree size. The
-`hashaudit` example verifies this empirically (0% redundant hashing).
+### Hashing & memoization
+Recomputing the whole trie hash per insert is the naive cost; this PoC avoids it.
+Records are parsed **lazily** — untouched child subtrees stay `Raw` (zero-copy
+slices) with their cached hashes reused — so an insert re-hashes only the
+root-to-leaf path it changed, *independent of leaf size*. The RAM frontier caches
+each node's hash in a `Cell` and invalidates only the touched path. Net: a
+steady-state insert performs ≈ path-length keccak calls, not a count that scales
+with subtree size.
+
+---
+
+## Performance & tuning
+
+Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
+`dense-pack-gc`:
+
+- **1B-key build** (`build-tree.sh`): ~1.8 µs/key in the RAM phase; a full 1B
+  build that spills mid-way completes in ~2 h (2.4× the pure-disk build).
+- **10k-batch inserts into the out-of-RAM 1B tree:** the tuning below took it
+  from ~10.5 → ~5.8 µs/key (**~1.8×**), at which point the device is ~82% busy.
+
+### Tuning knobs (environment variables)
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `MPT_WORKERS` | `min(cores,8)` | Phase-B read queue depth. **64** is a good value for out-of-RAM (random-read) workloads; the default 8 is too low. |
+| `MPT_FOLD` | on | Sort the per-leaf groups by file offset and read them in coalesced multi-MB spans (sequential I/O). ~2.5× on the disk path; `=0` reverts to random per-leaf reads. |
+| `MPT_GC_OPP` / `MPT_GC_OPP_UTIL` | off / 0.30 | Opportunistic GC: evacuate only the touched, under-util regions, fused into the foreground read. Sustainable bounded file at lower cost than the global cost-benefit GC. |
+| `MPT_ONE_WRITER` | off | Many parallel readers fold leaves → payloads; **one** writer appends them in a single sequential `write_batch`. Removes inter-worker append contention (64 concurrent appends hit ~1.1 GB/s vs one stream's ~3.5). ~1.5×. **Skips inline GC** — for bulk/gc-off use. |
+| `MPT_NO_WAL` | off | Write values with the RocksDB WAL disabled; durability via `persist`'s memtable flush (same model as the manifest). |
+| `MPT_ASYNC_VALUES` | off | (one-writer path) write the batch's values on a thread concurrent with Phase B, joined per batch — hides the value-write CPU under the I/O-bound reads. Pair with `MPT_NO_WAL`. |
+| `MPT_RAM_BUILD` / `MPT_RAM_BUILD_GIB` | off / 85·45 | RAM-build mode and its spill threshold (GiB; macOS/Linux defaults). |
+| `MAX_LEAF_KIB` | 16 | Leaf-size target (build time); sets `Config`. |
+| `MPT_DIRECT_IO` | off | O_DIRECT/F_NOCACHE reads. **Loses** here (bypasses cache hits + readahead). |
+
+> The one-writer / no-WAL / async-values flags are **opt-in**; the default path is
+> unchanged. `build-tree.sh` enables RAM-build + no-WAL; `batch-bench.sh` enables
+> the full fast path; `grow-tree.sh` defaults to the bounded (GC-on) path.
 
 ---
 
@@ -124,95 +165,72 @@ genuinely new (≈ path length), not a count that scales with subtree size. The
 
 | Path | What it does |
 |------|--------------|
-| [`src/lib.rs`](src/lib.rs) | The entire engine. See the component map below. |
-| [`benches/insert.rs`](benches/insert.rs) | Criterion throughput benchmark — 1000 inserts under random, sequential-hashed, and shared-prefix key distributions. Run with `cargo bench --bench insert`. |
-| [`benches/profile.rs`](benches/profile.rs) | Wall-clock **attribution** benchmark: splits insert/read time across hashing, (de)serialization, file IO, flush, and RocksDB. Run with `cargo bench --bench profile --features profiling`. |
-| [`benches/large.rs`](benches/large.rs) | Steady-state benchmark: preload N keys (`LARGE_PRELOAD`, optional `LARGE_BATCH`/`LARGE_MAX_LEAF_KIB`), then time new inserts + overwrites, logging per-10M stats. Easiest via the script below. |
-| [`examples/hashcount.rs`](examples/hashcount.rs) | Diagnostic: prints keccak calls per individual insert, showing how hashing scales. `cargo run --release --example hashcount --features profiling`. |
-| [`examples/hashaudit.rs`](examples/hashaudit.rs) | Diagnostic: classifies each keccak call of an insert as essential / recomputed-unchanged / duplicate, to prove hashing is minimal. `cargo run --release --example hashaudit --features profiling`. |
-| [`examples/diskusage.rs`](examples/diskusage.rs) | Diagnostic: reports the flat-file index footprint (bytes/entry) for N inserts. `cargo run --release --example diskusage [N]`. |
-| [`examples/sizecheck.rs`](examples/sizecheck.rs) | Diagnostic: reports flat-file length/free bytes/RAM nodes for the three benchmark key distributions. `cargo run --release --example sizecheck`. |
-| [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` with env knobs (`PRELOAD`, `BATCH`, `MAX_LEAF_KIB`, `PROFILE`); documents prereqs and the `TMPDIR`-must-be-a-real-disk caveat for large runs. |
-| [`Cargo.toml`](Cargo.toml) | Dependencies and the `profiling` feature flag. |
+| [`src/lib.rs`](src/lib.rs) | The entire engine (see the component map below). |
+| [`scripts/build-tree.sh`](scripts/build-tree.sh) | **Fast-build a tree of any size** → checkpoint (RAM-build + spill). |
+| [`scripts/batch-bench.sh`](scripts/batch-bench.sh) | **Benchmark batch inserts** into a tree, on a throwaway COW clone; prints us/key. |
+| [`scripts/grow-tree.sh`](scripts/grow-tree.sh) | **Grow a tree** by N more keys and re-checkpoint it in place. |
+| [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` (preload + timed inserts/overwrites); documents prereqs. |
+| [`examples/buildpersist.rs`](examples/buildpersist.rs) | Build N keys (RAM-build aware) + persist, no post-phases; per-10M rate + footprint. Driven by `build-tree.sh`. |
+| [`examples/foldbench.rs`](examples/foldbench.rs) | Insert N keys into an existing checkpoint in batches; per-batch + overall us/key; `MPT_PERSIST=1` to checkpoint. Driven by `batch-bench.sh` / `grow-tree.sh`. |
+| [`examples/profins.rs`](examples/profins.rs) | Profiling harness: per-phase + device-busy breakdown of batch inserts (read/write/value), for tuning. |
+| [`examples/reopen.rs`](examples/reopen.rs) | Reopen a checkpoint and exercise reads/`disk_accesses_for_key`. |
+| [`examples/iops.rs`](examples/iops.rs) | Device characterization: random/sequential read+write IOPS & bandwidth (O_DIRECT) and mmap reads, across block size / thread count. |
+| [`examples/hashaudit.rs`](examples/hashaudit.rs), [`hashcount.rs`](examples/hashcount.rs) | Diagnostics: prove per-insert hashing is minimal (`--features profiling`). |
+| [`examples/diskusage.rs`](examples/diskusage.rs), [`sizecheck.rs`](examples/sizecheck.rs), [`batchcheck.rs`](examples/batchcheck.rs) | Diagnostics: index footprint, file/free/RAM sizing, batch-vs-one-by-one parity. |
+| [`benches/insert.rs`](benches/insert.rs) | Criterion throughput (random / sequential / shared-prefix). |
+| [`benches/profile.rs`](benches/profile.rs) | Wall-clock attribution (`--features profiling`). |
+| [`benches/large.rs`](benches/large.rs) | Steady-state preload + inserts/overwrites with per-10M stats. |
 
 ### `src/lib.rs` component map
 
-Public API and types:
-- **`FlatMpt`** — the top-level database. Fields: `cfg`, `store` (`FlatFile`),
-  `upper` (`RamNode`), `values` (`rocksdb::DB`).
-  - `create(path, cfg)` — fresh DB (truncates the flat file, recreates the value store).
-  - `open(path)` — reopen a previously `persist`ed DB (reattaches, no truncation).
-  - `persist()` — checkpoint the RAM frontier + free list to the `.meta` manifest.
-  - `flush()` — flush buffered values to RocksDB without a full checkpoint.
-  - `insert(key, value) -> Hash` — insert/overwrite, returns the new root.
-  - `get_value(key) -> Result<Option<Vec<u8>>>` — read from RocksDB.
-  - `root() -> Hash` — memoized Merkle root of the whole trie.
-  - `ram_nodes()`, `flat_file_len()`, `free_bytes()`, `free_regions()`,
-    `disk_accesses_for_key()` — observability helpers used by tests/benches.
-- **`Config`** — leaf-size thresholds: `target_leaf_bytes`, `max_leaf_bytes`
-  (rewrite vs. split), `min_promote_bytes` (promote to its own disk record vs.
-  fold into a remainder).
-- **`Hash` / `Key`** — `[u8; 32]` aliases. **`DiskPtr`** — `{ offset, len }`.
-- **`prof`** — opt-in (`--features profiling`) wall-clock attribution + a keccak
-  audit hook. Compiles to zero-cost no-ops when the feature is off.
-
-Internal storage:
-- **`FreeList`** — coalescing, best-fit allocator over freed flat-file regions.
-- **`FlatFile`** — the flat file plus its `FreeList` and high-water `end`;
-  `write_payload` / `read` / `free` / `flush` / `sync` of `DiskSubtree` records.
-- **`Manifest` / `ManifestRef`** — the serialized checkpoint (`cfg` + `upper` +
-  `free` + `end`) read/written by `open` / `persist` via the `.meta` sidecar.
-
-Internal trie:
-- **`Node`** (`Empty` / `Leaf` / `Extension` / `Branch`) — a disk subtree's
-  Merkle structure; each non-trivial variant caches its `hash`. Serialized.
-- **`DiskSubtree`** — `{ prefix, node }`: the compact-encoded node plus the
-  nibble prefix it is rooted at. Splits derive `(Key, value_hash)` entries from
-  the node on demand.
-- **`RamChild`** — `Ram(Box<RamNode>)` or `Disk { ptr, root, bytes }`.
-- **`RamNode`** (`Empty` / `Extension` / `Branch`) — RAM frontier nodes with a
-  `Cell`-cached hash.
-
-Key functions:
-- `insert_ram` — frontier walk/mutation; `invalidate_ram` clears path caches.
-- `node_insert` — incremental insertion into a disk `Node` (path-only re-hash).
-- `build_node` / `make_*` / `single_entry_node` — canonical node construction
-  with hash caching.
-- `split_subtree` — turn an oversized disk leaf back into a RAM branch frontier.
-- `hash_ram` / `hash_node` / `hash_join` / `hash_leaf_value` / `keccak` /
-  `empty_hash` — the hashing layer (keccak-256).
+- **`FlatMpt`** — top-level DB. `create` / `open` / `persist` / `flush` /
+  `insert` / `insert_batch` / `get_value` / `root`, plus observability helpers
+  (`ram_nodes`, `flat_file_len`, `free_bytes`, `disk_accesses_for_key`).
+  `process_footprint_bytes()` reports the true committed footprint (counts
+  compressed/swapped memory — drives the RAM-build spill).
+- **`Config`** — `target_leaf_bytes` / `max_leaf_bytes` / `min_promote_bytes`.
+- **`Hash` / `Key`** = `[u8; 32]`; **`DiskPtr` `{ unit, len }`** (256 B units).
+- **`FlatFile`** — the flat file + `RegionAlloc` (log-structured 128 KiB-region
+  allocator with per-region liveness); `read_payload` / `write_payload` /
+  `write_batch` / `free` / region GC (`select_victims` / `evacuate_regions`).
+- **`RamNode`** (`Empty`/`Extension`/`Branch`) + **`RamChild`** (`Ram` / `Disk` /
+  `Mem`) — the frontier; **`Node`** / **`DiskSubtree`** — a disk subtree's Merkle
+  structure (lazily parsed; `Raw` children stay zero-copy).
+- Insert internals: `insert_batch` (Phase A/B/C), `process_chunk_coalesced` /
+  `process_chunk_fold` (readers), `fold_group`, `record_node_insert`,
+  `promote_record_to_ram`, `spill_mem` (RAM-build → disk), `process_opportunistic`
+  (fused GC). Hashing: `hash_node` / streaming keccak.
+- **`prof`** / **`stats`** — opt-in wall-clock attribution + always-on phase
+  counters (compile to no-ops / cheap atomics).
 
 ---
 
 ## Building & running
 
 ```bash
-cargo test                                            # unit tests (debug build also
-                                                      # cross-checks incremental vs. full rebuild)
-cargo bench --bench insert                            # throughput
-cargo bench --bench profile --features profiling      # time attribution
-cargo run --release --example hashcount --features profiling   # hashes per insert
-cargo run --release --example hashaudit --features profiling   # essential-hashing audit
+cargo test                                           # unit tests (incl. batch-vs-one-by-one,
+                                                     #   RAM-build vs disk-build root parity)
+cargo bench --bench insert                           # throughput
+cargo bench --bench profile --features profiling     # time attribution
+scripts/build-tree.sh /data/tree.flat 100000000      # build a 100M tree
+scripts/batch-bench.sh /data/tree.flat               # benchmark inserts into it
 ```
 
-The `profiling` feature gates all instrumentation; with it off (the default)
-the hot path carries no measurement overhead.
+A C/C++ toolchain + libclang is needed (RocksDB builds from source):
+`apt-get install build-essential clang libclang-dev` (Debian) / `xcode-select
+--install` (macOS).
 
 ---
 
 ## Known limitations / non-goals
 
-- **Persistence is checkpoint-based, not continuous.** The RAM frontier and free
-  list are only durable as of the last `persist()`. A crash after inserts but
-  before `persist()` reopens at the previous checkpoint (any newer flat-file
-  records are orphaned, and the value store may hold unreferenced values). There
-  is no write-ahead log for the trie index.
-- **Per-insert `flush()` is not an `fsync`** (only `persist()` fsyncs the flat
-  file). Crash durability between checkpoints is not provided.
+- **Persistence is checkpoint-based.** The frontier/index is durable only as of
+  the last `persist()`; a crash reopens at the previous checkpoint. No WAL for the
+  trie index (and `MPT_NO_WAL` extends that model to the value store).
+- **The one-writer path skips inline GC** — it's an opt-in bulk/gc-off fast path;
+  folding GC into it (so it can be the default) is a follow-up.
 - **Write amplification.** Each insert into a disk leaf rewrites the whole compact
-  subtree record. The compact format keeps this cheaper than bincode, but the
-  single-record rewrite remains the central cost of the design.
-- **Splits rebuild.** An overflowing leaf is rebuilt from its entries (its hashes
-  recomputed) — incremental hashing covers ordinary inserts, not splits.
-- **PoC value model.** Keys must be 32 bytes; values are duplicated between the
-  trie's `value_hash` and the RocksDB payload.
+  record; dense packing + the sequential writer keep it cheap, but it remains the
+  design's central write cost.
+- **PoC value model.** Keys are 32 bytes; values are duplicated between the trie's
+  `value_hash` and the RocksDB payload.

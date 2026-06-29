@@ -1,10 +1,12 @@
-//! Fold N fresh keys into an existing (disk-resident) checkpoint, in large
-//! batches, and report throughput. New keys hash uniformly across the existing
-//! 16⁶ leaves, so each batch touches ~all of them — exercising the sequential
-//! coalesced-read fold (the default) vs the old random per-leaf path (MPT_FOLD=0).
+//! Insert N fresh keys into an existing (disk-resident) checkpoint, in batches,
+//! and report per-batch + overall throughput. Used by both `batch-bench.sh`
+//! (benchmark a clone; no persist) and `grow-tree.sh` (grow the real tree;
+//! `MPT_PERSIST=1` checkpoints the result at the end). New keys hash uniformly
+//! across the trie's leaves. Tuning is via env (see README): MPT_WORKERS,
+//! MPT_ONE_WRITER, MPT_NO_WAL, MPT_ASYNC_VALUES, MPT_GC_DISABLE, MPT_FOLD.
 //!
-//!   MPT_FOLD=1 cargo run --release --example foldbench -- \
-//!       /tmp/ckpt.flat 20000000 1000000000 5000000
+//!   MPT_ONE_WRITER=1 MPT_NO_WAL=1 cargo run --release --example foldbench -- \
+//!       /path/ckpt.flat 20000000 2000000000 10000
 //!         args: <checkpoint> <n_keys> <start_index> <batch_size>
 
 use mpt_flat_poc::{FlatMpt, Key, hashed_key, hex, process_footprint_bytes};
@@ -53,9 +55,21 @@ fn main() {
         );
     }
     eprintln!(
-        "folded {n} keys in {:.1}s ({:.2} us/key)\n  root after = {}",
+        "inserted {n} keys in {:.1}s ({:.2} us/key)\n  root after = {}",
         t.elapsed().as_secs_f64(),
         t.elapsed().as_micros() as f64 / n as f64,
         hex(db.root()),
     );
+
+    // grow-tree.sh sets MPT_PERSIST=1 to checkpoint the enlarged tree; the
+    // benchmark path leaves the (cloned) checkpoint untouched.
+    if std::env::var("MPT_PERSIST").as_deref() == Ok("1") {
+        let ps = Instant::now();
+        db.persist().unwrap();
+        eprintln!(
+            "persisted in {:.1}s, flat now {:.1} GiB",
+            ps.elapsed().as_secs_f64(),
+            db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
 }
