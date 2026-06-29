@@ -1360,6 +1360,9 @@ impl FlatMpt {
         let t_a = std::time::Instant::now();
         // Dedup (last write wins) and compute leaf value-hashes; buffer values.
         let sv = skip_values();
+        // Async values (one-writer path): leave the overlay unflushed here; the
+        // one-writer branch writes it on a thread concurrent with Phase B.
+        let defer_values = async_values() && one_writer();
         let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
         for (key, value) in entries {
             let value_hash = hash_leaf_value(&value);
@@ -1368,7 +1371,7 @@ impl FlatMpt {
             }
             leaves.insert(key, value_hash);
         }
-        if !sv {
+        if !sv && !defer_values {
             self.flush_values()?;
         }
         let cfg = self.cfg.clone();
@@ -1432,7 +1435,15 @@ impl FlatMpt {
             // inter-worker append contention (concurrent appends run ~1.1 GB/s vs a
             // single stream's ~3.5). Phased read-all-then-write-all: overlapping the
             // two would contend for the one device. No inline GC on this path.
+            // Async values: hand the overlay to a worker that writes it concurrently
+            // with the reads (joined inside the scope, before the batch returns).
+            let v_overlay = if defer_values {
+                std::mem::take(&mut self.overlay)
+            } else {
+                HashMap::new()
+            };
             let store = &self.store;
+            let values = &self.values;
             let threads = worker_count();
             let chunk = groups.len().div_ceil(threads);
             // Read phase: all readers fold to payloads (device reading).
@@ -1440,6 +1451,11 @@ impl FlatMpt {
             #[allow(clippy::type_complexity)]
             let folded: Vec<(Vec<(Key, Hash, Vec<u8>)>, Vec<(Key, RamChild)>)> =
                 std::thread::scope(|scope| -> Result<_> {
+                    let vh = if !v_overlay.is_empty() {
+                        Some(scope.spawn(|| write_value_batch(values, &v_overlay)))
+                    } else {
+                        None
+                    };
                     let handles: Vec<_> = groups
                         .chunks(chunk)
                         .map(|c| scope.spawn(|| process_chunk_fold(store, &cfg, c)))
@@ -1447,6 +1463,9 @@ impl FlatMpt {
                     let mut out = Vec::with_capacity(handles.len());
                     for h in handles {
                         out.push(h.join().expect("fold reader thread panicked")?);
+                    }
+                    if let Some(vh) = vh {
+                        vh.join().expect("value writer thread panicked")?;
                     }
                     Ok(out)
                 })?;
@@ -1513,6 +1532,11 @@ impl FlatMpt {
                 evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
             };
             stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
+        }
+        // Async-values deferred the flush but the one-writer branch wasn't taken
+        // (small batch): flush now so values are durable before the manifest.
+        if defer_values && !self.overlay.is_empty() {
+            self.flush_values()?;
         }
 
         let b_ns = t_b.elapsed().as_nanos() as u64;
@@ -2415,6 +2439,37 @@ fn wal_disabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("MPT_NO_WAL").as_deref() == Ok("1"))
+}
+
+/// `MPT_ASYNC_VALUES=1` (one-writer path only): write the batch's values to RocksDB
+/// on a thread that runs concurrently with Phase B, joined before the batch returns
+/// (so reads-after-write stay correct — no cross-batch in-flight state). The value
+/// write is mostly memtable-insert CPU, so it hides under the I/O-bound reads;
+/// pair with MPT_NO_WAL so it carries no WAL I/O to contend with the flat file.
+fn async_values() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_ASYNC_VALUES").as_deref() == Ok("1"))
+}
+
+/// Write a value overlay to RocksDB as one batch (honours `MPT_NO_WAL`). Free
+/// function so it can run on a scoped worker thread (`&DB` is `Sync`).
+fn write_value_batch(values: &DB, overlay: &HashMap<Key, Vec<u8>>) -> Result<()> {
+    if overlay.is_empty() {
+        return Ok(());
+    }
+    let mut batch = WriteBatch::default();
+    for (key, value) in overlay {
+        batch.put(key, value);
+    }
+    if wal_disabled() {
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.disable_wal(true);
+        values.write_opt(batch, &wo)?;
+    } else {
+        values.write(batch)?;
+    }
+    Ok(())
 }
 
 /// Whether the disk batch path sorts groups by file offset and reads them via
