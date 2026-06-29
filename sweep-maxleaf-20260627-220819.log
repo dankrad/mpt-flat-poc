@@ -1,0 +1,223 @@
+sweep: keys=40000000 batch=10000 sizes=[1 2 4 8 16 32] tmpdir=/var/folders/x3/jh6r233j29zb8rh3fm8zlg200000gn/T//mpt-sweep-20260627-220819
+
+
+############## max_leaf = 1 KiB ##############
+config: max_leaf=1 KiB (target 512, min_promote 512), batch=10000
+
+  [  10M]     47s 4.7µs/key | flat 1.9G live 1.1G util 57% | leaves 2465005 avg 320B (4.1 k/leaf) | RAM 184M / 236882 nodes
+          phase ms/batch: A 13.6 | B 16.1 | GC 10.4 | C 5.5  (B 35%, GC 23%)
+          B-work µs/key: pread 3.7 parse 1.3 rebuild 2.6 serialize 1.0 pwrite 1.2 lock 0.8
+          GC: 1.51 reloc/key, 402 regs/batch, 10.4 ms/batch, R=8192, free_regions 322
+          promote: 236865 events (23.686/Kkey), 2125776 children (9.0/event, avg 113B), 2.4% of write bytes | write-amp 1028B/key
+  [  20M]    108s 6.0µs/key | flat 5.0G live 2.9G util 58% | leaves 11174486 avg 142B (1.8 k/leaf) | RAM 810M / 1049797 nodes
+          phase ms/batch: A 14.7 | B 15.3 | GC 16.4 | C 12.2  (B 26%, GC 28%)
+          B-work µs/key: pread 3.3 parse 1.0 rebuild 2.2 serialize 0.8 pwrite 1.9 lock 0.6
+          GC: 2.06 reloc/key, 710 regs/batch, 16.4 ms/batch, R=8192, free_regions 156
+          promote: 812915 events (81.291/Kkey), 7433696 children (9.1/event, avg 111B), 8.9% of write bytes | write-amp 932B/key
+  [  30M]    165s 5.7µs/key | flat 6.5G live 3.9G util 60% | leaves 13966772 avg 173B (2.1 k/leaf) | RAM 863M / 1117975 nodes
+          phase ms/batch: A 14.5 | B 11.9 | GC 15.7 | C 12.8  (B 22%, GC 29%)
+          B-work µs/key: pread 3.6 parse 0.7 rebuild 1.7 serialize 0.6 pwrite 1.6 lock 0.6
+          GC: 1.34 reloc/key, 556 regs/batch, 15.7 ms/batch, R=8192, free_regions 166
+          promote: 68178 events (6.818/Kkey), 641115 children (9.4/event, avg 108B), 1.5% of write bytes | write-amp 469B/key
+preloaded 40000000 keys in 223.37s  (5.58 µs/key)
+  flat file: 8081.9 MiB,  live: 4820.7 MiB,  util: 60%,  free_regions: 179,  garbage: 3261.2 MiB
+  leaves: 15230776 (avg 212 B = 2.6 keys/leaf), live 3084.9 MiB vs flat 8081.9 MiB
+  leaf pages: 1p=15230776 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 863.3 MiB total  (22.6 B/key)
+    frontier: 861.9 MiB (1118500 nodes),  free list: ~0.2 MiB (179 regions),  overlay: 0.0 MiB
+  split/write stats: writes=111343907 splits=0 max_record=1024B split_trigger=[0..0]B  pages: 1p=111343907  gc: passes=3999 regions_reclaimed=2124494 relocated=62408890 ms=60339
+  deep promotion: 1118483 events (35.8 keys/event), 10205597 children written (avg 111 B, 9.1/event), 3.8% of 27.7 GiB written | write-amp 744 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  12.64 µs/op median  (13.09 mean, 12.05 min, 18.69 max)
+
+  (after phase 1: free_regions: 0, free: 3549.6 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  13.14 µs/op median  (13.10 mean, 12.51 min, 13.53 max)
+
+
+
+############## max_leaf = 2 KiB ##############
+config: max_leaf=2 KiB (target 1024, min_promote 1024), batch=10000
+
+  [  10M]     45s 4.5µs/key | flat 1.9G live 0.9G util 47% | leaves 1048743 avg 759B (9.5 k/leaf) | RAM 55M / 69926 nodes
+          phase ms/batch: A 13.4 | B 16.8 | GC 8.5 | C 4.1  (B 39%, GC 20%)
+          B-work µs/key: pread 3.6 parse 1.5 rebuild 3.0 serialize 1.2 pwrite 1.0 lock 0.8
+          GC: 1.22 reloc/key, 284 regs/batch, 8.5 ms/batch, R=8192, free_regions 193
+          promote: 69909 events (6.991/Kkey), 902142 children (12.9/event, avg 160B), 1.2% of write bytes | write-amp 1176B/key
+  [  20M]     92s 4.8µs/key | flat 3.6G live 1.8G util 49% | leaves 2267250 avg 715B (8.8 k/leaf) | RAM 132M / 170309 nodes
+          phase ms/batch: A 13.7 | B 20.4 | GC 8.0 | C 3.9  (B 44%, GC 17%)
+          B-work µs/key: pread 3.4 parse 2.1 rebuild 3.9 serialize 1.9 pwrite 1.0 lock 0.7
+          GC: 0.80 reloc/key, 220 regs/batch, 8.0 ms/batch, R=8192, free_regions 234
+          promote: 100383 events (10.038/Kkey), 1284572 children (12.8/event, avg 159B), 1.1% of write bytes | write-amp 1921B/key
+  [  30M]    149s 5.6µs/key | flat 6.7G live 3.5G util 53% | leaves 11009449 avg 220B (2.7 k/leaf) | RAM 658M / 852555 nodes
+          phase ms/batch: A 14.0 | B 20.0 | GC 13.2 | C 7.4  (B 37%, GC 24%)
+          B-work µs/key: pread 3.4 parse 1.8 rebuild 3.5 serialize 1.5 pwrite 1.8 lock 0.6
+          GC: 2.02 reloc/key, 374 regs/batch, 13.2 ms/batch, R=8192, free_regions 263
+          promote: 682246 events (68.225/Kkey), 8787252 children (12.9/event, avg 159B), 7.2% of write bytes | write-amp 1946B/key
+preloaded 40000000 keys in 209.47s  (5.24 µs/key)
+  flat file: 8371.2 MiB,  live: 4801.3 MiB,  util: 58%,  free_regions: 193,  garbage: 3570.0 MiB
+  leaves: 15077401 (avg 214 B = 2.7 keys/leaf), live 3085.4 MiB vs flat 8371.2 MiB
+  leaf pages: 1p=15077401 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 853.5 MiB total  (22.4 B/key)
+    frontier: 851.6 MiB (1105165 nodes),  free list: ~0.3 MiB (193 regions),  overlay: 0.0 MiB
+  split/write stats: writes=111403719 splits=0 max_record=2048B split_trigger=[0..0]B  pages: 1p=111403719  gc: passes=3999 regions_reclaimed=1372893 relocated=58558433 ms=49614
+  deep promotion: 1105148 events (36.2 keys/event), 14245186 children written (avg 159 B, 12.9/event), 3.8% of 55.4 GiB written | write-amp 1487 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  12.30 µs/op median  (12.28 mean, 11.99 min, 12.63 max)
+
+  (after phase 1: free_regions: 0, free: 3856.5 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  12.71 µs/op median  (12.88 mean, 12.56 min, 13.60 max)
+
+
+
+############## max_leaf = 4 KiB ##############
+config: max_leaf=4 KiB (target 2048, min_promote 2048), batch=10000
+
+  [  10M]     44s 4.4µs/key | flat 1.9G live 0.9G util 46% | leaves 1048491 avg 759B (9.5 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 13.3 | B 18.3 | GC 7.5 | C 3.2  (B 43%, GC 18%)
+          B-work µs/key: pread 3.4 parse 1.7 rebuild 3.5 serialize 1.5 pwrite 1.0 lock 0.8
+          GC: 1.08 reloc/key, 264 regs/batch, 7.5 ms/batch, R=8192, free_regions 211
+          promote: 69903 events (6.990/Kkey), 1076531 children (15.4/event, avg 267B), 1.6% of write bytes | write-amp 1807B/key
+  [  20M]     91s 4.7µs/key | flat 3.1G live 1.6G util 53% | leaves 1048576 avg 1550B (19.1 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 14.0 | B 20.6 | GC 7.2 | C 3.7  (B 45%, GC 16%)
+          B-work µs/key: pread 3.7 parse 2.1 rebuild 3.9 serialize 1.9 pwrite 1.0 lock 0.7
+          GC: 0.65 reloc/key, 207 regs/batch, 7.2 ms/batch, R=8192, free_regions 194
+          promote: 0 events (0.000/Kkey), 0 children (0.0/event, avg 0B), 0.0% of write bytes | write-amp 1943B/key
+  [  30M]    144s 5.3µs/key | flat 5.0G live 2.4G util 49% | leaves 1050690 avg 2340B (28.6 k/leaf) | RAM 55M / 70052 nodes
+          phase ms/batch: A 13.9 | B 23.1 | GC 10.3 | C 3.7  (B 45%, GC 20%)
+          B-work µs/key: pread 3.5 parse 2.4 rebuild 4.7 serialize 2.3 pwrite 1.3 lock 0.6
+          GC: 0.63 reloc/key, 343 regs/batch, 10.3 ms/batch, R=8192, free_regions 402
+          promote: 147 events (0.015/Kkey), 2257 children (15.4/event, avg 266B), 0.0% of write bytes | write-amp 3245B/key
+preloaded 40000000 keys in 200.66s  (5.02 µs/key)
+  flat file: 6473.8 MiB,  live: 3303.7 MiB,  util: 51%,  free_regions: 438,  garbage: 3170.0 MiB
+  leaves: 1499049 (avg 2184 B = 26.7 keys/leaf), live 3122.8 MiB vs flat 6473.8 MiB
+  leaf pages: 1p=1499049 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 79.2 MiB total  (2.1 B/key)
+    frontier: 77.8 MiB (101025 nodes),  free list: ~0.2 MiB (438 regions),  overlay: 0.0 MiB
+  split/write stats: writes=70992656 splits=0 max_record=4096B split_trigger=[0..0]B  pages: 1p=70992656  gc: passes=3999 regions_reclaimed=1248685 relocated=30066313 ms=38134
+  deep promotion: 101023 events (395.9 keys/event), 1555911 children written (avg 267 B, 15.4/event), 0.4% of 105.4 GiB written | write-amp 2830 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  13.81 µs/op median  (13.78 mean, 13.44 min, 14.17 max)
+
+  (after phase 1: free_regions: 0, free: 3425.8 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  14.09 µs/op median  (14.15 mean, 13.81 min, 15.50 max)
+
+
+
+############## max_leaf = 8 KiB ##############
+config: max_leaf=8 KiB (target 4096, min_promote 4096), batch=10000
+
+  [  10M]     47s 4.7µs/key | flat 1.9G live 0.9G util 46% | leaves 1048491 avg 759B (9.5 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 13.2 | B 21.6 | GC 8.5 | C 2.2  (B 47%, GC 19%)
+          B-work µs/key: pread 2.9 parse 2.1 rebuild 5.0 serialize 2.0 pwrite 0.9 lock 0.6
+          GC: 0.77 reloc/key, 448 regs/batch, 8.5 ms/batch, R=8192, free_regions 195
+          promote: 69904 events (6.990/Kkey), 1116872 children (16.0/event, avg 514B), 1.3% of write bytes | write-amp 4373B/key
+  [  20M]     94s 4.7µs/key | flat 3.1G live 1.6G util 53% | leaves 1048576 avg 1550B (19.1 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 13.8 | B 20.2 | GC 7.8 | C 3.6  (B 45%, GC 17%)
+          B-work µs/key: pread 3.3 parse 2.2 rebuild 4.0 serialize 1.9 pwrite 1.0 lock 0.6
+          GC: 0.65 reloc/key, 207 regs/batch, 7.8 ms/batch, R=8192, free_regions 223
+          promote: 0 events (0.000/Kkey), 0 children (0.0/event, avg 0B), 0.0% of write bytes | write-amp 1943B/key
+  [  30M]    148s 5.3µs/key | flat 5.0G live 2.4G util 49% | leaves 1048576 avg 2345B (28.6 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 14.0 | B 24.3 | GC 9.5 | C 3.7  (B 47%, GC 18%)
+          B-work µs/key: pread 4.3 parse 2.5 rebuild 4.8 serialize 2.3 pwrite 1.2 lock 0.6
+          GC: 0.63 reloc/key, 343 regs/batch, 9.5 ms/batch, R=8192, free_regions 435
+          promote: 0 events (0.000/Kkey), 0 children (0.0/event, avg 0B), 0.0% of write bytes | write-amp 3245B/key
+preloaded 40000000 keys in 203.56s  (5.09 µs/key)
+  flat file: 6204.7 MiB,  live: 3255.7 MiB,  util: 53%,  free_regions: 413,  garbage: 2949.0 MiB
+  leaves: 1048576 (avg 3123 B = 38.1 keys/leaf), live 3123.9 MiB vs flat 6204.7 MiB
+  leaf pages: 1p=1048576 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 55.3 MiB total  (1.4 B/key)
+    frontier: 53.9 MiB (69905 nodes),  free list: ~0.2 MiB (413 regions),  overlay: 0.0 MiB
+  split/write stats: writes=66366795 splits=0 max_record=8192B split_trigger=[0..0]B  pages: 1p=66366795  gc: passes=3998 regions_reclaimed=1426897 relocated=26203066 ms=37498
+  deep promotion: 69904 events (572.2 keys/event), 1116872 children written (avg 514 B, 16.0/event), 0.4% of 129.5 GiB written | write-amp 3475 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  13.17 µs/op median  (13.23 mean, 12.97 min, 14.25 max)
+
+  (after phase 1: free_regions: 0, free: 3208.3 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  13.41 µs/op median  (13.42 mean, 13.28 min, 13.60 max)
+
+
+
+############## max_leaf = 16 KiB ##############
+config: max_leaf=16 KiB (target 8192, min_promote 8192), batch=10000
+
+  [  10M]     54s 5.4µs/key | flat 1.6G live 0.8G util 52% | leaves 65626 avg 12171B (152.4 k/leaf) | RAM 4M / 4375 nodes
+          phase ms/batch: A 12.7 | B 24.8 | GC 13.1 | C 1.2  (B 48%, GC 25%)
+          B-work µs/key: pread 2.8 parse 2.2 rebuild 6.5 serialize 2.6 pwrite 1.0 lock 0.5
+          GC: 0.44 reloc/key, 895 regs/batch, 13.1 ms/batch, R=8192, free_regions 1602
+          promote: 4374 events (0.437/Kkey), 69816 children (16.0/event, avg 1038B), 0.1% of write bytes | write-amp 8797B/key
+  [  20M]    109s 5.6µs/key | flat 3.1G live 1.6G util 53% | leaves 1048576 avg 1550B (19.1 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 13.5 | B 24.3 | GC 13.2 | C 3.0  (B 45%, GC 24%)
+          B-work µs/key: pread 3.4 parse 2.3 rebuild 5.4 serialize 2.5 pwrite 1.2 lock 0.5
+          GC: 0.73 reloc/key, 735 regs/batch, 13.2 ms/batch, R=8192, free_regions 202
+          promote: 65530 events (6.553/Kkey), 1048477 children (16.0/event, avg 1024B), 1.4% of write bytes | write-amp 7571B/key
+  [  30M]    162s 5.3µs/key | flat 5.0G live 2.4G util 49% | leaves 1048576 avg 2345B (28.6 k/leaf) | RAM 55M / 69905 nodes
+          phase ms/batch: A 13.8 | B 23.7 | GC 9.9 | C 3.7  (B 46%, GC 19%)
+          B-work µs/key: pread 4.0 parse 2.5 rebuild 4.8 serialize 2.3 pwrite 1.1 lock 0.6
+          GC: 0.63 reloc/key, 343 regs/batch, 9.9 ms/batch, R=8192, free_regions 452
+          promote: 0 events (0.000/Kkey), 0 children (0.0/event, avg 0B), 0.0% of write bytes | write-amp 3245B/key
+preloaded 40000000 keys in 218.32s  (5.46 µs/key)
+  flat file: 6201.7 MiB,  live: 3255.7 MiB,  util: 53%,  free_regions: 430,  garbage: 2946.0 MiB
+  leaves: 1048576 (avg 3123 B = 38.1 keys/leaf), live 3123.9 MiB vs flat 6201.7 MiB
+  leaf pages: 1p=1048576 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 55.3 MiB total  (1.4 B/key)
+    frontier: 53.9 MiB (69905 nodes),  free list: ~0.2 MiB (430 regions),  overlay: 0.0 MiB
+  split/write stats: writes=63166729 splits=0 max_record=16384B split_trigger=[0..0]B  pages: 1p=63166729  gc: passes=3996 regions_reclaimed=2401060 relocated=23687799 ms=49145
+  deep promotion: 69904 events (572.2 keys/event), 1118293 children written (avg 1025 B, 16.0/event), 0.5% of 223.1 GiB written | write-amp 5988 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  13.07 µs/op median  (13.16 mean, 12.77 min, 14.06 max)
+
+  (after phase 1: free_regions: 0, free: 3203.2 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  13.48 µs/op median  (13.63 mean, 13.16 min, 14.47 max)
+
+
+
+############## max_leaf = 32 KiB ##############
+config: max_leaf=32 KiB (target 16384, min_promote 16384), batch=10000
+
+  [  10M]     54s 5.4µs/key | flat 1.7G live 0.8G util 50% | leaves 65536 avg 12188B (152.6 k/leaf) | RAM 4M / 4369 nodes
+          phase ms/batch: A 12.7 | B 25.5 | GC 13.2 | C 1.2  (B 49%, GC 25%)
+          B-work µs/key: pread 2.8 parse 2.1 rebuild 6.9 serialize 2.6 pwrite 1.1 lock 0.4
+          GC: 0.40 reloc/key, 911 regs/batch, 13.2 ms/batch, R=8192, free_regions 1565
+          promote: 4368 events (0.437/Kkey), 69802 children (16.0/event, avg 2062B), 0.2% of write bytes | write-amp 9426B/key
+  [  20M]    132s 7.7µs/key | flat 3.2G live 1.5G util 53% | leaves 65536 avg 24852B (305.2 k/leaf) | RAM 5M / 4369 nodes
+          phase ms/batch: A 12.9 | B 33.1 | GC 28.3 | C 1.2  (B 44%, GC 37%)
+          B-work µs/key: pread 3.8 parse 2.3 rebuild 8.1 serialize 3.8 pwrite 2.2 lock 0.4
+          GC: 0.32 reloc/key, 2313 regs/batch, 28.3 ms/batch, R=8192, free_regions 2795
+          promote: 0 events (0.000/Kkey), 0 children (0.0/event, avg 0B), 0.0% of write bytes | write-amp 22944B/key
+  [  30M]    210s 7.9µs/key | flat 5.1G live 2.4G util 48% | leaves 1045636 avg 2352B (28.7 k/leaf) | RAM 55M / 69709 nodes
+          phase ms/batch: A 13.2 | B 32.7 | GC 28.7 | C 2.3  (B 43%, GC 37%)
+          B-work µs/key: pread 4.0 parse 2.5 rebuild 7.2 serialize 3.8 pwrite 2.4 lock 0.4
+          GC: 0.69 reloc/key, 2105 regs/batch, 28.7 ms/batch, R=8192, free_regions 427
+          promote: 65340 events (6.534/Kkey), 1045440 children (16.0/event, avg 2048B), 0.9% of write bytes | write-amp 23254B/key
+preloaded 40000000 keys in 266.05s  (6.65 µs/key)
+  flat file: 6266.6 MiB,  live: 3255.7 MiB,  util: 52%,  free_regions: 411,  garbage: 3010.9 MiB
+  leaves: 1048576 (avg 3123 B = 38.1 keys/leaf), live 3123.9 MiB vs flat 6266.6 MiB
+  leaf pages: 1p=1048576 2p=0 3p=0 4p=0 5p=0 6p=0 7p=0 8p=0
+  in-RAM index (live heap): 55.3 MiB total  (1.4 B/key)
+    frontier: 53.9 MiB (69905 nodes),  free list: ~0.2 MiB (411 regions),  overlay: 0.0 MiB
+  split/write stats: writes=57918629 splits=0 max_record=32768B split_trigger=[0..0]B  pages: 1p=41998831 2p=15919798  gc: passes=3994 regions_reclaimed=5758562 relocated=19772058 ms=82663
+  deep promotion: 69904 events (572.2 keys/event), 1118378 children written (avg 2049 B, 16.0/event), 0.4% of 558.5 GiB written | write-amp 14992 B/key
+
+=== 1000 NEW inserts into the preloaded trie ===
+  20 rounds x 1000 ops:  13.24 µs/op median  (13.41 mean, 12.85 min, 14.59 max)
+
+  (after phase 1: free_regions: 0, free: 3270.5 MiB)
+
+=== 1000 OVERWRITES of random existing keys ===
+  20 rounds x 1000 ops:  14.64 µs/op median  (14.56 mean, 13.90 min, 15.07 max)
+

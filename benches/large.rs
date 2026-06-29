@@ -12,7 +12,7 @@ use mpt_flat_poc::{Config, FlatMpt, Key, hashed_key, prof};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
@@ -51,6 +51,27 @@ static GLOBAL: Counting = Counting;
 
 fn live_heap() -> usize {
     LIVE.load(Ordering::Relaxed)
+}
+
+/// Set by the SIGINT/SIGTERM handler; the preload loop checks it and persists the
+/// database (flushing any buffered batch first) before exiting, so a killed run
+/// leaves a reopenable checkpoint instead of losing the in-RAM frontier.
+/// `kill -9` (SIGKILL) cannot be caught, so it still loses the frontier.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    // Async-signal-safe: only flip a flag; the main thread does the real work.
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // Cast through a fn pointer (not the fn item) to get a valid sighandler_t.
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only performs an atomic store, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -105,45 +126,196 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
 
+    // Disk-leaf size in KiB (max). target = max/2, min_promote = max/2.
+    // Larger leaves => fewer leaves => smaller frontier and less page padding,
+    // at the cost of more bytes rewritten per insert.
+    let max_kib: usize = std::env::var("LARGE_MAX_LEAF_KIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let max = max_kib * 1024;
     let cfg = Config {
-        target_leaf_bytes: 4 * 1024,
-        max_leaf_bytes: 8 * 1024,
-        min_promote_bytes: 2 * 1024,
+        target_leaf_bytes: max / 2,
+        max_leaf_bytes: max,
+        min_promote_bytes: max / 2,
     };
+    // Batch size for preload inserts; 0 = one-by-one. Must divide PROGRESS_EVERY.
+    let batch: usize = std::env::var("LARGE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    println!(
+        "config: max_leaf={} KiB (target {}, min_promote {}), batch={}\n",
+        max_kib,
+        max / 2,
+        max / 2,
+        if batch == 0 { "off".into() } else { batch.to_string() },
+    );
+    // With LARGE_PERSIST=1 the DB is built at a fixed, non-temporary path under
+    // $TMPDIR (so the flat file + .values + .meta survive process exit and can be
+    // reopened with FlatMpt::open). Otherwise a NamedTempFile auto-cleans on exit.
+    let persist = std::env::var("LARGE_PERSIST").ok().as_deref() == Some("1");
     let tmp = NamedTempFile::new().unwrap();
-    let mut db = FlatMpt::create(tmp.path(), cfg).unwrap();
+    let db_path = if persist {
+        std::env::temp_dir().join("mpt-checkpoint.flat")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    let mut db = FlatMpt::create(&db_path, cfg).unwrap();
+    install_signal_handlers();
 
     // ---- preload ----
     // Log running stats every PROGRESS_EVERY keys so a long (1B-key) run can be
     // tracked live: per-chunk insert rate, on-disk size, fragmentation, and the
     // in-RAM index footprint.
     const PROGRESS_EVERY: u64 = 10_000_000;
+    mpt_flat_poc::stats::reset();
     let heap_before = live_heap();
     let t = Instant::now();
     let mut chunk_start = Instant::now();
+    let mut buf: Vec<(Key, Vec<u8>)> = Vec::new();
+    // Previous-milestone split-leaf totals, to report the per-interval average
+    // size of leaves freshly created by splitting.
+    use std::sync::atomic::Ordering::Relaxed;
+    use mpt_flat_poc::stats;
+    // Per-interval deltas: read each counter, subtract the previous milestone's
+    // value. Indices documented in `snap()`.
+    let snap = || -> [u64; 18] {
+        [
+            stats::PHASE_A_NS.load(Relaxed),      // 0
+            stats::PHASE_B_NS.load(Relaxed),      // 1
+            stats::PHASE_C_NS.load(Relaxed),      // 2
+            stats::BATCHES.load(Relaxed),         // 3
+            stats::B_READ_IO_NS.load(Relaxed),    // 4  pread (device)
+            stats::B_READ_PARSE_NS.load(Relaxed), // 5  parse (cpu)
+            stats::B_REBUILD_NS.load(Relaxed),    // 6  rebuild (cpu)
+            stats::B_SERIALIZE_NS.load(Relaxed),  // 7  serialize (cpu)
+            stats::W_PWRITE_NS.load(Relaxed),     // 8  pwrite (device)
+            stats::W_LOCK_NS.load(Relaxed),       // 9  alloc lock (contention)
+            stats::GC_NS.load(Relaxed),           // 10 GC evacuate (read+relocate)
+            stats::GC_RELOCATED.load(Relaxed),    // 11 records relocated
+            stats::GC_REGIONS.load(Relaxed),      // 12 regions reclaimed
+            stats::B_FINAL_NS.load(Relaxed),      // 13 migrate+serialize+promote
+            stats::WRITE_BYTES.load(Relaxed),     // 14 total payload bytes written
+            stats::PROMOTE_EVENTS.load(Relaxed),  // 15 deep-promotion events
+            stats::PROMOTE_CHILDREN.load(Relaxed), // 16 children written by promotions
+            stats::PROMOTE_CHILD_BYTES.load(Relaxed), // 17 those children's bytes
+        ]
+    };
+    let mut prev = snap();
     for i in 0..preload {
-        db.insert(key_at(i), vec![0u8; 32]).unwrap();
+        // Caught a SIGINT/SIGTERM: flush any buffered batch, persist a reopenable
+        // checkpoint, and exit. (`std::process::exit` skips the NamedTempFile
+        // drop, so even the temp-path flat file survives.)
+        if INTERRUPTED.load(Relaxed) {
+            eprintln!("\n[signal] persisting {i} keys before exit...");
+            if !buf.is_empty() {
+                db.insert_batch(std::mem::take(&mut buf)).unwrap();
+            }
+            db.flush().unwrap();
+            db.persist().unwrap();
+            println!(
+                "persisted {i} keys to {} (reopen with FlatMpt::open)",
+                db_path.display(),
+            );
+            std::io::stdout().flush().ok();
+            std::process::exit(0);
+        }
+        if batch == 0 {
+            db.insert(key_at(i), vec![0u8; 32]).unwrap();
+        } else {
+            buf.push((key_at(i), vec![0u8; 32]));
+            if buf.len() >= batch {
+                db.insert_batch(std::mem::take(&mut buf)).unwrap();
+            }
+        }
         let done = i + 1;
         if done % PROGRESS_EVERY == 0 && done < preload {
             let chunk = chunk_start.elapsed();
             let live = live_heap().saturating_sub(heap_before);
+            let ls = db.leaf_stats();
+            let cur = snap();
+            let d: [u64; 18] = std::array::from_fn(|k| cur[k].saturating_sub(prev[k]));
+            prev = cur;
+            let dnb = d[3].max(1); // batches this interval
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let msb = |ns: u64| ns as f64 / 1e6 / dnb as f64; // ms/batch
+            let uk = |ns: u64| ns as f64 / 1000.0 / PROGRESS_EVERY as f64; // thread-µs/key
+            // Phase wall split now includes GC (which runs between B and C).
+            let phase_tot = (d[0] + d[1] + d[10] + d[2]).max(1);
             println!(
-                "  [{:>4}M] {:>6.0}s | last {}M @ {:.2} µs/key | flat {:.1} GiB | free_regions {} | RAM {:.1} MiB",
+                "  [{:>4}M] {:>6.0}s {:.1}µs/key | flat {:.1}G live {:.1}G util {:.0}% | leaves {} avg {}B ({:.1} k/leaf) | RAM {:.0}M / {} nodes",
                 done / 1_000_000,
                 t.elapsed().as_secs_f64(),
-                PROGRESS_EVERY / 1_000_000,
                 chunk.as_micros() as f64 / PROGRESS_EVERY as f64,
-                db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0),
-                db.free_regions(),
+                gib(db.flat_file_len()),
+                gib(db.live_bytes()),
+                db.utilization() * 100.0,
+                ls.count,
+                ls.avg_bytes(),
+                done as f64 / ls.count.max(1) as f64,
                 mib(live),
+                db.ram_report().frontier_nodes,
+            );
+            println!(
+                "          phase ms/batch: A {:.1} | B {:.1} | GC {:.1} | C {:.1}  (B {:.0}%, GC {:.0}%)",
+                msb(d[0]), msb(d[1]), msb(d[10]), msb(d[2]),
+                d[1] as f64 / phase_tot as f64 * 100.0,
+                d[10] as f64 / phase_tot as f64 * 100.0,
+            );
+            // Effective Phase-B concurrency = summed thread-time / wall-time. ~= the
+            // number of cores actually kept busy (cap = worker threads).
+            let b_work_ns = d[4] + d[5] + d[6] + d[7] + d[8] + d[9];
+            println!(
+                "          B-work µs/key: pread {:.1} parse {:.1} rebuild {:.1} serialize {:.1} pwrite {:.1} lock {:.1}  (B concurrency {:.1}x)",
+                uk(d[4]), uk(d[5]), uk(d[6]), uk(d[7]), uk(d[8]), uk(d[9]),
+                b_work_ns as f64 / d[1].max(1) as f64,
+            );
+            println!(
+                "          GC: {:.2} reloc/key, {} regs/batch, {:.1} ms/batch, R={}, free_regions {}",
+                d[11] as f64 / PROGRESS_EVERY as f64,
+                d[12] / dnb,
+                msb(d[10]),
+                db.gc_rate_current(),
+                db.free_regions(),
+            );
+            // Deep-promotion tax this interval: how often records promote, the
+            // child records each promotion writes (and their avg size), and the
+            // share of total write volume that promotion rebalancing accounts for.
+            let wbytes = d[14].max(1);
+            println!(
+                "          promote: {} events ({:.3}/Kkey), {} children ({:.1}/event, avg {}B), {:.1}% of write bytes | write-amp {:.0}B/key",
+                d[15],
+                d[15] as f64 * 1000.0 / PROGRESS_EVERY as f64,
+                d[16],
+                d[16] as f64 / d[15].max(1) as f64,
+                d[17] / d[16].max(1),
+                d[17] as f64 / wbytes as f64 * 100.0,
+                d[14] as f64 / PROGRESS_EVERY as f64,
             );
             std::io::stdout().flush().ok();
             chunk_start = Instant::now();
         }
     }
+    if !buf.is_empty() {
+        db.insert_batch(buf).unwrap();
+    }
     db.flush().unwrap();
     let elapsed = t.elapsed();
     let heap_after = live_heap();
+
+    // Optional checkpoint: LARGE_PERSIST=1 writes the .meta manifest so the built
+    // database can be reopened with FlatMpt::open (e.g. to time phases at scale
+    // without rebuilding). The flat file persists in $TMPDIR — don't delete it.
+    if persist {
+        let pt = Instant::now();
+        db.persist().unwrap();
+        println!(
+            "  persisted checkpoint to {} in {:.1}s (reopen with FlatMpt::open)",
+            db_path.display(),
+            pt.elapsed().as_secs_f64(),
+        );
+    }
 
     println!(
         "preloaded {preload} keys in {:.2}s  ({:.2} µs/key)",
@@ -151,10 +323,28 @@ fn main() {
         us_per(elapsed, preload as usize),
     );
     println!(
-        "  flat file: {:.1} MiB,  free_regions: {},  free: {:.1} MiB",
+        "  flat file: {:.1} MiB,  live: {:.1} MiB,  util: {:.0}%,  free_regions: {},  garbage: {:.1} MiB",
         db.flat_file_len() as f64 / 1_048_576.0,
+        db.live_bytes() as f64 / 1_048_576.0,
+        db.utilization() * 100.0,
         db.free_regions(),
         db.free_bytes() as f64 / 1_048_576.0,
+    );
+    let ls = db.leaf_stats();
+    println!(
+        "  leaves: {} (avg {} B = {:.1} keys/leaf), live {:.1} MiB vs flat {:.1} MiB",
+        ls.count,
+        ls.avg_bytes(),
+        preload as f64 / ls.count.max(1) as f64,
+        ls.total_bytes as f64 / 1_048_576.0,
+        db.flat_file_len() as f64 / 1_048_576.0,
+    );
+    println!(
+        "  leaf pages: {}",
+        (1..=8)
+            .map(|p| format!("{p}p={}", ls.page_hist[p]))
+            .collect::<Vec<_>>()
+            .join(" "),
     );
 
     // In-RAM index footprint: ground truth (live heap delta) + structural breakdown.
@@ -173,7 +363,30 @@ fn main() {
         r.free_regions,
         mib(r.overlay_bytes),
     );
+    println!("  split/write stats: {}", mpt_flat_poc::stats::dump());
+    // Cumulative deep-promotion tax over the whole preload.
+    let (pe, pc, pcb, wb) = (
+        stats::PROMOTE_EVENTS.load(Relaxed),
+        stats::PROMOTE_CHILDREN.load(Relaxed),
+        stats::PROMOTE_CHILD_BYTES.load(Relaxed),
+        stats::WRITE_BYTES.load(Relaxed),
+    );
+    println!(
+        "  deep promotion: {pe} events ({:.1} keys/event), {pc} children written (avg {} B, {:.1}/event), {:.1}% of {:.1} GiB written | write-amp {:.0} B/key",
+        preload as f64 / pe.max(1) as f64,
+        pcb / pc.max(1),
+        pc as f64 / pe.max(1) as f64,
+        pcb as f64 / wb.max(1) as f64 * 100.0,
+        wb as f64 / (1024.0 * 1024.0 * 1024.0),
+        wb as f64 / preload as f64,
+    );
     println!();
+
+    // When building a checkpoint, stop here: phases 1/2 below would mutate the
+    // flat file after persist() and leave the on-disk manifest stale.
+    if persist {
+        return;
+    }
 
     // ---- phase 1: brand-new inserts ----
     let mut next_new = preload;
