@@ -170,6 +170,7 @@ Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
 | [`scripts/batch-bench.sh`](scripts/batch-bench.sh) | **Benchmark batch inserts** into a tree, on a throwaway COW clone; prints us/key. |
 | [`scripts/grow-tree.sh`](scripts/grow-tree.sh) | **Grow a tree** by N more keys and re-checkpoint it in place. |
 | [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` (preload + timed inserts/overwrites); documents prereqs. |
+| [`scripts/iops-bench.sh`](scripts/iops-bench.sh) | **Characterize the SSD** (via `examples/iops`): read IOPS vs block size / queue depth, and single- vs multi-stream write bandwidth — the device numbers behind the tuning. |
 | [`examples/buildpersist.rs`](examples/buildpersist.rs) | Build N keys (RAM-build aware) + persist, no post-phases; per-10M rate + footprint. Driven by `build-tree.sh`. |
 | [`examples/foldbench.rs`](examples/foldbench.rs) | Insert N keys into an existing checkpoint in batches; per-batch + overall us/key; `MPT_PERSIST=1` to checkpoint. Driven by `batch-bench.sh` / `grow-tree.sh`. |
 | [`examples/profins.rs`](examples/profins.rs) | Profiling harness: per-phase + device-busy breakdown of batch inserts (read/write/value), for tuning. |
