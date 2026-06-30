@@ -2564,13 +2564,31 @@ const BATCH_LEAVES: usize = 8;
 /// Fold (sequential-merge) tuning. When a batch touches many leaves, the disk
 /// path sorts the per-leaf groups by file offset and reads consecutive ones in a
 /// single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
-/// ≤ `FOLD_MAX_GAP`. Dense runs are thus read a whole region at a time (sequential
-/// bandwidth) instead of one random `pread` per leaf; sparse runs fall back to
-/// ~per-record reads automatically (the next leaf is too far to coalesce). All
-/// leaves in a span share one buffer `Arc` and parse zero-copy. Inline GC runs on
-/// every batch regardless of size (use `MPT_GC_DISABLE=1` for gc-off bulk loads).
+/// ≤ `fold_max_gap()`. Coalescing trades extra bytes read (the untouched records
+/// in the gap) for fewer syscalls/seeks; it only wins when touched leaves are
+/// dense, so the gap defaults to 0 (see `fold_max_gap`). All leaves in a span
+/// share one buffer `Arc` and parse zero-copy. Inline GC runs on every batch
+/// regardless of size (use `MPT_GC_DISABLE=1` for gc-off bulk loads).
 const FOLD_SPAN_BYTES: u64 = 8 << 20; // ≤ 8 MiB per coalesced read
-const FOLD_MAX_GAP: u64 = 1 << 20; // coalesce across gaps ≤ 1 MiB
+/// Coalesce consecutive leaf reads across on-disk gaps ≤ this many bytes
+/// (default 0 = don't coalesce). Merging two touched leaves into one `pread`
+/// also reads the untouched records between them, which only pays off when
+/// touched leaves are densely/sequentially placed. For sparse random-key
+/// workloads (the common case) it reads large spans of dead data: measured
+/// ~2x slower end-to-end at a 1 MiB gap vs 0 on NVMe (35 KiB avg device read
+/// vs ~8 KiB), because the device is read-bandwidth bound. Tunable via
+/// `MPT_FOLD_GAP_KIB` for workloads with sequential insert locality.
+fn fold_max_gap() -> u64 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("MPT_FOLD_GAP_KIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+            .unwrap_or(0)
+    })
+}
 const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the batched write path
 
 /// Whether to coalesce leaf writes into batched `pwrite`s. The append allocator
@@ -2886,7 +2904,7 @@ fn process_chunk_coalesced(
         let mut j = i;
         while j + 1 < chunk.len() {
             let gap = chunk[j + 1].0.offset().saturating_sub(rec_end(&chunk[j].0));
-            if gap > FOLD_MAX_GAP || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
+            if gap > fold_max_gap() || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
                 break;
             }
             j += 1;
@@ -2941,7 +2959,7 @@ fn process_chunk_fold(
         let mut j = i;
         while j + 1 < chunk.len() {
             let gap = chunk[j + 1].0.offset().saturating_sub(rec_end(&chunk[j].0));
-            if gap > FOLD_MAX_GAP || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
+            if gap > fold_max_gap() || rec_end(&chunk[j + 1].0) - start > FOLD_SPAN_BYTES {
                 break;
             }
             j += 1;
