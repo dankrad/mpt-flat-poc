@@ -14,19 +14,26 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
 
 ## Quick start
 
+**Start here.** These are the two primary scripts — each takes a single argument (a
+directory) and reproduces the headline results end-to-end:
+
 ```bash
-# Build a tree of any size to a reopenable checkpoint (RAM-build, spills to disk):
-scripts/build-tree.sh /data/tree.flat 1000000000
+# 1. Build the 1B-key baseline the fast way (RAM-build, 100M-key batches, spill at
+#    70 GiB) → <dir>/ckpt.flat   (~1420 s, ~1.4 us/key)
+scripts/build-baseline-1b.sh /data/baseline
 
-# Benchmark batch inserts into it (on a throwaway clone; prints us/key):
-scripts/batch-bench.sh /data/tree.flat 10000000 10000
+# 2. Benchmark the fused fast path on a throwaway COW clone of it — one-writer +
+#    opportunistic GC + parallel writer + no-WAL + async values; prints us/key +
+#    the device read/write split + the gc-evac breakdown.
+scripts/bench-fused.sh /data/baseline
+```
 
-# Grow it by N more keys and re-checkpoint in place:
-scripts/grow-tree.sh /data/tree.flat 100000000
+General-purpose variants (arbitrary size, custom batches, in-place growth):
 
-# One-shot reproductions (single arg = directory), used to produce the headline numbers:
-scripts/build-baseline-1b.sh /data/baseline     # build the 1B baseline the fast way
-scripts/bench-fused.sh        /data/baseline     # benchmark the fused fast path on a clone
+```bash
+scripts/build-tree.sh  /data/tree.flat 1000000000      # build a tree of any size
+scripts/batch-bench.sh /data/tree.flat 10000000 10000  # benchmark batch inserts on a clone
+scripts/grow-tree.sh   /data/tree.flat 100000000       # grow a tree + re-checkpoint in place
 ```
 
 A checkpoint is three siblings: `tree.flat` (packed subtrees), `tree.flat.meta`
@@ -180,8 +187,8 @@ Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
 |------|--------------|
 | [`src/lib.rs`](src/lib.rs) | The entire engine (see the component map below). |
 | [`scripts/build-tree.sh`](scripts/build-tree.sh) | **Fast-build a tree of any size** → checkpoint (RAM-build + spill). |
-| [`scripts/build-baseline-1b.sh`](scripts/build-baseline-1b.sh) | **Build the 1B baseline** the fast way (RAM-build, 100M-key batches, spill at 70 GiB) → `<dir>/ckpt.flat`. Single arg: output dir. |
-| [`scripts/bench-fused.sh`](scripts/bench-fused.sh) | **Benchmark the fused fast path** (one-writer + opportunistic GC + parallel writer + no-WAL + async values) on a COW clone; 25M warmup → 10M measured. Single arg: baseline dir. |
+| [`scripts/build-baseline-1b.sh`](scripts/build-baseline-1b.sh) | ⭐ **PRIMARY — build the 1B baseline** the fast way (RAM-build, 100M-key batches, spill at 70 GiB) → `<dir>/ckpt.flat`. Single arg: output dir. |
+| [`scripts/bench-fused.sh`](scripts/bench-fused.sh) | ⭐ **PRIMARY — benchmark the fused fast path** (one-writer + opportunistic GC + parallel writer + no-WAL + async values) on a COW clone; 25M warmup → 10M measured. Single arg: baseline dir. |
 | [`scripts/batch-bench.sh`](scripts/batch-bench.sh) | **Benchmark batch inserts** into a tree, on a throwaway COW clone; prints us/key. |
 | [`scripts/grow-tree.sh`](scripts/grow-tree.sh) | **Grow a tree** by N more keys and re-checkpoint it in place. |
 | [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` (preload + timed inserts/overwrites); documents prereqs. |
