@@ -68,12 +68,19 @@ pub mod stats {
     pub static PHASE_B_NS: AtomicU64 = AtomicU64::new(0);
     pub static PHASE_C_NS: AtomicU64 = AtomicU64::new(0);
     pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    // Phase-A sub-split: value-hash + map-build vs the routing walks.
+    pub static A_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static A_ROUTE_NS: AtomicU64 = AtomicU64::new(0);
 
     pub fn on_batch(a_ns: u64, b_ns: u64, c_ns: u64) {
         PHASE_A_NS.fetch_add(a_ns, Relaxed);
         PHASE_B_NS.fetch_add(b_ns, Relaxed);
         PHASE_C_NS.fetch_add(c_ns, Relaxed);
         BATCHES.fetch_add(1, Relaxed);
+    }
+    pub fn on_phase_a_split(build_ns: u64, route_ns: u64) {
+        A_BUILD_NS.fetch_add(build_ns, Relaxed);
+        A_ROUTE_NS.fetch_add(route_ns, Relaxed);
     }
 
     /// Phase-B sub-breakdown, summed across all worker threads (so the total
@@ -216,6 +223,8 @@ pub mod stats {
         SPLIT_LEAVES.store(0, Relaxed);
         SPLIT_LEAF_BYTES.store(0, Relaxed);
         PHASE_A_NS.store(0, Relaxed);
+        A_BUILD_NS.store(0, Relaxed);
+        A_ROUTE_NS.store(0, Relaxed);
         PHASE_B_NS.store(0, Relaxed);
         PHASE_C_NS.store(0, Relaxed);
         BATCHES.store(0, Relaxed);
@@ -1449,7 +1458,7 @@ impl FlatMpt {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Hash> {
-        let value_hash = hash_leaf_value(&value);
+        let value_hash = leaf_hash(key, &value);
         self.overlay.insert(key, value);
         if self.overlay.len() >= VALUE_BATCH {
             self.flush_values()?;
@@ -1475,18 +1484,37 @@ impl FlatMpt {
         // cost-benefit cleaner leaves them alone until they settle.
         self.store.seg.lock().unwrap().bump_epoch();
         let t_a = std::time::Instant::now();
-        // Dedup (last write wins) and compute leaf value-hashes; buffer values.
         let sv = skip_values();
         // Async values (one-writer path): leave the overlay unflushed here; the
         // one-writer branch writes it on a thread concurrent with Phase B.
         let defer_values = async_values() && one_writer();
+        // Compute the leaf hash `keccak(3 ‖ key ‖ value)` for every entry. The
+        // hashes are independent, so fan them across cores (the keccak is the
+        // bulk of Phase A's CPU). Then dedup into the per-leaf hash map (last
+        // write wins) and buffer the values serially (cheap).
+        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let hthreads = ncpu.min(entries.len() / 1024).max(1);
+        let hashes: Vec<Hash> = if hthreads > 1 {
+            let chunk = entries.len().div_ceil(hthreads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = entries
+                    .chunks(chunk)
+                    .map(|c| scope.spawn(move || c.iter().map(|(k, v)| leaf_hash(*k, v)).collect::<Vec<Hash>>()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("phase-A hash thread panicked"))
+                    .collect()
+            })
+        } else {
+            entries.iter().map(|(k, v)| leaf_hash(*k, v)).collect()
+        };
         let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
-        for (key, value) in entries {
-            let value_hash = hash_leaf_value(&value);
+        for ((key, value), lh) in entries.into_iter().zip(hashes) {
             if !sv {
                 self.overlay.insert(key, value);
             }
-            leaves.insert(key, value_hash);
+            leaves.insert(key, lh);
         }
         if !sv && !defer_values {
             self.flush_values()?;
@@ -1503,23 +1531,77 @@ impl FlatMpt {
             return Ok(self.root());
         }
 
-        // Phase A (serial, read-only): route each key to the frontier disk leaf
-        // it lands in, grouping keys per leaf. Keys with no existing leaf create
-        // fresh structure and are applied serially afterwards.
-        let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
-        let mut fresh: Vec<(Key, Hash)> = Vec::new();
-        for (key, value_hash) in leaves {
-            match find_disk_ptr_key(&self.upper, &key, 0) {
-                Some(ptr) => {
-                    groups
-                        .entry(ptr.unit)
-                        .or_insert_with(|| (ptr, key, Vec::new()))
-                        .2
-                        .push((key, value_hash));
+        // Phase A (read-only): route each key to the frontier disk leaf it lands
+        // in, grouping keys per leaf. Keys with no existing leaf create fresh
+        // structure and are applied serially afterwards. The routing walks are
+        // parallelized across cores below for large batches.
+        // The walks are independent read-only descents of `self.upper`, so fan
+        // them across CPU threads and merge the per-thread partials afterward
+        // (cheap — the merge does no trie walks). Phase A is CPU-bound, so size
+        // to cores, not the (much larger) I/O worker count. A group's
+        // representative key can be *any* key routing to that leaf, so merging
+        // partials in arbitrary order is correct.
+        let build_ns = t_a.elapsed().as_nanos() as u64; // dedup + value-hash + maps
+        let t_route = std::time::Instant::now();
+        let leaves_vec: Vec<(Key, Hash)> = leaves.into_iter().collect();
+        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let route_threads = ncpu.min(leaves_vec.len() / 1024).max(1);
+        let (groups, fresh): (HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)>, Vec<(Key, Hash)>) =
+            if route_threads > 1 {
+                let upper = &self.upper;
+                let chunk = leaves_vec.len().div_ceil(route_threads);
+                let partials: Vec<(HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)>, Vec<(Key, Hash)>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = leaves_vec
+                            .chunks(chunk)
+                            .map(|c| {
+                                scope.spawn(move || {
+                                    let mut g: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> =
+                                        HashMap::new();
+                                    let mut f: Vec<(Key, Hash)> = Vec::new();
+                                    for (key, vh) in c {
+                                        match find_disk_ptr_key(upper, key, 0) {
+                                            Some(ptr) => g
+                                                .entry(ptr.unit)
+                                                .or_insert_with(|| (ptr, *key, Vec::new()))
+                                                .2
+                                                .push((*key, *vh)),
+                                            None => f.push((*key, *vh)),
+                                        }
+                                    }
+                                    (g, f)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().expect("phase-A routing thread panicked"))
+                            .collect()
+                    });
+                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
+                let mut fresh: Vec<(Key, Hash)> = Vec::new();
+                for (g, f) in partials {
+                    for (unit, (ptr, rep, kvs)) in g {
+                        groups.entry(unit).or_insert_with(|| (ptr, rep, Vec::new())).2.extend(kvs);
+                    }
+                    fresh.extend(f);
                 }
-                None => fresh.push((key, value_hash)),
-            }
-        }
+                (groups, fresh)
+            } else {
+                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
+                let mut fresh: Vec<(Key, Hash)> = Vec::new();
+                for (key, value_hash) in leaves_vec {
+                    match find_disk_ptr_key(&self.upper, &key, 0) {
+                        Some(ptr) => groups
+                            .entry(ptr.unit)
+                            .or_insert_with(|| (ptr, key, Vec::new()))
+                            .2
+                            .push((key, value_hash)),
+                        None => fresh.push((key, value_hash)),
+                    }
+                }
+                (groups, fresh)
+            };
         let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
         // Sort by file offset so each worker's chunk is a contiguous file range and
         // reads ascend in place — turning the per-leaf random reads into sequential
@@ -1529,6 +1611,7 @@ impl FlatMpt {
             groups.sort_unstable_by_key(|(ptr, _, _)| ptr.unit);
         }
         let a_ns = t_a.elapsed().as_nanos() as u64;
+        stats::on_phase_a_split(build_ns, t_route.elapsed().as_nanos() as u64);
         let t_b = std::time::Instant::now();
 
         // Phase B (parallel): each group reads its record, applies its keys
@@ -2096,7 +2179,7 @@ fn insert_into_child(
             Ok(())
         }
         None => {
-            let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
+            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
             *slot = Some(make_leaf_child(store, ram, subtree)?);
             Ok(())
         }
@@ -2123,7 +2206,7 @@ fn insert_ram(
             // therefore the hash — is independent of how the leaf was created.
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            let subtree = subtree_from_entries(child_prefix, vec![(key, leaf_hash(key, value_hash))]);
+            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
             let mut children = empty_children();
             children[idx] = Some(make_leaf_child(store, ram, subtree)?);
             *node = RamNode::Branch {
@@ -2161,7 +2244,7 @@ fn insert_ram(
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
-                let subtree = subtree_from_entries(new_prefix, vec![(key, leaf_hash(key, value_hash))]);
+                let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
                 children[new_idx] = Some(make_leaf_child(store, ram, subtree)?);
 
                 let branch = RamNode::Branch {
@@ -2215,15 +2298,17 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
 
 // --- Disk-node constructors: compute and cache the node hash exactly once. ---
 
-/// Position-independent leaf hash: `keccak(3 ‖ key ‖ value_hash)`. It commits to
-/// the *full* key and the value, so it never changes when the leaf moves to a
-/// different position in the tree (only the stored `path` does) — which is what
-/// lets a divergence re-home a leaf without re-hashing it.
-fn leaf_hash(key: Key, value_hash: Hash) -> Hash {
+/// Position-independent leaf hash: `keccak(3 ‖ key ‖ value)`. It commits to the
+/// *full* key and the value directly (no intermediate value-hash), so it never
+/// changes when the leaf moves to a different position in the tree (only the
+/// stored `path` does) — which is what lets a divergence re-home a leaf without
+/// re-hashing it. Computed once at ingest; the result is the `Hash` carried
+/// through routing / record insertion / the frontier.
+fn leaf_hash(key: Key, value: &[u8]) -> Hash {
     let mut h = Keccak256::new();
     h.update([3u8]);
     h.update(key);
-    h.update(value_hash);
+    h.update(value);
     keccak_finalize(h)
 }
 
@@ -2378,7 +2463,7 @@ fn record_node_insert(
         *node = parse_node_lazy(buf, *off, *len)?;
     }
     let nibbles = key_nibbles(&key);
-    let lh = leaf_hash(key, value_hash);
+    let lh = value_hash; // already the leaf hash (computed at ingest)
     let updated = match std::mem::replace(node, Node::Empty) {
         Node::Empty => single_entry_node(key, lh, depth),
         Node::Leaf { path, hash } => {
@@ -4201,12 +4286,6 @@ fn hash_join(tag: u8, path: &[u8], child: &Hash) -> Hash {
     keccak_finalize(h)
 }
 
-fn hash_leaf_value(value: &[u8]) -> Hash {
-    let mut h = Keccak256::new();
-    h.update([6u8]);
-    h.update(value);
-    keccak_finalize(h)
-}
 
 fn keccak(bytes: &[u8]) -> Hash {
     let _g = prof::scope(prof::Cat::Keccak);
@@ -4653,7 +4732,7 @@ mod tests {
         //  (b) hash identically whether that child is inline or overflowed
         //      (the Overflow.root equals the inline node's hash).
         let key = hashed_key("x");
-        let inline_child = leaf_node(vec![5, 6, 7], leaf_hash(key, [9u8; 32]));
+        let inline_child = leaf_node(vec![5, 6, 7], leaf_hash(key, &[9u8; 32]));
         let inline_hash = hash_node(&inline_child);
 
         // Build branch B1 with the child inline at slot 3.

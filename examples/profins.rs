@@ -100,6 +100,13 @@ fn main() {
     let pb = stats::PHASE_B_NS.load(Relaxed);
     let pc = stats::PHASE_C_NS.load(Relaxed);
     let phases = (pa + pb + pc).max(1) as f64;
+    let a_build = stats::A_BUILD_NS.load(Relaxed);
+    let a_route = stats::A_ROUTE_NS.load(Relaxed);
+    let us = |x: u64| x as f64 / 1000.0 / n as f64;
+    println!(
+        "  A split (us/key): build(hash+maps)={:.3}  route(walks)={:.3}",
+        us(a_build), us(a_route),
+    );
     // Phase B is parallel: sub-buckets are summed across worker threads, so only
     // their internal ratios are meaningful. Report them as a share of B-summed.
     let brebuild = stats::B_REBUILD_NS.load(Relaxed);
