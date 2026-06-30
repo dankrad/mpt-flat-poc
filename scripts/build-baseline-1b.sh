@@ -27,6 +27,6 @@ mkdir -p "$OUT"
 
 cargo build --release --example buildpersist
 
-MPT_RAM_BUILD=1 MPT_RAM_BUILD_GIB=70 MPT_BUILD_BATCH=100000000 \
+MPT_RAM_BUILD=1 MPT_RAM_BUILD_GIB=30 MPT_BUILD_BATCH=100000000 \
 MAX_LEAF_KIB=16 MPT_WORKERS=64 MPT_NO_WAL=1 \
   ./target/release/examples/buildpersist 1000000000 "$OUT/ckpt.flat"
