@@ -138,6 +138,28 @@ pub mod stats {
         GC_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Fused-GC evacuation accounting (the `process_fold_gc` path). For each
+    /// candidate region read to evacuate: `REGIONS` counts it, `BYTES_READ` adds
+    /// the whole region read (the full 128 KiB scan), `LIVE_BYTES` adds the live
+    /// records found in it (foreground + survivors — its true utilization),
+    /// `RELOC_BYTES` adds just the relocated survivors' payloads, and `READ_NS`
+    /// the region-read time. Derived: read-amp = `BYTES_READ / RELOC_BYTES` (bytes
+    /// scanned per useful byte moved), evac util = `LIVE_BYTES / BYTES_READ`,
+    /// reloc write share = `RELOC_BYTES / WRITE_BYTES`. These pinpoint whether the
+    /// full-region read or the relocation volume is the cost to cut.
+    pub static GC_EVAC_REGIONS: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GC_RELOC_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_evac(regions: u64, bytes_read: u64, live_bytes: u64, reloc_bytes: u64, read_ns: u64) {
+        GC_EVAC_REGIONS.fetch_add(regions, Relaxed);
+        GC_EVAC_BYTES_READ.fetch_add(bytes_read, Relaxed);
+        GC_EVAC_LIVE_BYTES.fetch_add(live_bytes, Relaxed);
+        GC_RELOC_BYTES.fetch_add(reloc_bytes, Relaxed);
+        GC_EVAC_READ_NS.fetch_add(read_ns, Relaxed);
+    }
+
     /// Phase-C sub-breakdown (serial): INSTALL = splice each group's result into
     /// the frontier + create structure for brand-new keys, ROOT = recompute the
     /// frontier hashes (`hash_ram` over the invalidated path — the keccac-heavy
@@ -214,6 +236,11 @@ pub mod stats {
         GC_REGIONS.store(0, Relaxed);
         GC_RELOCATED.store(0, Relaxed);
         GC_NS.store(0, Relaxed);
+        GC_EVAC_REGIONS.store(0, Relaxed);
+        GC_EVAC_BYTES_READ.store(0, Relaxed);
+        GC_EVAC_LIVE_BYTES.store(0, Relaxed);
+        GC_RELOC_BYTES.store(0, Relaxed);
+        GC_EVAC_READ_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -858,6 +885,96 @@ impl FlatFile {
         Ok(ptrs)
     }
 
+    /// Like [`write_batch`] but fans the per-run `pwrite`s across worker threads.
+    /// All allocation happens first in one locked pass (each run gets a region and
+    /// its records' `ptrs` are assigned); then the writes run lock-free in parallel,
+    /// each run targeting a distinct region. The single-writer `write_batch` is best
+    /// for sequential end-appends (one monotonic stream ~= device seq rate), but the
+    /// bounded-file GC path reuses freed regions scattered across the file, and
+    /// scattered writes are queue-depth-bound — many concurrent writers to distinct
+    /// offsets hit the device's multi-thread write rate (~6-10 GB/s) instead of the
+    /// single-stream ~3.5. No tail contention since every run is a different region.
+    fn write_batch_parallel(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
+        let mut ptrs: Vec<DiskPtr> = vec![DiskPtr { unit: 0, len: 0 }; payloads.len()];
+        // Plan + allocate pass (single, locked): pack runs (each ≤ one region),
+        // reserve a region per run, and fill in every record's ptr.
+        let mut runs: Vec<(u64, u32, usize, usize)> = Vec::new(); // (page_start, run_pages, i, j)
+        {
+            let lt = std::time::Instant::now();
+            let mut seg = self.seg.lock().unwrap();
+            let mut i = 0;
+            while i < payloads.len() {
+                let mut run_bytes = 0usize;
+                let mut j = i;
+                while j < payloads.len() {
+                    let rec = aligned(RECORD_HDR as usize + payloads[j].len());
+                    if j > i && run_bytes + rec > REGION_BYTES {
+                        break;
+                    }
+                    run_bytes += rec;
+                    j += 1;
+                }
+                let run_pages = pages_for(run_bytes as u32);
+                let live_units: u32 = payloads[i..j]
+                    .iter()
+                    .map(|p| units_for(RECORD_HDR + p.len() as u32))
+                    .sum();
+                let page_start = seg.alloc(run_pages, live_units, &self.end_page);
+                let base_unit = page_start * UNITS_PER_PAGE;
+                if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
+                    bail!("flat file exceeds the DiskPtr addressing limit");
+                }
+                let mut off = 0usize;
+                for k in i..j {
+                    ptrs[k] = DiskPtr {
+                        unit: (base_unit + (off / ADDR_UNIT as usize) as u64) as u32,
+                        len: payloads[k].len() as u32,
+                    };
+                    off += aligned(RECORD_HDR as usize + payloads[k].len());
+                }
+                runs.push((page_start, run_pages, i, j));
+                i = j;
+            }
+            stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
+        }
+        // Write pass (parallel, lock-free): each thread pwrites its runs to distinct
+        // region offsets.
+        let threads = worker_count();
+        let chunk = runs.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| -> Result<()> {
+            let handles: Vec<_> = runs
+                .chunks(chunk)
+                .map(|rc| {
+                    scope.spawn(move || -> Result<()> {
+                        for &(page_start, run_pages, i, j) in rc {
+                            let mut buf =
+                                IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
+                            let mut off = 0usize;
+                            for p in &payloads[i..j] {
+                                buf[off..off + 4].copy_from_slice(&(p.len() as u32).to_le_bytes());
+                                buf[off + 4..off + 4 + p.len()].copy_from_slice(p);
+                                stats::on_write(p.len());
+                                off += units_for(RECORD_HDR + p.len() as u32) as usize
+                                    * ADDR_UNIT as usize;
+                            }
+                            let _g = prof::scope(prof::Cat::FileWrite);
+                            let wt = std::time::Instant::now();
+                            (&self.file).write_all_at(&buf, page_start * PAGE)?;
+                            stats::on_pwrite(wt.elapsed().as_nanos() as u64);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("parallel writer thread panicked")?;
+            }
+            Ok(())
+        })?;
+        Ok(ptrs)
+    }
+
     fn read(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
         let record = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
         deserialize_subtree(&record)
@@ -1406,9 +1523,8 @@ impl FlatMpt {
         let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
         // Sort by file offset so each worker's chunk is a contiguous file range and
         // reads ascend in place — turning the per-leaf random reads into sequential
-        // ones, and letting the bulk path coalesce neighbours into one big read.
+        // ones, and letting large batches coalesce neighbours into one big read.
         let coalesce = fold_coalesce();
-        let bulk = coalesce && groups.len() >= FOLD_BULK_GROUPS;
         if coalesce && groups.len() >= 64 {
             groups.sort_unstable_by_key(|(ptr, _, _)| ptr.unit);
         }
@@ -1434,7 +1550,14 @@ impl FlatMpt {
             // that appends them all in a single sequential `write_batch` — avoids the
             // inter-worker append contention (concurrent appends run ~1.1 GB/s vs a
             // single stream's ~3.5). Phased read-all-then-write-all: overlapping the
-            // two would contend for the one device. No inline GC on this path.
+            // two would contend for the one device.
+            //
+            // With opportunistic GC (`opp`): candidate (touched, under-util) regions
+            // are read *once* and that read serves both the foreground fold and the
+            // evacuation of the region's other live records — the relocated payloads
+            // ride the same single writer, so GC adds no second read of those regions
+            // and no append contention. Without `opp`: plain fold, no evacuation.
+            //
             // Async values: hand the overlay to a worker that writes it concurrently
             // with the reads (joined inside the scope, before the batch returns).
             let v_overlay = if defer_values {
@@ -1444,49 +1567,84 @@ impl FlatMpt {
             };
             let store = &self.store;
             let values = &self.values;
-            let threads = worker_count();
-            let chunk = groups.len().div_ceil(threads);
-            // Read phase: all readers fold to payloads (device reading).
+            let upper = &self.upper;
+            // Read phase: readers fold to payloads (device reading), and — when
+            // `opp` — also collect relocated survivors from low-util regions.
             let t_read = std::time::Instant::now();
             #[allow(clippy::type_complexity)]
-            let folded: Vec<(Vec<(Key, Hash, Vec<u8>)>, Vec<(Key, RamChild)>)> =
-                std::thread::scope(|scope| -> Result<_> {
-                    let vh = if !v_overlay.is_empty() {
-                        Some(scope.spawn(|| write_value_batch(values, &v_overlay)))
-                    } else {
-                        None
-                    };
+            let (leaves, promoted, relocs): (
+                Vec<(Key, Hash, Vec<u8>)>,
+                Vec<(Key, RamChild)>,
+                Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
+            ) = std::thread::scope(|scope| -> Result<_> {
+                let vh = if !v_overlay.is_empty() {
+                    Some(scope.spawn(|| write_value_batch(values, &v_overlay)))
+                } else {
+                    None
+                };
+                let folded = if opp {
+                    process_fold_gc(store, upper, &cfg, &groups)?
+                } else {
+                    let threads = worker_count();
+                    let chunk = groups.len().div_ceil(threads);
                     let handles: Vec<_> = groups
                         .chunks(chunk)
                         .map(|c| scope.spawn(|| process_chunk_fold(store, &cfg, c)))
                         .collect();
-                    let mut out = Vec::with_capacity(handles.len());
+                    let mut lv: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+                    let mut pr: Vec<(Key, RamChild)> = Vec::new();
                     for h in handles {
-                        out.push(h.join().expect("fold reader thread panicked")?);
+                        let (l, p) = h.join().expect("fold reader thread panicked")?;
+                        lv.extend(l);
+                        pr.extend(p);
                     }
-                    if let Some(vh) = vh {
-                        vh.join().expect("value writer thread panicked")?;
-                    }
-                    Ok(out)
-                })?;
+                    (lv, pr, Vec::new())
+                };
+                if let Some(vh) = vh {
+                    vh.join().expect("value writer thread panicked")?;
+                }
+                Ok(folded)
+            })?;
             let read_ns = t_read.elapsed().as_nanos() as u64;
-            let mut res: Vec<(Key, RamChild)> = Vec::with_capacity(groups.len());
-            let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
-            for (ls, prom) in folded {
-                res.extend(prom);
-                leaves.extend(ls);
-            }
-            // Write phase: one big sequential `write_batch` of every new leaf.
+            // Write phase: one sequential `write_batch` of every new foreground leaf
+            // followed by every relocated survivor. Then assign the returned ptrs —
+            // foreground -> frontier child, relocations -> (prefix, new_ptr) for the
+            // Phase C install — and free the relocations' old ptrs (the foreground
+            // old ptrs were already freed inside `fold_group`).
             let t_write = std::time::Instant::now();
-            let payloads: Vec<&[u8]> = leaves.iter().map(|(_, _, p)| p.as_slice()).collect();
-            let ptrs = store.write_batch(&payloads)?;
+            let nlv = leaves.len();
+            let payloads: Vec<&[u8]> = leaves
+                .iter()
+                .map(|(_, _, p)| p.as_slice())
+                .chain(relocs.iter().map(|(_, p, _)| p.as_slice()))
+                .collect();
+            // Fused GC reuses freed regions scattered across the file, so its writes
+            // are random — parallel writers (distinct offsets, no tail contention)
+            // beat the single stream there. Plain sequential appends stay single
+            // (one monotonic stream already hits the device's seq rate; concurrent
+            // appends to the tail only contend). `MPT_PARALLEL_WRITE=1` forces it on.
+            let ptrs = if opp || parallel_write() {
+                store.write_batch_parallel(&payloads)?
+            } else {
+                store.write_batch(&payloads)?
+            };
             let write_ns = t_write.elapsed().as_nanos() as u64;
             stats::on_one_writer(read_ns, write_ns);
-            for ((rep, root, _), ptr) in leaves.iter().zip(ptrs) {
-                res.push((*rep, RamChild::Disk { ptr, root: *root }));
+            let mut res: Vec<(Key, RamChild)> = promoted;
+            res.reserve(nlv);
+            for ((rep, root, _), ptr) in leaves.iter().zip(&ptrs[..nlv]) {
+                res.push((*rep, RamChild::Disk { ptr: *ptr, root: *root }));
+            }
+            let mut reloc_out: Vec<(Vec<u8>, DiskPtr)> = Vec::with_capacity(relocs.len());
+            for ((prefix, _, old), ptr) in relocs.iter().zip(&ptrs[nlv..]) {
+                store.free(*old);
+                reloc_out.push((prefix.clone(), *ptr));
+            }
+            if !relocs.is_empty() {
+                stats::on_gc(0, relocs.len() as u64, 0);
             }
             results = res;
-            reloc = Vec::new();
+            reloc = reloc_out;
         } else if opp {
             let (res, rl) = process_opportunistic(&self.store, &self.upper, &cfg, &groups, batched)?;
             stats::on_gc(0, rl.len() as u64, 0);
@@ -1524,7 +1682,10 @@ impl FlatMpt {
             let fg_units: std::collections::HashSet<u32> =
                 groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
             let t_gc = std::time::Instant::now();
-            let r = if bulk { 0 } else { self.gc_rate() };
+            // GC runs every batch (including large/coalesced ones) so the file stays
+            // bounded; `MPT_GC_DISABLE=1` turns it off explicitly for one-shot bulk
+            // loads that don't care about reclaim.
+            let r = self.gc_rate();
             let victims = self.store.seg.lock().unwrap().select_victims(r);
             reloc = if victims.is_empty() {
                 Vec::new()
@@ -1580,6 +1741,18 @@ impl FlatMpt {
         let mut buckets: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
         for (key, vh) in leaves {
             buckets[nibble_at(&key, 0) as usize].push((key, vh));
+        }
+        // Fan the top into a 16-way branch with a single serial insert if it isn't
+        // one yet, so the *rest* of even the first batch takes the parallel path.
+        // Without this, a fresh build runs its entire first batch serially (a 100M
+        // first batch = minutes on one core) just to bootstrap the top branch.
+        if !matches!(self.upper, RamNode::Branch { .. }) {
+            for b in buckets.iter_mut() {
+                if let Some((key, vh)) = b.pop() {
+                    insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, vh, true)?;
+                    break;
+                }
+            }
         }
         if matches!(self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
@@ -2388,20 +2561,17 @@ enum GroupOut {
 /// splits a flush so no single `pwrite` exceeds one region (`REGION_PAGES`).
 const BATCH_LEAVES: usize = 8;
 
-/// Bulk-fold (sequential merge) tuning. When a batch touches many leaves, the
-/// disk path sorts the per-leaf groups by file offset and reads consecutive ones
-/// in a single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
+/// Fold (sequential-merge) tuning. When a batch touches many leaves, the disk
+/// path sorts the per-leaf groups by file offset and reads consecutive ones in a
+/// single `pread` spanning up to `FOLD_SPAN_BYTES`, coalescing across gaps
 /// ≤ `FOLD_MAX_GAP`. Dense runs are thus read a whole region at a time (sequential
-/// bandwidth, ~13 GB/s) instead of one random `pread` per leaf; sparse runs fall
-/// back to ~per-record reads automatically (the next leaf is too far to coalesce).
-/// All leaves in a span share one buffer `Arc` and parse zero-copy. At/above
-/// `FOLD_BULK_GROUPS` touched leaves the inline GC is skipped — a bulk merge is
-/// already rewriting most of the live set, so concurrent random evacuation only
-/// fights the sequential pass.
+/// bandwidth) instead of one random `pread` per leaf; sparse runs fall back to
+/// ~per-record reads automatically (the next leaf is too far to coalesce). All
+/// leaves in a span share one buffer `Arc` and parse zero-copy. Inline GC runs on
+/// every batch regardless of size (use `MPT_GC_DISABLE=1` for gc-off bulk loads).
 const FOLD_SPAN_BYTES: u64 = 8 << 20; // ≤ 8 MiB per coalesced read
 const FOLD_MAX_GAP: u64 = 1 << 20; // coalesce across gaps ≤ 1 MiB
-const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the bulk write path
-const FOLD_BULK_GROUPS: usize = 1 << 16; // ≥ this many groups ⇒ bulk merge (skip GC)
+const FOLD_WRITE_LEAVES: usize = 256; // flush threshold on the batched write path
 
 /// Whether to coalesce leaf writes into batched `pwrite`s. The append allocator
 /// places every write sequentially regardless; batching just cuts syscalls. On by
@@ -2418,6 +2588,16 @@ fn batched_writes() -> bool {
 /// run *slower* than one stream (~1.1 vs ~3.5 GB/s measured), so funnelling the
 /// writes through one stream is ~1.5x faster overall. Phased (read-all then
 /// write-all) beats overlapping them — both share the one device. No inline GC yet.
+/// `MPT_PARALLEL_WRITE=1`: in the one-writer path, fan the write phase's per-run
+/// `pwrite`s across worker threads ([`write_batch_parallel`]) instead of one serial
+/// stream. Helps when the writes are scattered (bounded-file GC reusing freed
+/// regions) — random writes are queue-depth-bound. Opt-in for A/B.
+fn parallel_write() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_PARALLEL_WRITE").as_deref() == Ok("1"))
+}
+
 fn one_writer() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2519,7 +2699,25 @@ fn value_db_opts() -> (Options, Cache) {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.set_block_based_table_factory(&bbt);
-    opts.set_db_write_buffer_size(1 << 30); // ~1 GiB total across memtables
+    // Bulk-load tuning for the value store. The build's dominant serial cost used
+    // to be `flush_values`: writing one big value `WriteBatch` per insert batch
+    // into the default skiplist memtable, which pays ~1.9 us/value of cache-miss-
+    // heavy random inserts and gets *worse* as the memtable grows (so big batches
+    // hurt — a 100M-key batch was ~37 us/key). The vector memtable makes the write
+    // path an O(1) append and defers the sort to the background flush, cutting the
+    // value flush ~20x (to ~0.1 us/key). Its poor point-read performance never
+    // matters here: values are write-only during the build. The remaining knobs
+    // give it plural memtables + parallel background jobs so flushes stay off the
+    // write path, and a relaxed L0 trigger so the bulk load never throttles.
+    opts.set_allow_concurrent_memtable_write(false); // required by the vector rep
+    opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
+    opts.set_write_buffer_size(256 << 20); // 256 MiB memtables (flush often, in bg)
+    opts.set_max_write_buffer_number(6); // plenty buffered while bg threads flush
+    opts.set_min_write_buffer_number_to_merge(1);
+    opts.set_max_background_jobs(8); // parallel flush + compaction
+    opts.set_max_subcompactions(4);
+    opts.set_level_zero_slowdown_writes_trigger(-1); // don't slow down on L0 buildup
+    opts.set_level_zero_stop_writes_trigger(1 << 20); // effectively never stop
     (opts, cache)
 }
 
@@ -3612,6 +3810,184 @@ fn process_opportunistic(
         }
         Ok((results, reloc))
     })
+}
+
+/// Like [`evac_and_fold_region`] but **writes nothing** — it reads the region once
+/// and returns the payloads to be written: foreground promotions, foreground new
+/// leaves `(rep, root, payload)`, and relocations `(prefix, payload, old_ptr)`.
+/// Used by the fused one-writer GC path, which funnels all of these into the
+/// single sequential writer instead of each region thread writing on its own.
+/// `fold_group` still frees the foreground records' old ptrs; the relocations'
+/// old ptrs are freed by the caller after the single write commits.
+#[allow(clippy::type_complexity)]
+fn fold_region_collect(
+    store: &FlatFile,
+    cfg: &Config,
+    upper: &RamNode,
+    region: u64,
+    fg: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+) -> Result<(
+    Vec<(Key, RamChild)>,
+    Vec<(Key, Hash, Vec<u8>)>,
+    Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
+)> {
+    let t = std::time::Instant::now();
+    let buf = store.read_region(region)?;
+    let read_ns = t.elapsed().as_nanos() as u64;
+    stats::on_read_io(read_ns);
+    let base_unit = region * REGION_UNITS;
+    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Hash)>)> =
+        fg.iter().map(|g| (g.0.unit, g)).collect();
+
+    let mut promoted: Vec<(Key, RamChild)> = Vec::new();
+    let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+    let mut relocs: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+    // Evac instrumentation: live bytes found (true region utilization) and relocated
+    // survivor bytes, against the full region read.
+    let mut live_bytes: u64 = 0;
+    let mut reloc_bytes: u64 = 0;
+
+    let mut p = 0usize;
+    while p + 4 <= buf.len() {
+        let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+        if len == 0 {
+            let next = (p / PAGE as usize + 1) * PAGE as usize;
+            if next <= p {
+                break;
+            }
+            p = next;
+            continue;
+        }
+        let rec_units = units_for(RECORD_HDR + len) as usize;
+        let end = p + 4 + len as usize;
+        if end > buf.len() {
+            break; // records never straddle a region
+        }
+        let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
+        let ptr = DiskPtr { unit, len };
+        if let Some(g) = fg_by_unit.get(&unit) {
+            live_bytes += len as u64; // foreground record was live
+            let rec: Arc<[u8]> = Arc::from(&buf[p + 4..end]);
+            let subtree = deserialize_subtree_lazy_at(rec, 0, len as usize)?;
+            match fold_group(store, cfg, ptr, subtree, &g.2, 0)? {
+                GroupOut::Promoted(rc) => promoted.push((g.1, rc)),
+                GroupOut::Leaf { payload, root } => leaves.push((g.1, root, payload)),
+            }
+        } else {
+            // Other live record in this low-util region: relocate it (skip stale).
+            let payload = &buf[p + 4..end];
+            if let Ok(prefix) = parse_prefix(payload) {
+                if find_disk_ptr(upper, &prefix, 0) == Some(ptr) {
+                    live_bytes += len as u64;
+                    reloc_bytes += len as u64;
+                    relocs.push((prefix, payload.to_vec(), ptr));
+                }
+            }
+        }
+        p += rec_units * ADDR_UNIT as usize;
+    }
+    stats::on_evac(1, buf.len() as u64, live_bytes, reloc_bytes, read_ns);
+    Ok((promoted, leaves, relocs))
+}
+
+/// Read phase for the fused one-writer + opportunistic-GC path. Like
+/// [`process_opportunistic`] it splits groups into candidate (touched, under-util)
+/// regions and the rest, reading each candidate region exactly once to fold the
+/// foreground keys *and* evacuate the region's other live records — but it
+/// **collects** all resulting payloads instead of writing them, so the caller can
+/// append them in one sequential `write_batch`. Returns
+/// `(foreground_leaves, promotions, relocations)`.
+#[allow(clippy::type_complexity)]
+fn process_fold_gc(
+    store: &FlatFile,
+    upper: &RamNode,
+    cfg: &Config,
+    groups: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+) -> Result<(
+    Vec<(Key, Hash, Vec<u8>)>,
+    Vec<(Key, RamChild)>,
+    Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
+)> {
+    let cand: std::collections::HashSet<u64> = {
+        let touched: std::collections::HashSet<u64> =
+            groups.iter().map(|(p, _, _)| p.unit as u64 / REGION_UNITS).collect();
+        store
+            .seg
+            .lock()
+            .unwrap()
+            .select_opportunistic(&touched, gc_opp_util())
+            .into_iter()
+            .collect()
+    };
+    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>> =
+        std::collections::HashMap::new();
+    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = Vec::new();
+    for g in groups {
+        let region = g.0.unit as u64 / REGION_UNITS;
+        if cand.contains(&region) {
+            by_region.entry(region).or_default().push(g.clone());
+        } else {
+            normal.push(g.clone());
+        }
+    }
+    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>)> =
+        by_region.into_iter().collect();
+    region_jobs.sort_unstable_by_key(|(r, _)| *r); // sequential region reads
+    let threads = worker_count();
+
+    #[allow(clippy::type_complexity)]
+    std::thread::scope(
+        |scope| -> Result<(
+            Vec<(Key, Hash, Vec<u8>)>,
+            Vec<(Key, RamChild)>,
+            Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
+        )> {
+            let nchunk = normal.len().div_ceil(threads).max(1);
+            let normal_handles: Vec<_> = normal
+                .chunks(nchunk)
+                .map(|c| scope.spawn(|| process_chunk_fold(store, cfg, c)))
+                .collect();
+            let rchunk = region_jobs.len().div_ceil(threads).max(1);
+            #[allow(clippy::type_complexity)]
+            let region_handles: Vec<_> = region_jobs
+                .chunks(rchunk.max(1))
+                .map(|rc| {
+                    scope.spawn(move || -> Result<(
+                        Vec<(Key, RamChild)>,
+                        Vec<(Key, Hash, Vec<u8>)>,
+                        Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
+                    )> {
+                        let mut pr = Vec::new();
+                        let mut lv = Vec::new();
+                        let mut rl = Vec::new();
+                        for (region, fgs) in rc {
+                            let (p, l, r) = fold_region_collect(store, cfg, upper, *region, fgs)?;
+                            pr.extend(p);
+                            lv.extend(l);
+                            rl.extend(r);
+                        }
+                        Ok((pr, lv, rl))
+                    })
+                })
+                .collect();
+
+            let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
+            let mut promoted: Vec<(Key, RamChild)> = Vec::new();
+            let mut relocs: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+            for h in normal_handles {
+                let (l, p) = h.join().expect("normal fold thread panicked")?;
+                leaves.extend(l);
+                promoted.extend(p);
+            }
+            for h in region_handles {
+                let (p, l, r) = h.join().expect("region evac thread panicked")?;
+                promoted.extend(p);
+                leaves.extend(l);
+                relocs.extend(r);
+            }
+            Ok((leaves, promoted, relocs))
+        },
+    )
 }
 
 fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {

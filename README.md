@@ -14,15 +14,26 @@ fixed 32-byte hashes (64 nibbles); values are arbitrary byte strings.
 
 ## Quick start
 
+**Start here.** These are the two primary scripts — each takes a single argument (a
+directory) and reproduces the headline results end-to-end:
+
 ```bash
-# Build a tree of any size to a reopenable checkpoint (RAM-build, spills to disk):
-scripts/build-tree.sh /data/tree.flat 1000000000
+# 1. Build the 1B-key baseline the fast way (RAM-build, 100M-key batches, spill at
+#    70 GiB) → <dir>/ckpt.flat   (~1420 s, ~1.4 us/key)
+scripts/build-baseline-1b.sh /data/baseline
 
-# Benchmark batch inserts into it (on a throwaway clone; prints us/key):
-scripts/batch-bench.sh /data/tree.flat 10000000 10000
+# 2. Benchmark the fused fast path on a throwaway COW clone of it — one-writer +
+#    opportunistic GC + parallel writer + no-WAL + async values; prints us/key +
+#    the device read/write split + the gc-evac breakdown.
+scripts/bench-fused.sh /data/baseline
+```
 
-# Grow it by N more keys and re-checkpoint in place:
-scripts/grow-tree.sh /data/tree.flat 100000000
+General-purpose variants (arbitrary size, custom batches, in-place growth):
+
+```bash
+scripts/build-tree.sh  /data/tree.flat 1000000000      # build a tree of any size
+scripts/batch-bench.sh /data/tree.flat 10000000 10000  # benchmark batch inserts on a clone
+scripts/grow-tree.sh   /data/tree.flat 100000000       # grow a tree + re-checkpoint in place
 ```
 
 A checkpoint is three siblings: `tree.flat` (packed subtrees), `tree.flat.meta`
@@ -82,7 +93,11 @@ dense packing cut the 1B file from 256 → ~154 GiB.)
 The trie only ever manipulates a `value_hash` (keccak of the value); the real
 bytes live in an embedded RocksDB in `<flatfile>.values/`. Inserts buffer values
 in a RAM overlay and flush them as one `WriteBatch`; `get_value` checks the
-overlay first so reads see the latest write.
+overlay first so reads see the latest write. The store is tuned for write-only
+bulk load (`value_db_opts`): a **vector memtable** makes the flush an O(1) append
+(the sort is deferred to the background SST flush), which cut the value flush ~20×
+— it was the build's dominant serial cost with the default skiplist memtable
+(~1.9 µs/value of cache-miss-heavy random inserts, *worse* as the memtable grows).
 
 ### Persistence (`persist` / `open`, the `.meta` manifest)
 The flat file and value store hold the data, but the *index* tying them together
@@ -109,10 +124,15 @@ writable trie (cached hashes and all). A crash reopens at the last checkpoint.
    the root once.
 
 **RAM-build mode** (`MPT_RAM_BUILD=1`, used by `build-tree.sh`): new/rewritten
-leaves live in RAM as their own `Arc`s with no flat-file I/O or GC — ~1.8 µs/key.
-When the process footprint crosses a threshold it **spills** the leaves to disk
-and reverts to the disk path. This makes building huge trees fast: the first
-several hundred million keys are pure-RAM.
+leaves live in RAM as their own `Arc`s with no flat-file I/O or GC. The batch is
+partitioned by top nibble and the insert is **fanned across the top branch's 16
+disjoint child subtrees** (one thread each, no shared store, no lock); a fresh
+tree is bootstrapped into a 16-way branch with a single serial insert so even the
+first batch parallelizes. When the process footprint crosses a threshold it
+**spills** the leaves to disk and reverts to the disk path. Building huge trees is
+fast: a 1B-key tree (16 KiB leaves, 100M-key batches) builds in ~1420 s (~1.4
+µs/key) — pure-RAM until the spill (~500M keys at a 70 GiB ceiling), then the disk
+path with bounded GC (~7 GiB flat growth per 100M-key batch).
 
 **The disk path** has been profiled and tuned (see **Tuning**); the headline
 findings: per-key compute is hidden under read I/O, reads are near the device
@@ -167,6 +187,8 @@ Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
 |------|--------------|
 | [`src/lib.rs`](src/lib.rs) | The entire engine (see the component map below). |
 | [`scripts/build-tree.sh`](scripts/build-tree.sh) | **Fast-build a tree of any size** → checkpoint (RAM-build + spill). |
+| [`scripts/build-baseline-1b.sh`](scripts/build-baseline-1b.sh) | ⭐ **PRIMARY — build the 1B baseline** the fast way (RAM-build, 100M-key batches, spill at 70 GiB) → `<dir>/ckpt.flat`. Single arg: output dir. |
+| [`scripts/bench-fused.sh`](scripts/bench-fused.sh) | ⭐ **PRIMARY — benchmark the fused fast path** (one-writer + opportunistic GC + parallel writer + no-WAL + async values) on a COW clone; 25M warmup → 10M measured. Single arg: baseline dir. |
 | [`scripts/batch-bench.sh`](scripts/batch-bench.sh) | **Benchmark batch inserts** into a tree, on a throwaway COW clone; prints us/key. |
 | [`scripts/grow-tree.sh`](scripts/grow-tree.sh) | **Grow a tree** by N more keys and re-checkpoint it in place. |
 | [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` (preload + timed inserts/overwrites); documents prereqs. |

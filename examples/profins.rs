@@ -28,10 +28,28 @@ fn main() {
     let batch: u64 = a.next().map(|s| s.parse().unwrap()).unwrap_or(10_000);
 
     let mut db = FlatMpt::open(&path).unwrap();
+    let mut i = start;
+    // Optional warmup (MPT_PROF_WARMUP keys) inserted *before* measuring + resetting
+    // stats — drives GC to its steady-state utilization so the evac breakdown
+    // reflects the steady regime, not the dilute early phase (regions still >util).
+    let warmup: u64 = std::env::var("MPT_PROF_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if warmup > 0 {
+        let mut done = 0u64;
+        while done < warmup {
+            let this = batch.min(warmup - done);
+            let entries: Vec<(Key, Vec<u8>)> = (i..i + this).map(|k| (key(k), vec![0u8; 32])).collect();
+            db.insert_batch(entries).unwrap();
+            done += this;
+            i += this;
+        }
+        eprintln!("warmup: {warmup} keys, flat {:.1} GiB", db.flat_file_len() as f64 / (1024.0 * 1024.0 * 1024.0));
+    }
     let flat0 = db.flat_file_len();
     stats::reset();
     let t = Instant::now();
-    let mut i = start;
     let mut done = 0u64;
     while done < n {
         let this = batch.min(n - done);
@@ -53,6 +71,28 @@ fn main() {
             ow_write as f64 / 1000.0 / n as f64,
             (ow_read + ow_write) as f64 / total_ns * 100.0,
             (1.0 - (ow_read + ow_write) as f64 / total_ns) * 100.0,
+        );
+    }
+
+    // Fused-GC evacuation breakdown: where the GC cost actually goes.
+    let ev_regions = stats::GC_EVAC_REGIONS.load(Relaxed);
+    if ev_regions > 0 {
+        let ev_read = stats::GC_EVAC_BYTES_READ.load(Relaxed);
+        let ev_live = stats::GC_EVAC_LIVE_BYTES.load(Relaxed);
+        let ev_reloc = stats::GC_RELOC_BYTES.load(Relaxed);
+        let ev_read_ns = stats::GC_EVAC_READ_NS.load(Relaxed);
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let wbytes_all = stats::WRITE_BYTES.load(Relaxed).max(1);
+        println!(
+            "  gc-evac: {} regions  read {:.1} GiB ({:.0} KiB/region, util {:.0}%)  reloc {:.2} GiB  read-amp {:.1}x/reloc-byte  evac-read {:.2} us/key  reloc-write-share {:.0}%",
+            ev_regions,
+            ev_read as f64 / gib,
+            ev_read as f64 / ev_regions as f64 / 1024.0,
+            ev_live as f64 / ev_read.max(1) as f64 * 100.0,
+            ev_reloc as f64 / gib,
+            ev_read as f64 / ev_reloc.max(1) as f64,
+            ev_read_ns as f64 / 1000.0 / n as f64,
+            ev_reloc as f64 / wbytes_all as f64 * 100.0,
         );
     }
 
