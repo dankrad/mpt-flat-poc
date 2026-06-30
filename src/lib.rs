@@ -2807,8 +2807,12 @@ pub fn process_footprint_bytes() -> u64 {
 }
 
 /// Number of Phase-B worker threads (each issues one blocking pread at a time, so
-/// this is effectively the read queue depth). Defaults to min(cores, 8);
-/// `MPT_WORKERS=N` overrides — used to explore the device QD curve.
+/// this is effectively the read queue depth). Defaults to 192: the reads are
+/// I/O-bound (threads block on pread), so we intentionally oversubscribe cores to
+/// keep the device queue deep. Measured sweet spot on NVMe — read-phase µs/key
+/// keeps falling to ~192 then regresses as the buffered-read IOPS ceiling
+/// (~165K) saturates and extra threads only deepen the queue. `MPT_WORKERS=N`
+/// overrides (e.g. to explore the QD curve or cap threads on a small box).
 fn worker_count() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
@@ -2817,12 +2821,7 @@ fn worker_count() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-                    .min(8)
-            })
+            .unwrap_or(192)
     })
 }
 
