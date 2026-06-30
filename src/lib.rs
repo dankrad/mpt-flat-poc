@@ -138,6 +138,28 @@ pub mod stats {
         GC_NS.fetch_add(ns, Relaxed);
     }
 
+    /// Fused-GC evacuation accounting (the `process_fold_gc` path). For each
+    /// candidate region read to evacuate: `REGIONS` counts it, `BYTES_READ` adds
+    /// the whole region read (the full 128 KiB scan), `LIVE_BYTES` adds the live
+    /// records found in it (foreground + survivors — its true utilization),
+    /// `RELOC_BYTES` adds just the relocated survivors' payloads, and `READ_NS`
+    /// the region-read time. Derived: read-amp = `BYTES_READ / RELOC_BYTES` (bytes
+    /// scanned per useful byte moved), evac util = `LIVE_BYTES / BYTES_READ`,
+    /// reloc write share = `RELOC_BYTES / WRITE_BYTES`. These pinpoint whether the
+    /// full-region read or the relocation volume is the cost to cut.
+    pub static GC_EVAC_REGIONS: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GC_RELOC_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GC_EVAC_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn on_evac(regions: u64, bytes_read: u64, live_bytes: u64, reloc_bytes: u64, read_ns: u64) {
+        GC_EVAC_REGIONS.fetch_add(regions, Relaxed);
+        GC_EVAC_BYTES_READ.fetch_add(bytes_read, Relaxed);
+        GC_EVAC_LIVE_BYTES.fetch_add(live_bytes, Relaxed);
+        GC_RELOC_BYTES.fetch_add(reloc_bytes, Relaxed);
+        GC_EVAC_READ_NS.fetch_add(read_ns, Relaxed);
+    }
+
     /// Phase-C sub-breakdown (serial): INSTALL = splice each group's result into
     /// the frontier + create structure for brand-new keys, ROOT = recompute the
     /// frontier hashes (`hash_ram` over the invalidated path — the keccac-heavy
@@ -214,6 +236,11 @@ pub mod stats {
         GC_REGIONS.store(0, Relaxed);
         GC_RELOCATED.store(0, Relaxed);
         GC_NS.store(0, Relaxed);
+        GC_EVAC_REGIONS.store(0, Relaxed);
+        GC_EVAC_BYTES_READ.store(0, Relaxed);
+        GC_EVAC_LIVE_BYTES.store(0, Relaxed);
+        GC_RELOC_BYTES.store(0, Relaxed);
+        GC_EVAC_READ_NS.store(0, Relaxed);
         for a in &PAGE_HIST {
             a.store(0, Relaxed);
         }
@@ -855,6 +882,96 @@ impl FlatFile {
             stats::on_pwrite(wt.elapsed().as_nanos() as u64);
             i = j;
         }
+        Ok(ptrs)
+    }
+
+    /// Like [`write_batch`] but fans the per-run `pwrite`s across worker threads.
+    /// All allocation happens first in one locked pass (each run gets a region and
+    /// its records' `ptrs` are assigned); then the writes run lock-free in parallel,
+    /// each run targeting a distinct region. The single-writer `write_batch` is best
+    /// for sequential end-appends (one monotonic stream ~= device seq rate), but the
+    /// bounded-file GC path reuses freed regions scattered across the file, and
+    /// scattered writes are queue-depth-bound — many concurrent writers to distinct
+    /// offsets hit the device's multi-thread write rate (~6-10 GB/s) instead of the
+    /// single-stream ~3.5. No tail contention since every run is a different region.
+    fn write_batch_parallel(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
+        let mut ptrs: Vec<DiskPtr> = vec![DiskPtr { unit: 0, len: 0 }; payloads.len()];
+        // Plan + allocate pass (single, locked): pack runs (each ≤ one region),
+        // reserve a region per run, and fill in every record's ptr.
+        let mut runs: Vec<(u64, u32, usize, usize)> = Vec::new(); // (page_start, run_pages, i, j)
+        {
+            let lt = std::time::Instant::now();
+            let mut seg = self.seg.lock().unwrap();
+            let mut i = 0;
+            while i < payloads.len() {
+                let mut run_bytes = 0usize;
+                let mut j = i;
+                while j < payloads.len() {
+                    let rec = aligned(RECORD_HDR as usize + payloads[j].len());
+                    if j > i && run_bytes + rec > REGION_BYTES {
+                        break;
+                    }
+                    run_bytes += rec;
+                    j += 1;
+                }
+                let run_pages = pages_for(run_bytes as u32);
+                let live_units: u32 = payloads[i..j]
+                    .iter()
+                    .map(|p| units_for(RECORD_HDR + p.len() as u32))
+                    .sum();
+                let page_start = seg.alloc(run_pages, live_units, &self.end_page);
+                let base_unit = page_start * UNITS_PER_PAGE;
+                if base_unit + (run_pages as u64 * UNITS_PER_PAGE) > u32::MAX as u64 {
+                    bail!("flat file exceeds the DiskPtr addressing limit");
+                }
+                let mut off = 0usize;
+                for k in i..j {
+                    ptrs[k] = DiskPtr {
+                        unit: (base_unit + (off / ADDR_UNIT as usize) as u64) as u32,
+                        len: payloads[k].len() as u32,
+                    };
+                    off += aligned(RECORD_HDR as usize + payloads[k].len());
+                }
+                runs.push((page_start, run_pages, i, j));
+                i = j;
+            }
+            stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
+        }
+        // Write pass (parallel, lock-free): each thread pwrites its runs to distinct
+        // region offsets.
+        let threads = worker_count();
+        let chunk = runs.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| -> Result<()> {
+            let handles: Vec<_> = runs
+                .chunks(chunk)
+                .map(|rc| {
+                    scope.spawn(move || -> Result<()> {
+                        for &(page_start, run_pages, i, j) in rc {
+                            let mut buf =
+                                IoBuf::zeroed(run_pages as usize * PAGE as usize, self.direct);
+                            let mut off = 0usize;
+                            for p in &payloads[i..j] {
+                                buf[off..off + 4].copy_from_slice(&(p.len() as u32).to_le_bytes());
+                                buf[off + 4..off + 4 + p.len()].copy_from_slice(p);
+                                stats::on_write(p.len());
+                                off += units_for(RECORD_HDR + p.len() as u32) as usize
+                                    * ADDR_UNIT as usize;
+                            }
+                            let _g = prof::scope(prof::Cat::FileWrite);
+                            let wt = std::time::Instant::now();
+                            (&self.file).write_all_at(&buf, page_start * PAGE)?;
+                            stats::on_pwrite(wt.elapsed().as_nanos() as u64);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("parallel writer thread panicked")?;
+            }
+            Ok(())
+        })?;
         Ok(ptrs)
     }
 
@@ -1501,7 +1618,16 @@ impl FlatMpt {
                 .map(|(_, _, p)| p.as_slice())
                 .chain(relocs.iter().map(|(_, p, _)| p.as_slice()))
                 .collect();
-            let ptrs = store.write_batch(&payloads)?;
+            // Fused GC reuses freed regions scattered across the file, so its writes
+            // are random — parallel writers (distinct offsets, no tail contention)
+            // beat the single stream there. Plain sequential appends stay single
+            // (one monotonic stream already hits the device's seq rate; concurrent
+            // appends to the tail only contend). `MPT_PARALLEL_WRITE=1` forces it on.
+            let ptrs = if opp || parallel_write() {
+                store.write_batch_parallel(&payloads)?
+            } else {
+                store.write_batch(&payloads)?
+            };
             let write_ns = t_write.elapsed().as_nanos() as u64;
             stats::on_one_writer(read_ns, write_ns);
             let mut res: Vec<(Key, RamChild)> = promoted;
@@ -2462,6 +2588,16 @@ fn batched_writes() -> bool {
 /// run *slower* than one stream (~1.1 vs ~3.5 GB/s measured), so funnelling the
 /// writes through one stream is ~1.5x faster overall. Phased (read-all then
 /// write-all) beats overlapping them — both share the one device. No inline GC yet.
+/// `MPT_PARALLEL_WRITE=1`: in the one-writer path, fan the write phase's per-run
+/// `pwrite`s across worker threads ([`write_batch_parallel`]) instead of one serial
+/// stream. Helps when the writes are scattered (bounded-file GC reusing freed
+/// regions) — random writes are queue-depth-bound. Opt-in for A/B.
+fn parallel_write() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_PARALLEL_WRITE").as_deref() == Ok("1"))
+}
+
 fn one_writer() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -3697,7 +3833,8 @@ fn fold_region_collect(
 )> {
     let t = std::time::Instant::now();
     let buf = store.read_region(region)?;
-    stats::on_read_io(t.elapsed().as_nanos() as u64);
+    let read_ns = t.elapsed().as_nanos() as u64;
+    stats::on_read_io(read_ns);
     let base_unit = region * REGION_UNITS;
     let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Hash)>)> =
         fg.iter().map(|g| (g.0.unit, g)).collect();
@@ -3705,6 +3842,10 @@ fn fold_region_collect(
     let mut promoted: Vec<(Key, RamChild)> = Vec::new();
     let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
     let mut relocs: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+    // Evac instrumentation: live bytes found (true region utilization) and relocated
+    // survivor bytes, against the full region read.
+    let mut live_bytes: u64 = 0;
+    let mut reloc_bytes: u64 = 0;
 
     let mut p = 0usize;
     while p + 4 <= buf.len() {
@@ -3725,6 +3866,7 @@ fn fold_region_collect(
         let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
         let ptr = DiskPtr { unit, len };
         if let Some(g) = fg_by_unit.get(&unit) {
+            live_bytes += len as u64; // foreground record was live
             let rec: Arc<[u8]> = Arc::from(&buf[p + 4..end]);
             let subtree = deserialize_subtree_lazy_at(rec, 0, len as usize)?;
             match fold_group(store, cfg, ptr, subtree, &g.2, 0)? {
@@ -3736,12 +3878,15 @@ fn fold_region_collect(
             let payload = &buf[p + 4..end];
             if let Ok(prefix) = parse_prefix(payload) {
                 if find_disk_ptr(upper, &prefix, 0) == Some(ptr) {
+                    live_bytes += len as u64;
+                    reloc_bytes += len as u64;
                     relocs.push((prefix, payload.to_vec(), ptr));
                 }
             }
         }
         p += rec_units * ADDR_UNIT as usize;
     }
+    stats::on_evac(1, buf.len() as u64, live_bytes, reloc_bytes, read_ns);
     Ok((promoted, leaves, relocs))
 }
 
