@@ -107,6 +107,15 @@ fn main() {
         "  A split (us/key): build(hash+maps)={:.3}  route(walks)={:.3}",
         us(a_build), us(a_route),
     );
+    // Size of the in-RAM frontier (the index that stays resident): branch/extension
+    // node count + their heap bytes, and the total in-RAM index incl. free-list.
+    let rr = db.ram_report();
+    println!(
+        "  ram frontier: {} nodes, {:.1} MiB  (total in-RAM index {:.1} MiB)",
+        rr.frontier_nodes,
+        rr.frontier_bytes as f64 / (1024.0 * 1024.0),
+        rr.total_bytes() as f64 / (1024.0 * 1024.0),
+    );
     // Phase B is parallel: sub-buckets are summed across worker threads, so only
     // their internal ratios are meaningful. Report them as a share of B-summed.
     let brebuild = stats::B_REBUILD_NS.load(Relaxed);
