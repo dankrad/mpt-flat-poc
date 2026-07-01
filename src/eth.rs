@@ -153,10 +153,38 @@ mod tests {
         s.as_bytes().to_vec()
     }
 
+    fn hx(s: &str) -> Vec<u8> {
+        alloy_primitives::hex::decode(s).unwrap()
+    }
+
     #[test]
     fn empty_trie_root() {
-        // keccak256(RLP("")) = the canonical empty MPT root.
-        assert_eq!(root(&[]), keccak256([0x80u8]));
+        // keccak256(RLP("")) = the canonical empty MPT root (also Ethereum's
+        // EMPTY_ROOT / empty storage-trie root).
+        let empty: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+            .parse()
+            .unwrap();
+        assert_eq!(root(&[]), empty);
+        assert_eq!(keccak256([0x80u8]), empty);
+    }
+
+    #[test]
+    fn official_secure_trie_accounts() {
+        // ethereum/tests TrieTests/hex_encoded_securetrie_test.json "test1":
+        // address -> RLP(account); keys are keccak-hashed (secure trie). This is the
+        // Ethereum state-trie shape exactly.
+        let pairs = [
+            ("a94f5374fce5edbc8e2a8697c15331677e6ebf0b", "f848018405f446a7a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("095e7baea6a6c7c4c2dfeb977efac326af552d87", "f8440101a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a004bccc5d94f4d1f99aab44369a910179931772f2a5c001c3229f57831c102769"),
+            ("d2571607e241ecf590ed94b12d87c94babe36db6", "f8440180a0ba4b47865c55a341a4a78759bb913cd15c3ee8eaf30a62fa8d1c8863113d84e8a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("62c01474f089b07dae603491675dc5b5748f7049", "f8448080a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("2adc25665018aa1fe0e6bc666dac8fc2697ff9ba", "f8478083019a59a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+        ];
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = pairs.iter().map(|(k, v)| (hx(k), hx(v))).collect();
+        let want: B256 = "0x730a444e08ab4b8dee147c9b232fc52d34a223d600031c1e9d25bfc985cbd797"
+            .parse()
+            .unwrap();
+        assert_eq!(secure_root(&entries), want);
     }
 
     #[test]
