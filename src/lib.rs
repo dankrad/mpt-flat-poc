@@ -1103,9 +1103,13 @@ enum Node {
     Leaf {
         /// Remaining key nibbles from this leaf's position to depth 64 (a merged
         /// extension+leaf). The full key is `position_prefix ++ path`, recovered
-        /// from the tree position, so the key isn't stored; `value_hash` is folded
-        /// into the position-independent `hash`, so it isn't stored either.
+        /// from the tree position, so the key isn't stored.
         path: Vec<u8>,
+        /// The leaf's value bytes. Ethereum's leaf hash is `keccak256(RLP([
+        /// hex_prefix(path), value]))`, so it depends on `path`; when a split
+        /// re-homes the leaf to a shallower depth its `path` shrinks and `hash`
+        /// must be recomputed — which needs `value` here, in the trie.
+        value: Vec<u8>,
         hash: Hash,
     },
     Extension {
@@ -1460,14 +1464,13 @@ impl FlatMpt {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Hash> {
-        let value_hash = leaf_hash(key, &value);
-        self.overlay.insert(key, value);
+        self.overlay.insert(key, value.clone());
         if self.overlay.len() >= VALUE_BATCH {
             self.flush_values()?;
         }
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
-        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash, ram)?;
+        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value, ram)?;
         self.store.flush()?;
         Ok(self.root())
     }
@@ -1490,33 +1493,17 @@ impl FlatMpt {
         // Async values (one-writer path): leave the overlay unflushed here; the
         // one-writer branch writes it on a thread concurrent with Phase B.
         let defer_values = async_values() && one_writer();
-        // Compute the leaf hash `keccak(3 ‖ key ‖ value)` for every entry. The
-        // hashes are independent, so fan them across cores (the keccak is the
-        // bulk of Phase A's CPU). Then dedup into the per-leaf hash map (last
-        // write wins) and buffer the values serially (cheap).
-        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let hthreads = ncpu.min(entries.len() / 1024).max(1);
-        let hashes: Vec<Hash> = if hthreads > 1 {
-            let chunk = entries.len().div_ceil(hthreads);
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = entries
-                    .chunks(chunk)
-                    .map(|c| scope.spawn(move || c.iter().map(|(k, v)| leaf_hash(*k, v)).collect::<Vec<Hash>>()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().expect("phase-A hash thread panicked"))
-                    .collect()
-            })
-        } else {
-            entries.iter().map(|(k, v)| leaf_hash(*k, v)).collect()
-        };
-        let mut leaves: BTreeMap<Key, Hash> = BTreeMap::new();
-        for ((key, value), lh) in entries.into_iter().zip(hashes) {
+        // Dedup entries into the per-leaf value map (last write wins) and buffer
+        // the values for the RocksDB overlay. The Ethereum leaf hash is
+        // position-dependent, so it can't be precomputed here (as the old
+        // position-independent hash was) — it's computed when the leaf is placed,
+        // inside the parallel per-record fold of Phase B.
+        let mut leaves: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+        for (key, value) in entries.into_iter() {
             if !sv {
-                self.overlay.insert(key, value);
+                self.overlay.insert(key, value.clone());
             }
-            leaves.insert(key, lh);
+            leaves.insert(key, value);
         }
         if !sv && !defer_values {
             self.flush_values()?;
@@ -1545,30 +1532,30 @@ impl FlatMpt {
         // partials in arbitrary order is correct.
         let build_ns = t_a.elapsed().as_nanos() as u64; // dedup + value-hash + maps
         let t_route = std::time::Instant::now();
-        let leaves_vec: Vec<(Key, Hash)> = leaves.into_iter().collect();
+        let leaves_vec: Vec<(Key, Vec<u8>)> = leaves.into_iter().collect();
         let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let route_threads = ncpu.min(leaves_vec.len() / 1024).max(1);
-        let (groups, fresh): (HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)>, Vec<(Key, Hash)>) =
+        let (groups, fresh): (HashMap<u32, (DiskPtr, Key, Vec<(Key, Vec<u8>)>)>, Vec<(Key, Vec<u8>)>) =
             if route_threads > 1 {
                 let upper = &self.upper;
                 let chunk = leaves_vec.len().div_ceil(route_threads);
-                let partials: Vec<(HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)>, Vec<(Key, Hash)>)> =
+                let partials: Vec<(HashMap<u32, (DiskPtr, Key, Vec<(Key, Vec<u8>)>)>, Vec<(Key, Vec<u8>)>)> =
                     std::thread::scope(|scope| {
                         let handles: Vec<_> = leaves_vec
                             .chunks(chunk)
                             .map(|c| {
                                 scope.spawn(move || {
-                                    let mut g: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> =
+                                    let mut g: HashMap<u32, (DiskPtr, Key, Vec<(Key, Vec<u8>)>)> =
                                         HashMap::new();
-                                    let mut f: Vec<(Key, Hash)> = Vec::new();
+                                    let mut f: Vec<(Key, Vec<u8>)> = Vec::new();
                                     for (key, vh) in c {
                                         match find_disk_ptr_key(upper, key, 0) {
                                             Some(ptr) => g
                                                 .entry(ptr.unit)
                                                 .or_insert_with(|| (ptr, *key, Vec::new()))
                                                 .2
-                                                .push((*key, *vh)),
-                                            None => f.push((*key, *vh)),
+                                                .push((*key, vh.clone())),
+                                            None => f.push((*key, vh.clone())),
                                         }
                                     }
                                     (g, f)
@@ -1580,8 +1567,8 @@ impl FlatMpt {
                             .map(|h| h.join().expect("phase-A routing thread panicked"))
                             .collect()
                     });
-                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
-                let mut fresh: Vec<(Key, Hash)> = Vec::new();
+                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Vec<u8>)>)> = HashMap::new();
+                let mut fresh: Vec<(Key, Vec<u8>)> = Vec::new();
                 for (g, f) in partials {
                     for (unit, (ptr, rep, kvs)) in g {
                         groups.entry(unit).or_insert_with(|| (ptr, rep, Vec::new())).2.extend(kvs);
@@ -1590,21 +1577,21 @@ impl FlatMpt {
                 }
                 (groups, fresh)
             } else {
-                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Hash)>)> = HashMap::new();
-                let mut fresh: Vec<(Key, Hash)> = Vec::new();
-                for (key, value_hash) in leaves_vec {
+                let mut groups: HashMap<u32, (DiskPtr, Key, Vec<(Key, Vec<u8>)>)> = HashMap::new();
+                let mut fresh: Vec<(Key, Vec<u8>)> = Vec::new();
+                for (key, value) in leaves_vec {
                     match find_disk_ptr_key(&self.upper, &key, 0) {
                         Some(ptr) => groups
                             .entry(ptr.unit)
                             .or_insert_with(|| (ptr, key, Vec::new()))
                             .2
-                            .push((key, value_hash)),
-                        None => fresh.push((key, value_hash)),
+                            .push((key, value)),
+                        None => fresh.push((key, value)),
                     }
                 }
                 (groups, fresh)
             };
-        let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = groups.into_values().collect();
+        let mut groups: Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)> = groups.into_values().collect();
         // Sort by file offset so each worker's chunk is a contiguous file range and
         // reads ascend in place — turning the per-leaf random reads into sequential
         // ones, and letting large batches coalesce neighbours into one big read.
@@ -1797,10 +1784,10 @@ impl FlatMpt {
         for (prefix, new_ptr) in reloc {
             install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
         }
-        for (key, value_hash) in fresh {
+        for (key, value) in fresh {
             // Disk path (RAM mode early-returns via the fan-out below), so new
             // structure is disk-backed.
-            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value_hash, false)?;
+            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value, false)?;
         }
         let install_ns = t_c.elapsed().as_nanos() as u64;
         let t_flush = std::time::Instant::now();
@@ -1821,9 +1808,9 @@ impl FlatMpt {
     /// thread — no contention, no lock, no shared store (each leaf is its own
     /// `Arc`, freed by drop). Falls back to serial while the top isn't yet a branch
     /// (the tiny early phase).
-    fn insert_batch_ram(&mut self, leaves: BTreeMap<Key, Hash>) -> Result<()> {
+    fn insert_batch_ram(&mut self, leaves: BTreeMap<Key, Vec<u8>>) -> Result<()> {
         let cfg = self.cfg.clone();
-        let mut buckets: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
+        let mut buckets: [Vec<(Key, Vec<u8>)>; 16] = std::array::from_fn(|_| Vec::new());
         for (key, vh) in leaves {
             buckets[nibble_at(&key, 0) as usize].push((key, vh));
         }
@@ -2146,18 +2133,18 @@ fn insert_into_child(
     slot: &mut Option<RamChild>,
     child_prefix: Vec<u8>,
     key: Key,
-    value_hash: Hash,
+    value: Vec<u8>,
     ram: bool,
 ) -> Result<()> {
     match slot {
-        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, value_hash, ram),
+        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, value, ram),
         Some(RamChild::Mem(_)) => {
             // In-RAM leaf: parse its bytes, apply the key, re-serialize into a new
             // `Arc` (the old one drops here). No I/O, no shared store.
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let mut subtree = parse_payload_lazy(m.bytes)?;
             let depth = subtree.prefix.len();
-            record_node_insert(store, cfg, &mut subtree.node, depth, key, value_hash)?;
+            record_node_insert(store, cfg, &mut subtree.node, depth, key, value)?;
             *slot = Some(if should_promote(cfg, &subtree) {
                 promote_to_mem(subtree)?
             } else {
@@ -2168,7 +2155,7 @@ fn insert_into_child(
         Some(RamChild::Disk { ptr, root }) => {
             let mut subtree = store.read_lazy(*ptr)?;
             let old_ptr = *ptr;
-            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value_hash)?;
+            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value)?;
             if should_promote(cfg, &subtree) {
                 store.free(old_ptr);
                 *slot = Some(promote_record_to_ram(store, subtree)?);
@@ -2181,7 +2168,7 @@ fn insert_into_child(
             Ok(())
         }
         None => {
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
+            let subtree = subtree_from_entries(child_prefix, vec![(key, value)]);
             *slot = Some(make_leaf_child(store, ram, subtree)?);
             Ok(())
         }
@@ -2194,7 +2181,7 @@ fn insert_ram(
     node: &mut RamNode,
     prefix: Vec<u8>,
     key: Key,
-    value_hash: Hash,
+    value: Vec<u8>,
     ram: bool,
 ) -> Result<()> {
     let nibbles = key_nibbles(&key);
@@ -2208,7 +2195,7 @@ fn insert_ram(
             // therefore the hash — is independent of how the leaf was created.
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value_hash)]);
+            let subtree = subtree_from_entries(child_prefix, vec![(key, value)]);
             let mut children = empty_children();
             children[idx] = Some(make_leaf_child(store, ram, subtree)?);
             *node = RamNode::Branch {
@@ -2246,7 +2233,7 @@ fn insert_ram(
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
-                let subtree = subtree_from_entries(new_prefix, vec![(key, value_hash)]);
+                let subtree = subtree_from_entries(new_prefix, vec![(key, value)]);
                 children[new_idx] = Some(make_leaf_child(store, ram, subtree)?);
 
                 let branch = RamNode::Branch {
@@ -2266,7 +2253,7 @@ fn insert_ram(
             } else {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram(store, cfg, child, next_prefix, key, value_hash, ram)
+                insert_ram(store, cfg, child, next_prefix, key, value, ram)
             }
         }
         RamNode::Branch { children, .. } => {
@@ -2276,14 +2263,14 @@ fn insert_ram(
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            insert_into_child(store, cfg, &mut children[idx], child_prefix, key, value_hash, ram)
+            insert_into_child(store, cfg, &mut children[idx], child_prefix, key, value, ram)
         }
     }
 }
 
 
-fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Hash)>) -> DiskSubtree {
-    let node = build_node(&entries, prefix.len());
+fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Vec<u8>)>) -> DiskSubtree {
+    let node = build_node(entries, prefix.len());
     DiskSubtree { prefix, node }
 }
 
@@ -2300,28 +2287,17 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
 
 // --- Disk-node constructors: compute and cache the node hash exactly once. ---
 
-/// Position-independent leaf hash: `keccak(3 ‖ key ‖ value)`. It commits to the
-/// *full* key and the value directly (no intermediate value-hash), so it never
-/// changes when the leaf moves to a different position in the tree (only the
-/// stored `path` does) — which is what lets a divergence re-home a leaf without
-/// re-hashing it. Computed once at ingest; the result is the `Hash` carried
-/// through routing / record insertion / the frontier.
-fn leaf_hash(key: Key, value: &[u8]) -> Hash {
-    let mut h = Keccak256::new();
-    h.update([3u8]);
-    h.update(key);
-    h.update(value);
-    keccak_finalize(h)
-}
-
 /// A leaf holding the suffix `path` (key nibbles from its position to depth 64)
-/// and its precomputed `hash`.
-fn leaf_node(path: Vec<u8>, hash: Hash) -> Node {
-    Node::Leaf { path, hash }
+/// and its `value`, hashing them the Ethereum way (`leaf_hash`). Recomputes the
+/// hash from `path` + `value`, so callers can re-home a leaf to a new depth just
+/// by handing it a shorter `path`.
+fn leaf_node(path: Vec<u8>, value: Vec<u8>) -> Node {
+    let hash = leaf_hash(&path, &value);
+    Node::Leaf { path, value, hash }
 }
 
 fn make_extension(path: Vec<u8>, child: Node) -> Node {
-    let hash = hash_join(4, &path, &hash_node(&child));
+    let hash = ext_hash(&path, &hash_node(&child));
     Node::Extension {
         path,
         child: Box::new(child),
@@ -2329,16 +2305,10 @@ fn make_extension(path: Vec<u8>, child: Node) -> Node {
     }
 }
 
-/// keccak(5 ‖ h0 ‖ … ‖ h15) over the 16 child digests (empty slots use the empty
-/// hash). An `Overflow` child contributes its `root` via `hash_node`, so a branch
-/// hashes identically whether a child is inline or overflowed.
+/// Ethereum branch node hash over the 16 child slots (see `branch_hash_streaming`).
+/// An `Overflow` child contributes its `root` via `hash_node`, so a branch hashes
+/// identically whether a child is inline or overflowed.
 fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
-    // RLP-style sparse encoding: a 16-bit presence bitmap followed by only the
-    // present children's hashes, so an absent slot costs ~0 bytes instead of a
-    // 32-byte `empty_hash`. The bitmap + ordered hashes still uniquely determine
-    // the branch, so this stays collision-resistant; it just shrinks the keccak
-    // input (513 bytes fixed -> 3 + 32*popcount) for the sparse branches that
-    // dominate, cutting the path-rehash work.
     let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
     branch_hash_streaming(bitmap, children.iter().flatten().map(|c| hash_node(c)))
 }
@@ -2360,21 +2330,21 @@ fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
     Node::Branch { children, hash }
 }
 
-/// Canonical node for a subtree holding exactly one entry at `depth`.
 /// Canonical node for a single entry at `depth`: a bare leaf carrying the key's
-/// suffix and its (already-computed) leaf hash. `leaf_hash` is the value from
-/// [`leaf_hash`], not a raw value hash.
-fn single_entry_node(key: Key, leaf_hash: Hash, depth: usize) -> Node {
-    leaf_node(key_nibbles(&key)[depth..].to_vec(), leaf_hash)
+/// suffix (nibbles from `depth` to 64) and its `value`.
+fn single_entry_node(key: Key, value: Vec<u8>, depth: usize) -> Node {
+    leaf_node(key_nibbles(&key)[depth..].to_vec(), value)
 }
 
-fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
+/// Build the canonical subtree for `entries` (distinct keys, non-empty) rooted at
+/// `depth`. Takes ownership so values move into their leaves without cloning.
+fn build_node(entries: Vec<(Key, Vec<u8>)>, depth: usize) -> Node {
     if entries.is_empty() {
         return Node::Empty;
     }
     if entries.len() == 1 {
-        let (key, value_hash) = entries[0];
-        return single_entry_node(key, value_hash, depth);
+        let (key, value) = entries.into_iter().next().unwrap();
+        return single_entry_node(key, value, depth);
     }
 
     let nibbles: Vec<Vec<u8>> = entries.iter().map(|(key, _)| key_nibbles(key)).collect();
@@ -2392,15 +2362,15 @@ fn build_node(entries: &[(Key, Hash)], depth: usize) -> Node {
         return make_extension(path, build_node(entries, depth + common));
     }
 
-    let mut grouped: [Vec<(Key, Hash)>; 16] = std::array::from_fn(|_| Vec::new());
-    for (i, entry) in entries.iter().enumerate() {
-        let idx = nibbles[i].get(depth).copied().unwrap_or(0) as usize;
-        grouped[idx].push(*entry);
+    let mut grouped: [Vec<(Key, Vec<u8>)>; 16] = std::array::from_fn(|_| Vec::new());
+    for (entry, nib) in entries.into_iter().zip(nibbles.iter()) {
+        let idx = nib.get(depth).copied().unwrap_or(0) as usize;
+        grouped[idx].push(entry);
     }
     let mut children = empty_box_children();
     for (idx, group) in grouped.into_iter().enumerate() {
         if !group.is_empty() {
-            children[idx] = Some(Box::new(build_node(&group, depth + 1)));
+            children[idx] = Some(Box::new(build_node(group, depth + 1)));
         }
     }
     make_branch(children)
@@ -2457,7 +2427,7 @@ fn record_node_insert(
     node: &mut Node,
     depth: usize,
     key: Key,
-    value_hash: Hash,
+    value: Vec<u8>,
 ) -> Result<()> {
     // Expand a lazily-unparsed subtree one level before navigating into it
     // (children become `Raw` again, so deeper untouched subtrees stay unparsed).
@@ -2465,26 +2435,27 @@ fn record_node_insert(
         *node = parse_node_lazy(buf, *off, *len)?;
     }
     let nibbles = key_nibbles(&key);
-    let lh = value_hash; // already the leaf hash (computed at ingest)
     let updated = match std::mem::replace(node, Node::Empty) {
-        Node::Empty => single_entry_node(key, lh, depth),
-        Node::Leaf { path, hash } => {
+        Node::Empty => single_entry_node(key, value, depth),
+        Node::Leaf { path, value: old_value, .. } => {
             let remaining = &nibbles[depth..];
             let common = common_prefix(&path, remaining);
             if common == path.len() {
                 // Same key (both suffixes run to depth 64): overwrite the value.
                 debug_assert_eq!(path.as_slice(), remaining);
-                leaf_node(path, lh)
+                leaf_node(path, value)
             } else {
-                // The new key diverges partway along the leaf's suffix. Keep the
-                // old leaf under a shorter suffix (its full key — and so its hash —
-                // is unchanged) and add the new leaf alongside.
+                // The new key diverges partway along the leaf's suffix. Re-home the
+                // old leaf under a shorter suffix — its remaining path shrinks, so
+                // its Ethereum hash changes and is recomputed from `old_value` — and
+                // add the new leaf alongside.
                 let mut children = empty_box_children();
                 let old_idx = path[common] as usize;
-                children[old_idx] = Some(Box::new(leaf_node(path[common + 1..].to_vec(), hash)));
+                children[old_idx] =
+                    Some(Box::new(leaf_node(path[common + 1..].to_vec(), old_value)));
                 let new_idx = remaining[common] as usize;
                 children[new_idx] =
-                    Some(Box::new(single_entry_node(key, lh, depth + common + 1)));
+                    Some(Box::new(single_entry_node(key, value, depth + common + 1)));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -2496,7 +2467,7 @@ fn record_node_insert(
         Node::Extension { path, mut child, .. } => {
             let common = common_prefix(&path, &nibbles[depth..]);
             if common == path.len() {
-                record_node_insert(store, cfg, &mut child, depth + path.len(), key, value_hash)?;
+                record_node_insert(store, cfg, &mut child, depth + path.len(), key, value)?;
                 make_extension(path, *child)
             } else {
                 // Diverges partway along the extension — no overflow edge here.
@@ -2510,7 +2481,7 @@ fn record_node_insert(
                 }));
                 let new_idx = nibbles[depth + common] as usize;
                 children[new_idx] =
-                    Some(Box::new(single_entry_node(key, lh, depth + common + 1)));
+                    Some(Box::new(single_entry_node(key, value, depth + common + 1)));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -2528,9 +2499,9 @@ fn record_node_insert(
                     // on data written by this build.
                     unreachable!("on-disk Overflow under promote-on-max (option B)")
                 }
-                Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value_hash)?,
+                Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value)?,
                 None => {
-                    children[idx] = Some(Box::new(single_entry_node(key, lh, depth + 1)));
+                    children[idx] = Some(Box::new(single_entry_node(key, value, depth + 1)));
                 }
             }
             make_branch(children)
@@ -2920,7 +2891,7 @@ fn process_group(
     store: &FlatFile,
     cfg: &Config,
     ptr: DiskPtr,
-    keys: &[(Key, Hash)],
+    keys: &[(Key, Vec<u8>)],
 ) -> Result<GroupOut> {
     let t = std::time::Instant::now();
     let subtree = store.read_lazy(ptr)?;
@@ -2938,13 +2909,13 @@ fn fold_group(
     cfg: &Config,
     ptr: DiskPtr,
     mut subtree: DiskSubtree,
-    keys: &[(Key, Hash)],
+    keys: &[(Key, Vec<u8>)],
     read_ns: u64,
 ) -> Result<GroupOut> {
     let depth = subtree.prefix.len();
     let t = std::time::Instant::now();
-    for (key, value_hash) in keys {
-        record_node_insert(store, cfg, &mut subtree.node, depth, *key, *value_hash)?;
+    for (key, value) in keys {
+        record_node_insert(store, cfg, &mut subtree.node, depth, *key, value.clone())?;
     }
     let rebuild_ns = t.elapsed().as_nanos() as u64;
 
@@ -2976,7 +2947,7 @@ fn fold_group(
 fn process_chunk_coalesced(
     store: &FlatFile,
     cfg: &Config,
-    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    chunk: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
     batched: bool,
 ) -> Result<Vec<(Key, RamChild)>> {
     let mut out = Vec::with_capacity(chunk.len());
@@ -3034,7 +3005,7 @@ fn process_chunk_coalesced(
 fn process_chunk_fold(
     store: &FlatFile,
     cfg: &Config,
-    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    chunk: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
 ) -> Result<(Vec<(Key, Hash, Vec<u8>)>, Vec<(Key, RamChild)>)> {
     let mut leaves: Vec<(Key, Hash, Vec<u8>)> = Vec::new();
     let mut promoted: Vec<(Key, RamChild)> = Vec::new();
@@ -3074,7 +3045,7 @@ fn process_chunk_fold(
 fn process_chunk(
     store: &FlatFile,
     cfg: &Config,
-    chunk: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    chunk: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
     batched: bool,
 ) -> Result<Vec<(Key, RamChild)>> {
     let mut out = Vec::with_capacity(chunk.len());
@@ -3154,7 +3125,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
 fn node_size(node: &Node) -> usize {
     match node {
         Node::Empty => 1,
-        Node::Leaf { path, .. } => 1 + (1 + path.len().div_ceil(2)) + 32,
+        Node::Leaf { path, value, .. } => 1 + (1 + path.len().div_ceil(2)) + 4 + value.len() + 32,
         Node::Extension { path, child, .. } => {
             1 + (1 + path.len().div_ceil(2)) + 32 + node_size(child)
         }
@@ -3209,9 +3180,11 @@ fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
 fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     match node {
         Node::Empty => out.push(0),
-        Node::Leaf { path, hash } => {
+        Node::Leaf { path, value, hash } => {
             out.push(1);
             write_nibble_path(out, path)?;
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value);
             out.extend_from_slice(hash);
         }
         Node::Extension { path, child, hash } => {
@@ -3357,8 +3330,10 @@ impl<'a> CompactReader<'a> {
             0 => Ok(Node::Empty),
             1 => {
                 let path = self.read_nibble_path()?;
+                let vlen = self.read_u32()? as usize;
+                let value = self.read_bytes(vlen)?.to_vec();
                 let hash = self.read_hash()?;
-                Ok(Node::Leaf { path, hash })
+                Ok(Node::Leaf { path, value, hash })
             }
             2 => {
                 let path = self.read_nibble_path()?;
@@ -3468,8 +3443,10 @@ impl LazyReader {
             0 => Ok(Node::Empty),
             1 => {
                 let path = self.nibble_path()?;
+                let vlen = self.u32()? as usize;
+                let value = self.take(vlen)?.to_vec();
                 let hash = self.hash()?;
-                Ok(Node::Leaf { path, hash })
+                Ok(Node::Leaf { path, value, hash })
             }
             2 => {
                 let path = self.nibble_path()?;
@@ -3536,7 +3513,14 @@ fn extract_hash(bytes: &[u8]) -> Result<Hash> {
     let mut r = CompactReader::new(bytes);
     match r.read_u8()? {
         0 => Ok(empty_hash()),
-        1 | 2 => {
+        1 => {
+            // Leaf: tag, path, value (u32-len-prefixed), hash.
+            r.skip_nibble_path()?;
+            let vlen = r.read_u32()? as usize;
+            let _ = r.read_bytes(vlen)?;
+            r.read_hash()
+        }
+        2 => {
             r.skip_nibble_path()?;
             r.read_hash()
         }
@@ -3769,14 +3753,14 @@ fn evac_and_fold_region(
     cfg: &Config,
     upper: &RamNode,
     region: u64,
-    fg: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    fg: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
     batched: bool,
 ) -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
     let t = std::time::Instant::now();
     let buf = store.read_region(region)?;
     stats::on_read_io(t.elapsed().as_nanos() as u64);
     let base_unit = region * REGION_UNITS;
-    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Hash)>)> =
+    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Vec<u8>)>)> =
         fg.iter().map(|g| (g.0.unit, g)).collect();
 
     let mut results: Vec<(Key, RamChild)> = Vec::new();
@@ -3849,7 +3833,7 @@ fn process_opportunistic(
     store: &FlatFile,
     upper: &RamNode,
     cfg: &Config,
-    groups: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    groups: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
     batched: bool,
 ) -> Result<(Vec<(Key, RamChild)>, Vec<(Vec<u8>, DiskPtr)>)> {
     let cand: std::collections::HashSet<u64> = {
@@ -3863,9 +3847,9 @@ fn process_opportunistic(
             .into_iter()
             .collect()
     };
-    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>> =
+    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)>> =
         std::collections::HashMap::new();
-    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = Vec::new();
+    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)> = Vec::new();
     for g in groups {
         let region = g.0.unit as u64 / REGION_UNITS;
         if cand.contains(&region) {
@@ -3874,7 +3858,7 @@ fn process_opportunistic(
             normal.push(g.clone());
         }
     }
-    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>)> =
+    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)>)> =
         by_region.into_iter().collect();
     region_jobs.sort_unstable_by_key(|(r, _)| *r); // sequential region reads
     let threads = worker_count();
@@ -3929,7 +3913,7 @@ fn fold_region_collect(
     cfg: &Config,
     upper: &RamNode,
     region: u64,
-    fg: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    fg: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
 ) -> Result<(
     Vec<(Key, RamChild)>,
     Vec<(Key, Hash, Vec<u8>)>,
@@ -3940,7 +3924,7 @@ fn fold_region_collect(
     let read_ns = t.elapsed().as_nanos() as u64;
     stats::on_read_io(read_ns);
     let base_unit = region * REGION_UNITS;
-    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Hash)>)> =
+    let fg_by_unit: std::collections::HashMap<u32, &(DiskPtr, Key, Vec<(Key, Vec<u8>)>)> =
         fg.iter().map(|g| (g.0.unit, g)).collect();
 
     let mut promoted: Vec<(Key, RamChild)> = Vec::new();
@@ -4006,7 +3990,7 @@ fn process_fold_gc(
     store: &FlatFile,
     upper: &RamNode,
     cfg: &Config,
-    groups: &[(DiskPtr, Key, Vec<(Key, Hash)>)],
+    groups: &[(DiskPtr, Key, Vec<(Key, Vec<u8>)>)],
 ) -> Result<(
     Vec<(Key, Hash, Vec<u8>)>,
     Vec<(Key, RamChild)>,
@@ -4023,9 +4007,9 @@ fn process_fold_gc(
             .into_iter()
             .collect()
     };
-    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>> =
+    let mut by_region: std::collections::HashMap<u64, Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)>> =
         std::collections::HashMap::new();
-    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Hash)>)> = Vec::new();
+    let mut normal: Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)> = Vec::new();
     for g in groups {
         let region = g.0.unit as u64 / REGION_UNITS;
         if cand.contains(&region) {
@@ -4034,7 +4018,7 @@ fn process_fold_gc(
             normal.push(g.clone());
         }
     }
-    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Hash)>)>)> =
+    let mut region_jobs: Vec<(u64, Vec<(DiskPtr, Key, Vec<(Key, Vec<u8>)>)>)> =
         by_region.into_iter().collect();
     region_jobs.sort_unstable_by_key(|(r, _)| *r); // sequential region reads
     let threads = worker_count();
@@ -4159,11 +4143,11 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            // Tag 4 == the disk-side extension tag (`make_extension`). Using one
-            // tag per node type across RAM and disk makes a node's hash depend
-            // only on its structure, never on which side of the storage boundary
-            // it currently lives on — see `root_is_independent_of_leaf_size`.
-            let computed = hash_join(4, path, &hash_ram(child));
+            // Extension hashing is identical on the RAM and disk sides, so a
+            // node's hash depends only on its structure, never on which side of
+            // the storage boundary it currently lives on — see
+            // `root_is_independent_of_leaf_size`.
+            let computed = ext_hash(path, &hash_ram(child));
             hash.set(Some(computed));
             computed
         }
@@ -4171,10 +4155,9 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            // Tag 5 == the disk-side branch tag (`make_branch`); see above. Same
-            // sparse encoding as `branch_hash`: bitmap + present children's hashes
-            // only, so RAM and disk branches with the same structure still hash
-            // identically (storage-independent root).
+            // Same Ethereum branch encoding as the disk side (`branch_hash`), so
+            // RAM and disk branches with the same structure hash identically
+            // (storage-independent root).
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
             let computed = branch_hash_streaming(
                 bitmap,
@@ -4204,7 +4187,7 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
                 return cached;
             }
             // One child: parallelism is at the branch below, so recurse parallel.
-            let computed = hash_join(4, path, &hash_ram_parallel(child));
+            let computed = ext_hash(path, &hash_ram_parallel(child));
             hash.set(Some(computed));
             computed
         }
@@ -4280,12 +4263,28 @@ fn hash_node(node: &Node) -> Hash {
     }
 }
 
-fn hash_join(tag: u8, path: &[u8], child: &Hash) -> Hash {
-    let mut h = Keccak256::new();
-    h.update([tag, path.len() as u8]);
-    h.update(path);
-    h.update(child);
-    keccak_finalize(h)
+/// Ethereum extension node: `keccak256(RLP([hex_prefix(path, leaf=false),
+/// ref(child)]))`. The child of an extension is always a branch, whose RLP is far
+/// larger than 32 bytes, so its reference is always the hashed form
+/// `RLP(child_hash)` — the inline-`<32` case never applies here.
+fn ext_hash(path: &[u8], child: &Hash) -> Hash {
+    let node = crate::eth::rlp_list(&[
+        crate::eth::rlp_string(&crate::eth::hex_prefix(path, false)),
+        crate::eth::rlp_string(child),
+    ]);
+    keccak(&node)
+}
+
+/// Ethereum leaf node: `keccak256(RLP([hex_prefix(path, leaf=true), value]))`.
+/// `path` is the leaf's remaining nibbles at its current position, so this must be
+/// recomputed whenever the leaf is re-homed to a different depth (see the split in
+/// `record_node_insert`) — which is why the value now lives in the leaf.
+fn leaf_hash(path: &[u8], value: &[u8]) -> Hash {
+    let node = crate::eth::rlp_list(&[
+        crate::eth::rlp_string(&crate::eth::hex_prefix(path, true)),
+        crate::eth::rlp_string(value),
+    ]);
+    keccak(&node)
 }
 
 
@@ -4296,38 +4295,33 @@ fn keccak(bytes: &[u8]) -> Hash {
     output
 }
 
-/// Finalize a streaming keccak with the same profiling hooks as [`keccak`], but
-/// without the per-call scratch `Vec`: callers `update()` the tag and payload
-/// pieces straight into the sponge. Absorbing is concatenation-equivalent, so the
-/// digest is byte-identical to `keccak(&[tag, ..payload])` — only the heap
-/// allocation (and its memcpy) disappears, which is the dominant per-hash cost in
-/// the cache-resident regime.
-fn keccak_finalize(hasher: Keccak256) -> Hash {
-    let _g = prof::scope(prof::Cat::Keccak);
-    let output: Hash = hasher.finalize().into();
-    prof::record(output);
-    output
-}
-
-/// Sparse branch digest `keccak(5 ‖ bitmap_le ‖ present-child-hashes)` streamed
-/// into the sponge. Shared by all three branch hashers (disk `Node`, RAM serial,
-/// RAM parallel) so they stay byte-identical.
-fn branch_hash_streaming(bitmap: u16, child_hashes: impl Iterator<Item = Hash>) -> Hash {
-    let mut h = Keccak256::new();
-    h.update([5u8]);
-    h.update(bitmap.to_le_bytes());
-    for ch in child_hashes {
-        h.update(ch);
+/// Ethereum branch node: `keccak256(RLP([ref_0, …, ref_15, value]))`. `bitmap`
+/// marks the present child slots (little-endian) and `child_hashes` yields their
+/// hashes in slot order; absent slots encode as the empty string `0x80`. Every
+/// child of a real branch has RLP ≥ 32 bytes, so its reference is the hashed form
+/// `RLP(child_hash)`. All keys are full 64-nibble paths, so no key terminates at a
+/// branch — the 17th (value) slot is always the empty string.
+fn branch_hash_streaming(bitmap: u16, mut child_hashes: impl Iterator<Item = Hash>) -> Hash {
+    let empty = crate::eth::rlp_string(&[]);
+    let mut items: Vec<Vec<u8>> = Vec::with_capacity(17);
+    for i in 0..16 {
+        if bitmap & (1 << i) != 0 {
+            let ch = child_hashes.next().expect("bitmap/child-hash count mismatch");
+            items.push(crate::eth::rlp_string(&ch));
+        } else {
+            items.push(empty.clone());
+        }
     }
-    keccak_finalize(h)
+    items.push(empty); // 17th value slot: always empty (secure trie, full-length keys)
+    keccak(&crate::eth::rlp_list(&items))
 }
 
-/// Hash of the empty/absent node. It is a constant, so compute it once instead
-/// of re-running keccak for every empty child slot of every branch we hash.
+/// Hash of the empty trie: `keccak256(RLP("")) = keccak256(0x80)` — Ethereum's
+/// `EMPTY_ROOT`. Computed once.
 fn empty_hash() -> Hash {
     use std::sync::OnceLock;
     static EMPTY: OnceLock<Hash> = OnceLock::new();
-    *EMPTY.get_or_init(|| keccak(&[0]))
+    *EMPTY.get_or_init(|| keccak(&crate::eth::rlp_string(&[])))
 }
 
 fn key_nibbles(key: &Key) -> Vec<u8> {
@@ -4499,6 +4493,60 @@ mod tests {
 
     fn db(cfg: Config) -> FlatMpt {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
+    }
+
+    /// The engine must reproduce Ethereum's exact MPT roots: the empty root, the
+    /// official secure-trie account vector's known root, and — over an arbitrary
+    /// key/value set — the `eth` reference oracle. All values here are ≥ 32 bytes,
+    /// so every node's RLP is ≥ 32 bytes and the (not-yet-implemented) inline-`<32`
+    /// rule never applies; agreement with the oracle (which does implement inline)
+    /// then also proves no inline node arises in these tries.
+    #[test]
+    fn engine_root_matches_ethereum() {
+        let dec = |s: &str| alloy_primitives::hex::decode(s).unwrap();
+
+        // (a) Empty trie == Ethereum EMPTY_ROOT = keccak256(RLP("")).
+        let mut mpt = db(Config::default());
+        assert_eq!(
+            hex(mpt.root()),
+            "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+        );
+
+        // (b) Official ethereum/tests hex_encoded_securetrie_test "test1": insert
+        // keccak(address) -> RLP(account) and reproduce the known state root.
+        let pairs = [
+            ("a94f5374fce5edbc8e2a8697c15331677e6ebf0b", "f848018405f446a7a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("095e7baea6a6c7c4c2dfeb977efac326af552d87", "f8440101a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a004bccc5d94f4d1f99aab44369a910179931772f2a5c001c3229f57831c102769"),
+            ("d2571607e241ecf590ed94b12d87c94babe36db6", "f8440180a0ba4b47865c55a341a4a78759bb913cd15c3ee8eaf30a62fa8d1c8863113d84e8a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("62c01474f089b07dae603491675dc5b5748f7049", "f8448080a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("2adc25665018aa1fe0e6bc666dac8fc2697ff9ba", "f8478083019a59a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+        ];
+        let mut oracle_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (addr, rlp) in pairs {
+            let (addr, rlp) = (dec(addr), dec(rlp));
+            mpt.insert(hashed_key(&addr), rlp.clone()).unwrap();
+            oracle_entries.push((addr, rlp));
+        }
+        assert_eq!(
+            hex(mpt.root()),
+            "730a444e08ab4b8dee147c9b232fc52d34a223d600031c1e9d25bfc985cbd797"
+        );
+        assert_eq!(mpt.root().as_slice(), crate::eth::secure_root(&oracle_entries).as_slice());
+
+        // (c) General equivalence over many keys via the batch path: engine root ==
+        // eth oracle over the same (32-byte key used verbatim, value) set.
+        let mut mpt2 = db(Config::default());
+        let mut entries: Vec<(Key, Vec<u8>)> = Vec::new();
+        for i in 0..3000u64 {
+            let k = hashed_key(i.to_le_bytes());
+            let mut v = vec![0xabu8; 40];
+            v[..8].copy_from_slice(&i.to_le_bytes());
+            entries.push((k, v));
+        }
+        mpt2.insert_batch(entries.clone()).unwrap();
+        let oracle: Vec<(Vec<u8>, Vec<u8>)> =
+            entries.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+        assert_eq!(mpt2.root().as_slice(), crate::eth::root(&oracle).as_slice());
     }
 
     #[test]
@@ -4733,8 +4781,8 @@ mod tests {
         //  (a) survive serialize -> deserialize unchanged, and
         //  (b) hash identically whether that child is inline or overflowed
         //      (the Overflow.root equals the inline node's hash).
-        let key = hashed_key("x");
-        let inline_child = leaf_node(vec![5, 6, 7], leaf_hash(key, &[9u8; 32]));
+        let _key = hashed_key("x");
+        let inline_child = leaf_node(vec![5, 6, 7], vec![9u8; 32]);
         let inline_hash = hash_node(&inline_child);
 
         // Build branch B1 with the child inline at slot 3.

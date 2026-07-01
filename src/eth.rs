@@ -33,14 +33,14 @@ pub fn hex_prefix(nibbles: &[u8], leaf: bool) -> Vec<u8> {
 }
 
 /// RLP-encode a byte string.
-fn rlp_string(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn rlp_string(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 9);
     alloy_rlp::Encodable::encode(&bytes, &mut out);
     out
 }
 
 /// RLP-encode a list whose items are already RLP-encoded elements.
-fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
     let payload: usize = items.iter().map(|i| i.len()).sum();
     let mut out = Vec::with_capacity(payload + 9);
     alloy_rlp::Header { list: true, payload_length: payload }.encode(&mut out);
