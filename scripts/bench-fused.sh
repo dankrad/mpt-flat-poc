@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Benchmark sustained 10k-key-batch inserts into a baseline checkpoint using the
+# Benchmark sustained 300k-key-batch inserts into a baseline checkpoint using the
 # full fused fast path:
 #   one-writer + opportunistic GC (evacuation fused into the foreground read,
-#   relocations written by the parallel writer) + no-WAL + async values, 64 workers,
+#   relocations written by the parallel writer) + no-WAL + async values, 192 workers,
 #   GC evac threshold 0.30.
 #
 # Runs against a throwaway copy-on-write clone of the baseline (the baseline is left
 # untouched). Warms 25M keys first to drive GC to its steady state, then measures
-# 10M keys in 10k batches and prints the us/key, the one-writer device read/write
+# 15M keys in 300k batches and prints the us/key, the one-writer device read/write
 # split, and the gc-evac breakdown.
 #
 #   Usage: scripts/bench-fused.sh <baseline-dir>
@@ -34,7 +34,7 @@ clonedir "$CK.values" "$CLONE/ckpt.flat.values"
 
 cargo build --release --example profins
 
-echo "bench-fused: 25M warmup + 10M measured (10k batches) on a clone of $CK"
-env MPT_WORKERS=64 MPT_ONE_WRITER=1 MPT_GC_OPP=1 MPT_GC_OPP_UTIL=0.30 \
+echo "bench-fused: 25M warmup + 15M measured (300k batches) on a clone of $CK"
+env MPT_WORKERS=192 MPT_ONE_WRITER=1 MPT_GC_OPP=1 MPT_GC_OPP_UTIL=0.30 \
     MPT_NO_WAL=1 MPT_ASYNC_VALUES=1 MPT_PROF_WARMUP=25000000 \
-  ./target/release/examples/profins "$CLONE/ckpt.flat" 10000000 8600000000 10000
+  ./target/release/examples/profins "$CLONE/ckpt.flat" 15000000 8600000000 300000
