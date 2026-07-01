@@ -1916,11 +1916,11 @@ impl FlatMpt {
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
         let _g = prof::scope(prof::Cat::ValueGet);
-        // Buffered writes win over what's already in RocksDB.
-        if let Some(value) = self.overlay.get(key) {
-            return Ok(Some(value.clone()));
-        }
-        Ok(self.values.get(key)?)
+        // The value lives in its trie leaf (not a side store): walk the RAM
+        // frontier to the record that owns this key, then descend that record's
+        // node tree to the leaf.
+        let nibbles = key_nibbles(key);
+        ram_get(&self.store, &self.upper, &nibbles, 0)
     }
 
     pub fn root(&self) -> Hash {
@@ -2042,6 +2042,70 @@ impl FlatMpt {
                 PathEnd::Inline(true) => return Ok(reads),
                 PathEnd::Inline(false) => bail!("key not found in addressed disk subtree"),
             }
+        }
+    }
+}
+
+/// Point-read the value for `key` by walking the RAM frontier down to the record
+/// that owns it, then descending that record's node tree. Returns `None` if the
+/// key is absent. `depth` is the nibble index reached so far.
+fn ram_get(store: &FlatFile, node: &RamNode, nibbles: &[u8], depth: usize) -> Result<Option<Vec<u8>>> {
+    match node {
+        RamNode::Empty => Ok(None),
+        RamNode::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                ram_get(store, child, nibbles, depth + path.len())
+            } else {
+                Ok(None)
+            }
+        }
+        RamNode::Branch { children, .. } => {
+            let idx = nibbles[depth] as usize;
+            match &children[idx] {
+                None => Ok(None),
+                Some(RamChild::Ram(child)) => ram_get(store, child, nibbles, depth + 1),
+                Some(RamChild::Disk { ptr, .. }) => {
+                    let sub = store.read_lazy(*ptr)?;
+                    node_get(store, &sub.node, nibbles, sub.prefix.len())
+                }
+                Some(RamChild::Mem(m)) => {
+                    let sub = parse_payload_lazy(m.bytes.clone())?;
+                    node_get(store, &sub.node, nibbles, sub.prefix.len())
+                }
+            }
+        }
+    }
+}
+
+/// Descend a record's node tree following `nibbles` from `depth`, returning the
+/// leaf's value if the key is present. Expands `Raw`/`Overflow` edges on demand.
+fn node_get(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Result<Option<Vec<u8>>> {
+    match node {
+        Node::Empty => Ok(None),
+        Node::Leaf { path, value, .. } => {
+            Ok((nibbles[depth..] == path[..]).then(|| value.clone()))
+        }
+        Node::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                node_get(store, child, nibbles, depth + path.len())
+            } else {
+                Ok(None)
+            }
+        }
+        Node::Branch { children, .. } => {
+            let idx = nibbles[depth] as usize;
+            match &children[idx] {
+                Some(child) => node_get(store, child, nibbles, depth + 1),
+                None => Ok(None),
+            }
+        }
+        Node::Overflow { ptr, .. } => {
+            let sub = store.read_lazy(*ptr)?;
+            node_get(store, &sub.node, nibbles, sub.prefix.len())
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let n = parse_node_lazy(buf, *off, *len)?;
+            node_get(store, &n, nibbles, depth)
         }
     }
 }
