@@ -19,7 +19,7 @@ directory) and reproduces the headline results end-to-end:
 
 ```bash
 # 1. Build the 1B-key baseline the fast way (RAM-build, 100M-key batches, spill at
-#    70 GiB) → <dir>/ckpt.flat   (~1420 s, ~1.4 us/key)
+#    30 GiB) → <dir>/ckpt.flat   (~1.4 us/key)
 scripts/build-baseline-1b.sh /data/baseline
 
 # 2. Benchmark the fused fast path on a throwaway COW clone of it — one-writer +
@@ -42,7 +42,7 @@ A checkpoint is three siblings: `tree.flat` (packed subtrees), `tree.flat.meta`
 tuning; every knob is overridable via the environment (see **Tuning** below).
 
 > **Disk note:** run with `$TMPDIR`/output on a real SSD, not tmpfs. A 1B-key tree
-> is ~150 GiB flat + ~33 GiB values.
+> is ~85 GiB flat + ~34 GiB values.
 
 ---
 
@@ -65,8 +65,8 @@ tuning; every knob is overridable via the environment (see **Tuning** below).
    store: FlatFile  ──────────────────────  values: rocksdb::DB
    ┌──────────────────────────────┐         ┌──────────────────────┐
    │ 128 KiB regions of records    │         │  key → value bytes    │
-   │ [len][compact subtree], dense │         │  (the trie only ever  │
-   │ 256 B packing + region GC     │         │   stores value_hash)  │
+   │ [len][compact subtree], dense │         │  (the trie stores     │
+   │ 256 B packing + region GC     │         │   only a leaf hash)   │
    └──────────────────────────────┘         └──────────────────────┘
 ```
 
@@ -86,18 +86,16 @@ Disk subtrees are compact-encoded `DiskSubtree` records (`[u32 len][payload]`),
 one). The file is a sequence of **128 KiB regions**; a log-structured allocator
 appends records and an inline, self-tuning **garbage collector** evacuates the
 emptiest regions to reclaim space, so the file doesn't grow unboundedly under
-overwrite/split churn. (Earlier the records were 1-page-padded with a free-list;
-dense packing cut the 1B file from 256 → ~154 GiB.)
+overwrite/split churn.
 
 ### 3. The value store (`rocksdb::DB` / `values`)
-The trie only ever manipulates a `value_hash` (keccak of the value); the real
-bytes live in an embedded RocksDB in `<flatfile>.values/`. Inserts buffer values
-in a RAM overlay and flush them as one `WriteBatch`; `get_value` checks the
-overlay first so reads see the latest write. The store is tuned for write-only
-bulk load (`value_db_opts`): a **vector memtable** makes the flush an O(1) append
-(the sort is deferred to the background SST flush), which cut the value flush ~20×
-— it was the build's dominant serial cost with the default skiplist memtable
-(~1.9 µs/value of cache-miss-heavy random inserts, *worse* as the memtable grows).
+The trie stores only a leaf hash — `keccak(key ‖ value)` — so the real value bytes
+live in an embedded RocksDB in `<flatfile>.values/`. Inserts buffer values in a RAM
+overlay and flush them as one `WriteBatch`; `get_value` checks the overlay first so
+reads see the latest write. The store is tuned for write-only bulk load
+(`value_db_opts`): a **vector memtable** makes the flush an O(1) append (the sort is
+deferred to the background SST flush), avoiding the skiplist memtable's
+cache-miss-heavy random inserts.
 
 ### Persistence (`persist` / `open`, the `.meta` manifest)
 The flat file and value store hold the data, but the *index* tying them together
@@ -114,8 +112,10 @@ writable trie (cached hashes and all). A crash reopens at the last checkpoint.
 
 `insert_batch(entries)` is the workhorse (single `insert` is a 1-element batch):
 
-1. **Phase A (route):** hash each value, buffer it for RocksDB, and walk the RAM
-   frontier to find the disk leaf each key lands in, grouping keys per leaf.
+1. **Phase A (route):** compute each leaf hash (`keccak(key‖value)`), buffer the
+   value for RocksDB, and walk the RAM frontier to find the disk leaf each key lands
+   in, grouping keys per leaf — the hashing and the frontier walks are fanned across
+   cores.
 2. **Phase B (per-leaf, parallel):** each group reads its leaf record, applies
    its keys (`record_node_insert` — re-hashing only the touched path), and either
    rewrites the leaf or, if it exceeds `max_leaf_bytes`, **promotes** it into more
@@ -130,15 +130,15 @@ disjoint child subtrees** (one thread each, no shared store, no lock); a fresh
 tree is bootstrapped into a 16-way branch with a single serial insert so even the
 first batch parallelizes. When the process footprint crosses a threshold it
 **spills** the leaves to disk and reverts to the disk path. Building huge trees is
-fast: a 1B-key tree (16 KiB leaves, 100M-key batches) builds in ~1420 s (~1.4
-µs/key) — pure-RAM until the spill (~500M keys at a 70 GiB ceiling), then the disk
-path with bounded GC (~7 GiB flat growth per 100M-key batch).
+fast: a 1B-key tree (16 KiB leaves, 100M-key batches) builds at ~1.4 µs/key —
+pure-RAM until the footprint crosses the spill ceiling, then the disk path with
+bounded GC (~7 GiB flat growth per 100M-key batch).
 
-**The disk path** has been profiled and tuned (see **Tuning**); the headline
-findings: per-key compute is hidden under read I/O, reads are near the device
-limit, and the real costs are *write-append contention* (fixed by a single
-sequential writer) and the *synchronous value write* (hidden by overlapping it
-with reads).
+**The disk path** is read-bandwidth-bound (see **Tuning**): per-key compute is
+hidden under the read I/O and the device's random-read bandwidth is the ceiling.
+The main write costs — *append contention* and the *synchronous value write* — are
+taken off the read path by a single sequential writer and by overlapping the value
+write with the reads.
 
 ### Hashing & memoization
 Recomputing the whole trie hash per insert is the naive cost; this PoC avoids it.
@@ -153,25 +153,33 @@ with subtree size.
 
 ## Performance & tuning
 
-Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
-`dense-pack-gc`:
+Measured on a Micron 7500 PRO NVMe SSD, inserting fresh keys into the out-of-RAM
+1B-key tree:
 
-- **1B-key build** (`build-tree.sh`): ~1.8 µs/key in the RAM phase; a full 1B
-  build that spills mid-way completes in ~2 h (2.4× the pure-disk build).
-- **10k-batch inserts into the out-of-RAM 1B tree:** the tuning below took it
-  from ~10.5 → ~5.8 µs/key (**~1.8×**), at which point the device is ~82% busy.
+- **Raw ingest (GC off, `batch-bench.sh`):** ~6.3 µs/key (10k-key batches).
+- **Space-bounded (GC on, `bench-fused.sh`):** ~7.0 µs/key (300k-key batches) — the
+  fused opportunistic GC holds the flat file steady (`flat_grow=0`) for ~0.7 µs/key
+  over the GC-off path.
+- **1B-key build (`build-baseline-1b.sh`):** ~1.4 µs/key (RAM-build until the spill,
+  then the bounded-GC disk path).
+
+The disk path is **read-bandwidth-bound**: per-key compute is hidden under the read
+I/O and the device's random-read bandwidth (~5 GB/s at these block sizes) is the
+ceiling. The knobs below target that — a deep read queue, tight reads, and moving
+the value write and append contention off the read path.
 
 ### Tuning knobs (environment variables)
 
 | Var | Default | Effect |
 |-----|---------|--------|
-| `MPT_WORKERS` | `min(cores,8)` | Phase-B read queue depth. **64** is a good value for out-of-RAM (random-read) workloads; the default 8 is too low. |
-| `MPT_FOLD` | on | Sort the per-leaf groups by file offset and read them in coalesced multi-MB spans (sequential I/O). ~2.5× on the disk path; `=0` reverts to random per-leaf reads. |
+| `MPT_WORKERS` | `192` | Phase-B read queue depth (each worker issues one blocking `pread`). 192 is the measured sweet spot on NVMe — read throughput keeps rising with concurrency up to the buffered-read IOPS ceiling. |
+| `MPT_FOLD` | on | Sort the per-leaf groups by file offset so each worker's reads ascend in place; `=0` reverts to unsorted per-leaf reads. |
+| `MPT_FOLD_GAP_KIB` | `0` | Coalesce consecutive leaf reads across on-disk gaps ≤ this (KiB) into one `pread`. Default 0 = read only the touched leaves; raising it trades reading the dead in-between bytes for fewer, larger reads — a win only when touched leaves are densely placed. |
 | `MPT_GC_OPP` / `MPT_GC_OPP_UTIL` | off / 0.30 | Opportunistic GC: evacuate only the touched, under-util regions, fused into the foreground read. Sustainable bounded file at lower cost than the global cost-benefit GC. |
 | `MPT_ONE_WRITER` | off | Many parallel readers fold leaves → payloads; **one** writer appends them in a single sequential `write_batch`. Removes inter-worker append contention (64 concurrent appends hit ~1.1 GB/s vs one stream's ~3.5). ~1.5×. **Skips inline GC** — for bulk/gc-off use. |
 | `MPT_NO_WAL` | off | Write values with the RocksDB WAL disabled; durability via `persist`'s memtable flush (same model as the manifest). |
 | `MPT_ASYNC_VALUES` | off | (one-writer path) write the batch's values on a thread concurrent with Phase B, joined per batch — hides the value-write CPU under the I/O-bound reads. Pair with `MPT_NO_WAL`. |
-| `MPT_RAM_BUILD` / `MPT_RAM_BUILD_GIB` | off / 85·45 | RAM-build mode and its spill threshold (GiB; macOS/Linux defaults). |
+| `MPT_RAM_BUILD` / `MPT_RAM_BUILD_GIB` | off / 85·45 | RAM-build mode and its spill threshold (GiB of process footprint; macOS/Linux defaults). `build-baseline-1b.sh` sets 30. |
 | `MAX_LEAF_KIB` | 16 | Leaf-size target (build time); sets `Config`. |
 | `MPT_DIRECT_IO` | off | O_DIRECT/F_NOCACHE reads. **Loses** here (bypasses cache hits + readahead). |
 
@@ -187,8 +195,8 @@ Measured on an 18-core Apple-Silicon box (137 GB RAM, ~13 GB/s SSD), branch
 |------|--------------|
 | [`src/lib.rs`](src/lib.rs) | The entire engine (see the component map below). |
 | [`scripts/build-tree.sh`](scripts/build-tree.sh) | **Fast-build a tree of any size** → checkpoint (RAM-build + spill). |
-| [`scripts/build-baseline-1b.sh`](scripts/build-baseline-1b.sh) | ⭐ **PRIMARY — build the 1B baseline** the fast way (RAM-build, 100M-key batches, spill at 70 GiB) → `<dir>/ckpt.flat`. Single arg: output dir. |
-| [`scripts/bench-fused.sh`](scripts/bench-fused.sh) | ⭐ **PRIMARY — benchmark the fused fast path** (one-writer + opportunistic GC + parallel writer + no-WAL + async values) on a COW clone; 25M warmup → 10M measured. Single arg: baseline dir. |
+| [`scripts/build-baseline-1b.sh`](scripts/build-baseline-1b.sh) | ⭐ **PRIMARY — build the 1B baseline** the fast way (RAM-build, 100M-key batches, spill at 30 GiB) → `<dir>/ckpt.flat`. Single arg: output dir. |
+| [`scripts/bench-fused.sh`](scripts/bench-fused.sh) | ⭐ **PRIMARY — benchmark the fused fast path** (one-writer + opportunistic GC + parallel writer + no-WAL + async values) on a COW clone; 25M warmup → 15M measured (300k batches). Single arg: baseline dir. |
 | [`scripts/batch-bench.sh`](scripts/batch-bench.sh) | **Benchmark batch inserts** into a tree, on a throwaway COW clone; prints us/key. |
 | [`scripts/grow-tree.sh`](scripts/grow-tree.sh) | **Grow a tree** by N more keys and re-checkpoint it in place. |
 | [`scripts/run-large-bench.sh`](scripts/run-large-bench.sh) | Build + run `benches/large.rs` (preload + timed inserts/overwrites); documents prereqs. |
@@ -255,5 +263,5 @@ A C/C++ toolchain + libclang is needed (RocksDB builds from source):
 - **Write amplification.** Each insert into a disk leaf rewrites the whole compact
   record; dense packing + the sequential writer keep it cheap, but it remains the
   design's central write cost.
-- **PoC value model.** Keys are 32 bytes; values are duplicated between the trie's
-  `value_hash` and the RocksDB payload.
+- **PoC value model.** Keys are 32 bytes; the trie commits to a leaf hash
+  (`keccak(key‖value)`) while the value bytes live separately in RocksDB.

@@ -4,7 +4,7 @@
 #     top branch is bootstrapped so the first batch parallelizes, and values go
 #     into a vector-memtable RocksDB tuned for bulk load.
 #   - 100M-key insert batches.
-#   - Spill the in-RAM leaves to disk once the process footprint crosses 70 GiB,
+#   - Spill the in-RAM leaves to disk once the process footprint crosses 30 GiB,
 #     then finish on the disk path (bounded GC).
 #   - 16 KiB leaves, 64 workers, values written with the WAL disabled.
 #
@@ -16,9 +16,9 @@
 # Produces <output-dir>/ckpt.flat, ckpt.flat.meta, ckpt.flat.values/. Reopen/verify
 # with:  cargo run --release --example reopen -- <output-dir>/ckpt.flat
 #
-# Note: MPT_RAM_BUILD_GIB=70 is a footprint ceiling tuned for a ~137 GiB-RAM box;
-# lower it on a smaller machine (it must trip before RAM gets tight). The build
-# needs ~150 GiB of free disk at peak and settles to ~85 GiB.
+# Note: MPT_RAM_BUILD_GIB=30 is the spill ceiling — it must trip before RAM gets
+# tight; raise it on a larger-RAM box to stay in the faster RAM-build phase longer.
+# The build needs ~150 GiB of free disk at peak and settles to ~85 GiB.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
