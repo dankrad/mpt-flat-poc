@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+alloy-primitives = "1"
+alloy-rlp = "0.3"
 anyhow = "1"
 bincode = "1"
 libc = "0.2"

@@ -1,3 +1,5 @@
+pub mod eth;
+
 use anyhow::{Result, anyhow, bail};
 use rocksdb::{BlockBasedOptions, Cache, DB, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
