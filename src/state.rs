@@ -15,7 +15,7 @@
 
 use crate::eth::{Account, EMPTY_CODE_HASH};
 use crate::{FlatMpt, Key};
-use alloy_primitives::{keccak256, Address, B256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -137,20 +137,47 @@ impl EthState {
     }
 
     /// Insert/overwrite an account (keyed by `keccak256(address)`).
+    ///
+    /// If `acct.storage_root == EMPTY_ROOT` the account is stored as a structured
+    /// account leaf whose storage nests in the trie — so subsequent
+    /// [`set_storage`](Self::set_storage) calls build its storage and recompute the
+    /// root. If `storage_root` is a non-empty *opaque* root (e.g. ingesting a
+    /// complete account whose slots you don't have), the exact account RLP is stored
+    /// as a value leaf instead; `set_storage` on such an account then errors.
     pub fn set_account(&mut self, addr: &Address, acct: &Account) -> Result<()> {
-        self.trie.insert(account_key(addr), acct.rlp())?;
+        let key = account_key(addr);
+        if acct.storage_root == crate::eth::EMPTY_ROOT {
+            self.trie.insert_account(key, acct.nonce, acct.balance, acct.code_hash.0)?;
+        } else {
+            self.trie.insert(key, acct.rlp())?;
+        }
         Ok(())
     }
 
-    /// Bulk account upsert — one batched trie insert.
-    pub fn set_accounts(&mut self, accounts: &[(Address, Account)]) -> Result<()> {
-        let entries: Vec<(Key, Vec<u8>)> =
-            accounts.iter().map(|(a, acct)| (account_key(a), acct.rlp())).collect();
-        self.trie.insert_batch(entries)?;
+    /// Set one storage slot of an account (auto-creating an empty account if none
+    /// exists). `slot` is the raw slot key; it is `keccak`-hashed (secure trie). A
+    /// zero value is a deletion in Ethereum — callers should handle that; here it is
+    /// written verbatim as `RLP(0)`.
+    pub fn set_storage(&mut self, addr: &Address, slot: U256, value: U256) -> Result<()> {
+        let slot_key = keccak256(slot.to_be_bytes::<32>()).0;
+        self.trie.insert_storage(
+            account_key(addr),
+            slot_key,
+            crate::eth::storage_value_rlp(value),
+        )?;
         Ok(())
     }
 
-    /// Fetch and decode an account.
+    /// Read a storage slot (`None` if unset). Decodes `RLP(U256)`.
+    pub fn get_storage(&self, addr: &Address, slot: U256) -> Result<Option<U256>> {
+        let slot_key = keccak256(slot.to_be_bytes::<32>()).0;
+        match self.trie.get_storage(&account_key(addr), &slot_key)? {
+            Some(bytes) => Ok(Some(alloy_rlp::Decodable::decode(&mut bytes.as_slice())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch and decode an account (its `storage_root` reflects nested storage).
     pub fn get_account(&self, addr: &Address) -> Result<Option<Account>> {
         match self.trie.get_value(&account_key(addr))? {
             Some(bytes) => Ok(Some(Account::decode(&bytes)?)),
@@ -240,6 +267,97 @@ mod tests {
         assert_eq!(st.get_account(&a0).unwrap().unwrap(), accts[0].1);
         let missing: Address = "0x000000000000000000000000000000000000dead".parse().unwrap();
         assert_eq!(st.get_account(&missing).unwrap(), None);
+    }
+
+    /// Phase 4b: a contract's storage is built slot-by-slot via `set_storage`, nested
+    /// in its account leaf. Its `storage_root` (computed self-contained) and the
+    /// folded `state_root` must match the `eth` oracle, and slots must read back.
+    #[test]
+    fn nested_storage_reproduces_storage_and_state_roots() {
+        let mut st = state();
+
+        // A handful of EOAs so the state trie's top is a real branch (matching
+        // Ethereum canonical form), plus one contract whose storage we build.
+        let eoas: Vec<(Address, Account)> = (1u64..=12)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[19] = i as u8;
+                (Address::from(a), Account::eoa(i, U256::from(i * 1000)))
+            })
+            .collect();
+        for (addr, acct) in &eoas {
+            st.set_account(addr, acct).unwrap();
+        }
+
+        let contract: Address = "0x00000000000000000000000000000000c0ffee00".parse().unwrap();
+        let code = b"contract-bytecode-blob";
+        let code_hash = st.set_code(code).unwrap();
+        st.set_account(&contract, &Account::contract(3, U256::from(42u64), crate::eth::EMPTY_ROOT, code_hash))
+            .unwrap();
+
+        // Storage slots (slot -> value), including a large slot index and value.
+        let slots: [(U256, U256); 5] = [
+            (U256::from(0u64), U256::from(0x11u64)),
+            (U256::from(1u64), U256::from(0x2222u64)),
+            (U256::from(2u64), U256::from(0xdead_beefu64)),
+            (U256::from(1_000_000u64), U256::from(7u64)),
+            (U256::from(0u64), U256::from(0x99u64)), // overwrite slot 0 (last wins)
+        ];
+        for (slot, val) in slots {
+            st.set_storage(&contract, slot, val).unwrap();
+        }
+
+        // Expected storage root via the (externally-validated) oracle: a secure trie
+        // over keccak(slot) -> RLP(value), last write wins.
+        use std::collections::BTreeMap;
+        let mut live: BTreeMap<[u8; 32], U256> = BTreeMap::new();
+        for (slot, val) in slots {
+            live.insert(slot.to_be_bytes::<32>(), val);
+        }
+        let storage_entries: Vec<(Vec<u8>, Vec<u8>)> = live
+            .iter()
+            .map(|(slot, val)| (slot.to_vec(), crate::eth::storage_value_rlp(*val)))
+            .collect();
+        let expected_storage_root = crate::eth::secure_root(&storage_entries);
+
+        let acct = st.get_account(&contract).unwrap().unwrap();
+        assert_eq!(acct.storage_root, expected_storage_root, "nested storage root vs oracle");
+        assert_eq!(acct.nonce, 3);
+        assert_eq!(acct.code_hash, code_hash);
+
+        // Slots read back (including the overwritten slot 0), absent slot is None.
+        assert_eq!(st.get_storage(&contract, U256::from(0u64)).unwrap(), Some(U256::from(0x99u64)));
+        assert_eq!(st.get_storage(&contract, U256::from(2u64)).unwrap(), Some(U256::from(0xdead_beefu64)));
+        assert_eq!(st.get_storage(&contract, U256::from(1_000_000u64)).unwrap(), Some(U256::from(7u64)));
+        assert_eq!(st.get_storage(&contract, U256::from(555u64)).unwrap(), None);
+
+        // Full state root via oracle over all accounts (contract carries the nested
+        // storage root). Proves the two-level fold is exact.
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = eoas
+            .iter()
+            .map(|(a, acct)| (a.as_slice().to_vec(), acct.rlp()))
+            .collect();
+        let contract_rlp =
+            Account::contract(3, U256::from(42u64), expected_storage_root, code_hash).rlp();
+        entries.push((contract.as_slice().to_vec(), contract_rlp));
+        assert_eq!(st.state_root(), crate::eth::secure_root(&entries), "state root vs oracle");
+
+        // Survives persist + reopen: storage root and a slot are still correct.
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let mut st2 = EthState::create(tmp.path(), crate::Config::default()).unwrap();
+            for (addr, acct) in &eoas {
+                st2.set_account(addr, acct).unwrap();
+            }
+            st2.set_account(&contract, &Account::contract(3, U256::from(42u64), crate::eth::EMPTY_ROOT, code_hash)).unwrap();
+            for (slot, val) in slots {
+                st2.set_storage(&contract, slot, val).unwrap();
+            }
+            st2.persist().unwrap();
+        }
+        let st2 = EthState::open(tmp.path()).unwrap();
+        assert_eq!(st2.get_account(&contract).unwrap().unwrap().storage_root, expected_storage_root);
+        assert_eq!(st2.get_storage(&contract, U256::from(2u64)).unwrap(), Some(U256::from(0xdead_beefu64)));
     }
 
     #[test]

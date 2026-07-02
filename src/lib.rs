@@ -1,6 +1,7 @@
 pub mod eth;
 pub mod state;
 
+use alloy_primitives::{B256, U256};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -1138,6 +1139,27 @@ enum Node {
         len: usize,
         nref: NodeRef,
     },
+    /// A state-trie **account** leaf (Phase 4): the account fields plus its storage
+    /// trie nested *inline* in this node, so the whole thing is one unified trie and
+    /// re-hashing is self-contained. The leaf's value is `RLP([nonce, balance,
+    /// storage_root, code_hash])`, where `storage_root` is the Merkle root of the
+    /// nested `storage` subtree — computed here, never fetched from a store. Small
+    /// storage packs in the same record; large-contract promotion is future work.
+    Account {
+        /// Remaining `keccak(address)` nibbles from this leaf's position to depth 64.
+        path: Vec<u8>,
+        nonce: u64,
+        balance: U256,
+        code_hash: Hash,
+        /// The account's storage trie (ordinary `Node`s over `keccak(slot)` paths,
+        /// with `RLP(U256)` values); `Node::Empty` when the account has no storage.
+        storage: Box<Node>,
+        /// Cached storage-trie root (`EMPTY_ROOT` when empty) — lets an account-field
+        /// write skip re-walking storage.
+        storage_root: Hash,
+        /// Cached reference of this account leaf (over the account RLP).
+        nref: NodeRef,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1408,9 +1430,30 @@ impl FlatMpt {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Hash> {
+        self.insert_op(key, LeafOp::Value(value))
+    }
+
+    /// Insert an account leaf (creating or updating fields, preserving storage).
+    pub fn insert_account(
+        &mut self,
+        key: Key,
+        nonce: u64,
+        balance: U256,
+        code_hash: Hash,
+    ) -> Result<Hash> {
+        self.insert_op(key, LeafOp::Account { nonce, balance, code_hash })
+    }
+
+    /// Set one storage slot of the account at `key` (auto-creates an empty account
+    /// if none exists). `slot` is the secure-trie storage key (`keccak(slot)`).
+    pub fn insert_storage(&mut self, key: Key, slot: Key, value: Vec<u8>) -> Result<Hash> {
+        self.insert_op(key, LeafOp::Storage { slot, value })
+    }
+
+    fn insert_op(&mut self, key: Key, op: LeafOp) -> Result<Hash> {
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
-        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value, ram)?;
+        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, op, ram)?;
         self.store.flush()?;
         Ok(self.root())
     }
@@ -1693,7 +1736,7 @@ impl FlatMpt {
         for (key, value) in fresh {
             // Disk path (RAM mode early-returns via the fan-out below), so new
             // structure is disk-backed.
-            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value, false)?;
+            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(value), false)?;
         }
         let install_ns = t_c.elapsed().as_nanos() as u64;
         let t_flush = std::time::Instant::now();
@@ -1727,7 +1770,7 @@ impl FlatMpt {
         if !matches!(self.upper, RamNode::Branch { .. }) {
             for b in buckets.iter_mut() {
                 if let Some((key, vh)) = b.pop() {
-                    insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, vh, true)?;
+                    insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(vh), true)?;
                     break;
                 }
             }
@@ -1746,7 +1789,7 @@ impl FlatMpt {
                         }
                         handles.push(scope.spawn(move || -> Result<()> {
                             for (key, vh) in keys {
-                                insert_into_child(store, cfg, slot, vec![k as u8], key, vh, true)?;
+                                insert_into_child(store, cfg, slot, vec![k as u8], key, LeafOp::Value(vh), true)?;
                             }
                             Ok(())
                         }));
@@ -1760,7 +1803,7 @@ impl FlatMpt {
         } else {
             let store = &self.store;
             for (key, vh) in buckets.into_iter().flatten() {
-                insert_ram(store, &cfg, &mut self.upper, Vec::new(), key, vh, true)?;
+                insert_ram(store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(vh), true)?;
             }
         }
         Ok(())
@@ -1827,6 +1870,14 @@ impl FlatMpt {
         // node tree to the leaf.
         let nibbles = key_nibbles(key);
         ram_get(&self.store, &self.upper, &nibbles, 0)
+    }
+
+    /// Read a storage slot of the account at `account_key`: descend to the account
+    /// leaf, then into its nested storage subtree at `slot_key`. `None` if the
+    /// account or slot is absent, or the account is a raw (opaque-storage) leaf.
+    pub fn get_storage(&self, account_key: &Key, slot_key: &Key) -> Result<Option<Vec<u8>>> {
+        let nibbles = key_nibbles(account_key);
+        ram_get_storage(&self.store, &self.upper, &nibbles, 0, slot_key)
     }
 
     pub fn root(&self) -> Hash {
@@ -1982,6 +2033,19 @@ fn node_get(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Resu
         Node::Leaf { path, value, .. } => {
             Ok((nibbles[depth..] == path[..]).then(|| value.clone()))
         }
+        // A generic value read of an account key returns the account RLP (the leaf
+        // value). Storage is read via the account's nested subtree (`storage_get`).
+        Node::Account { path, nonce, balance, code_hash, storage_root, .. } => {
+            Ok((nibbles[depth..] == path[..]).then(|| {
+                eth::Account {
+                    nonce: *nonce,
+                    balance: *balance,
+                    storage_root: B256::from(*storage_root),
+                    code_hash: B256::from(*code_hash),
+                }
+                .rlp()
+            }))
+        }
         Node::Extension { path, child, .. } => {
             if nibbles[depth..].starts_with(path) {
                 node_get(store, child, nibbles, depth + path.len())
@@ -2003,6 +2067,80 @@ fn node_get(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Resu
         Node::Raw { buf, off, len, .. } => {
             let n = parse_node_lazy(buf, *off, *len)?;
             node_get(store, &n, nibbles, depth)
+        }
+    }
+}
+
+/// Walk the RAM frontier toward the account at `nibbles`, then read `slot_key` from
+/// its nested storage. Mirrors [`ram_get`] but descends into the account's storage.
+fn ram_get_storage(
+    store: &FlatFile,
+    node: &RamNode,
+    nibbles: &[u8],
+    depth: usize,
+    slot_key: &Key,
+) -> Result<Option<Vec<u8>>> {
+    match node {
+        RamNode::Empty => Ok(None),
+        RamNode::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                ram_get_storage(store, child, nibbles, depth + path.len(), slot_key)
+            } else {
+                Ok(None)
+            }
+        }
+        RamNode::Branch { children, .. } => match &children[nibbles[depth] as usize] {
+            None => Ok(None),
+            Some(RamChild::Ram(child)) => ram_get_storage(store, child, nibbles, depth + 1, slot_key),
+            Some(RamChild::Disk { ptr, .. }) => {
+                let sub = store.read_lazy(*ptr)?;
+                node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+            }
+            Some(RamChild::Mem(m)) => {
+                let sub = parse_payload_lazy(m.bytes.clone())?;
+                node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+            }
+        },
+    }
+}
+
+/// Descend a record to the account leaf at `nibbles`, then read `slot_key` from its
+/// nested storage subtree. `None` if the account/slot is absent or the leaf is a
+/// raw (opaque-storage) value leaf rather than an account node.
+fn node_get_storage(
+    store: &FlatFile,
+    node: &Node,
+    nibbles: &[u8],
+    depth: usize,
+    slot_key: &Key,
+) -> Result<Option<Vec<u8>>> {
+    match node {
+        Node::Empty | Node::Leaf { .. } => Ok(None),
+        Node::Account { path, storage, .. } => {
+            if nibbles[depth..] == path[..] {
+                node_get(store, storage, &key_nibbles(slot_key), 0)
+            } else {
+                Ok(None)
+            }
+        }
+        Node::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                node_get_storage(store, child, nibbles, depth + path.len(), slot_key)
+            } else {
+                Ok(None)
+            }
+        }
+        Node::Branch { children, .. } => match &children[nibbles[depth] as usize] {
+            Some(child) => node_get_storage(store, child, nibbles, depth + 1, slot_key),
+            None => Ok(None),
+        },
+        Node::Overflow { ptr, .. } => {
+            let sub = store.read_lazy(*ptr)?;
+            node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let n = parse_node_lazy(buf, *off, *len)?;
+            node_get_storage(store, &n, nibbles, depth, slot_key)
         }
     }
 }
@@ -2087,18 +2225,18 @@ fn insert_into_child(
     slot: &mut Option<RamChild>,
     child_prefix: Vec<u8>,
     key: Key,
-    value: Vec<u8>,
+    op: LeafOp,
     ram: bool,
 ) -> Result<()> {
     match slot {
-        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, value, ram),
+        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, op, ram),
         Some(RamChild::Mem(_)) => {
             // In-RAM leaf: parse its bytes, apply the key, re-serialize into a new
             // `Arc` (the old one drops here). No I/O, no shared store.
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let mut subtree = parse_payload_lazy(m.bytes)?;
             let depth = subtree.prefix.len();
-            record_node_insert(store, cfg, &mut subtree.node, depth, key, value)?;
+            record_node_insert(store, cfg, &mut subtree.node, depth, key, op)?;
             *slot = Some(if should_promote(cfg, &subtree) {
                 promote_to_mem(subtree)?
             } else {
@@ -2109,7 +2247,7 @@ fn insert_into_child(
         Some(RamChild::Disk { ptr, root }) => {
             let mut subtree = store.read_lazy(*ptr)?;
             let old_ptr = *ptr;
-            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, value)?;
+            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, op)?;
             if should_promote(cfg, &subtree) {
                 store.free(old_ptr);
                 *slot = Some(promote_record_to_ram(store, subtree)?);
@@ -2122,7 +2260,8 @@ fn insert_into_child(
             Ok(())
         }
         None => {
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value)]);
+            let node = place_new(store, cfg, key, op, child_prefix.len())?;
+            let subtree = DiskSubtree { prefix: child_prefix, node };
             *slot = Some(make_leaf_child(store, ram, subtree)?);
             Ok(())
         }
@@ -2135,7 +2274,7 @@ fn insert_ram(
     node: &mut RamNode,
     prefix: Vec<u8>,
     key: Key,
-    value: Vec<u8>,
+    op: LeafOp,
     ram: bool,
 ) -> Result<()> {
     let nibbles = key_nibbles(&key);
@@ -2149,7 +2288,8 @@ fn insert_ram(
             // therefore the hash — is independent of how the leaf was created.
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            let subtree = subtree_from_entries(child_prefix, vec![(key, value)]);
+            let node_new = place_new(store, cfg, key, op, child_prefix.len())?;
+            let subtree = DiskSubtree { prefix: child_prefix, node: node_new };
             let mut children = empty_children();
             children[idx] = Some(make_leaf_child(store, ram, subtree)?);
             *node = RamNode::Branch {
@@ -2187,7 +2327,8 @@ fn insert_ram(
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
-                let subtree = subtree_from_entries(new_prefix, vec![(key, value)]);
+                let node_new = place_new(store, cfg, key, op, new_prefix.len())?;
+                let subtree = DiskSubtree { prefix: new_prefix, node: node_new };
                 children[new_idx] = Some(make_leaf_child(store, ram, subtree)?);
 
                 let branch = RamNode::Branch {
@@ -2207,7 +2348,7 @@ fn insert_ram(
             } else {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram(store, cfg, child, next_prefix, key, value, ram)
+                insert_ram(store, cfg, child, next_prefix, key, op, ram)
             }
         }
         RamNode::Branch { children, .. } => {
@@ -2217,16 +2358,11 @@ fn insert_ram(
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            insert_into_child(store, cfg, &mut children[idx], child_prefix, key, value, ram)
+            insert_into_child(store, cfg, &mut children[idx], child_prefix, key, op, ram)
         }
     }
 }
 
-
-fn subtree_from_entries(prefix: Vec<u8>, entries: Vec<(Key, Vec<u8>)>) -> DiskSubtree {
-    let node = build_node(entries, prefix.len());
-    DiskSubtree { prefix, node }
-}
 
 /// The `i`-th nibble of a key (i in 0..64), without allocating.
 fn nibble_at(key: &Key, i: usize) -> u8 {
@@ -2248,6 +2384,31 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
 fn leaf_node(path: Vec<u8>, value: Vec<u8>) -> Node {
     let nref = leaf_ref(&path, &value);
     Node::Leaf { path, value, nref }
+}
+
+/// Build an account leaf: compute its storage root from the nested `storage`
+/// subtree, fold `RLP([nonce, balance, storage_root, code_hash])` into the leaf
+/// value, and cache the storage root + node reference. Self-contained — hashing an
+/// account never touches a value store.
+fn account_node(path: Vec<u8>, nonce: u64, balance: U256, code_hash: Hash, storage: Node) -> Node {
+    let storage_root = hash_node(&storage).finalize();
+    let account_rlp = eth::Account {
+        nonce,
+        balance,
+        storage_root: B256::from(storage_root),
+        code_hash: B256::from(code_hash),
+    }
+    .rlp();
+    let nref = leaf_ref(&path, &account_rlp);
+    Node::Account {
+        path,
+        nonce,
+        balance,
+        code_hash,
+        storage: Box::new(storage),
+        storage_root,
+        nref,
+    }
 }
 
 fn make_extension(path: Vec<u8>, child: Node) -> Node {
@@ -2284,52 +2445,6 @@ fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
     Node::Branch { children, nref }
 }
 
-/// Canonical node for a single entry at `depth`: a bare leaf carrying the key's
-/// suffix (nibbles from `depth` to 64) and its `value`.
-fn single_entry_node(key: Key, value: Vec<u8>, depth: usize) -> Node {
-    leaf_node(key_nibbles(&key)[depth..].to_vec(), value)
-}
-
-/// Build the canonical subtree for `entries` (distinct keys, non-empty) rooted at
-/// `depth`. Takes ownership so values move into their leaves without cloning.
-fn build_node(entries: Vec<(Key, Vec<u8>)>, depth: usize) -> Node {
-    if entries.is_empty() {
-        return Node::Empty;
-    }
-    if entries.len() == 1 {
-        let (key, value) = entries.into_iter().next().unwrap();
-        return single_entry_node(key, value, depth);
-    }
-
-    let nibbles: Vec<Vec<u8>> = entries.iter().map(|(key, _)| key_nibbles(key)).collect();
-    let mut common = 0;
-    while depth + common < 64 {
-        let nibble = nibbles[0][depth + common];
-        if nibbles.iter().all(|ks| ks[depth + common] == nibble) {
-            common += 1;
-        } else {
-            break;
-        }
-    }
-    if common > 0 {
-        let path = nibbles[0][depth..depth + common].to_vec();
-        return make_extension(path, build_node(entries, depth + common));
-    }
-
-    let mut grouped: [Vec<(Key, Vec<u8>)>; 16] = std::array::from_fn(|_| Vec::new());
-    for (entry, nib) in entries.into_iter().zip(nibbles.iter()) {
-        let idx = nib.get(depth).copied().unwrap_or(0) as usize;
-        grouped[idx].push(entry);
-    }
-    let mut children = empty_box_children();
-    for (idx, group) in grouped.into_iter().enumerate() {
-        if !group.is_empty() {
-            children[idx] = Some(Box::new(build_node(group, depth + 1)));
-        }
-    }
-    make_branch(children)
-}
-
 
 /// Outcome of following a key's nibble path through one record's (inline) node.
 enum PathEnd {
@@ -2347,7 +2462,9 @@ fn follow_key(node: &Node, depth: usize, key: &Key) -> PathEnd {
         Node::Empty => PathEnd::Inline(false),
         // The leaf holds the key's suffix; it matches iff that suffix equals the
         // remaining nibbles of `key` from here.
-        Node::Leaf { path, .. } => PathEnd::Inline(key_nibbles(key)[depth..] == path[..]),
+        Node::Leaf { path, .. } | Node::Account { path, .. } => {
+            PathEnd::Inline(key_nibbles(key)[depth..] == path[..])
+        }
         Node::Extension { path, child, .. } => {
             let nibbles = key_nibbles(key);
             if nibbles.get(depth..depth + path.len()) == Some(path.as_slice()) {
@@ -2370,6 +2487,49 @@ fn follow_key(node: &Node, depth: usize, key: &Key) -> PathEnd {
     }
 }
 
+/// What to place/update at a key's leaf position. The state trie inserts
+/// `Account`/`Storage` ops (producing [`Node::Account`] leaves); a storage subtree
+/// inserts `Value` ops (producing [`Node::Leaf`] value leaves) — the same descent
+/// (`record_node_insert`) serves both levels.
+enum LeafOp {
+    /// Place/overwrite a generic value leaf (storage-trie slot, or a plain trie).
+    Value(Vec<u8>),
+    /// Place/update an account leaf, preserving any existing storage subtree.
+    Account { nonce: u64, balance: U256, code_hash: Hash },
+    /// Set one storage slot of the account at this key (auto-creates an empty
+    /// account if none exists), by inserting into the account's nested storage.
+    Storage { slot: Key, value: Vec<u8> },
+}
+
+/// Create a fresh node for a brand-new key at `depth` from a [`LeafOp`].
+fn place_new(store: &FlatFile, cfg: &Config, key: Key, op: LeafOp, depth: usize) -> Result<Node> {
+    let path = key_nibbles(&key)[depth..].to_vec();
+    Ok(match op {
+        LeafOp::Value(value) => leaf_node(path, value),
+        LeafOp::Account { nonce, balance, code_hash } => {
+            account_node(path, nonce, balance, code_hash, Node::Empty)
+        }
+        LeafOp::Storage { slot, value } => {
+            // Storage on a missing account: create an empty account holding the slot.
+            let mut storage = Node::Empty;
+            record_node_insert(store, cfg, &mut storage, 0, slot, LeafOp::Value(value))?;
+            account_node(path, 0, U256::ZERO, eth::EMPTY_CODE_HASH.0, storage)
+        }
+    })
+}
+
+/// Re-home an existing leaf (value or account) under a shorter suffix `path` after
+/// a divergence — recomputing its reference (which depends on `path`).
+fn rehome(node: Node, path: Vec<u8>) -> Node {
+    match node {
+        Node::Leaf { value, .. } => leaf_node(path, value),
+        Node::Account { nonce, balance, code_hash, storage, .. } => {
+            account_node(path, nonce, balance, code_hash, *storage)
+        }
+        _ => unreachable!("only leaf/account nodes are re-homed on divergence"),
+    }
+}
+
 /// Like [`node_insert`], but the subtree may contain `Overflow` children (which
 /// live only at branch slots). Crossing one reads, recurses into, migrates, and
 /// rewrites that child record, then updates the `Overflow{ptr, root}` in place.
@@ -2381,7 +2541,7 @@ fn record_node_insert(
     node: &mut Node,
     depth: usize,
     key: Key,
-    value: Vec<u8>,
+    op: LeafOp,
 ) -> Result<()> {
     // Expand a lazily-unparsed subtree one level before navigating into it
     // (children become `Raw` again, so deeper untouched subtrees stay unparsed).
@@ -2390,26 +2550,27 @@ fn record_node_insert(
     }
     let nibbles = key_nibbles(&key);
     let updated = match std::mem::replace(node, Node::Empty) {
-        Node::Empty => single_entry_node(key, value, depth),
-        Node::Leaf { path, value: old_value, .. } => {
+        Node::Empty => place_new(store, cfg, key, op, depth)?,
+        old @ (Node::Leaf { .. } | Node::Account { .. }) => {
+            let path = match &old {
+                Node::Leaf { path, .. } | Node::Account { path, .. } => path.clone(),
+                _ => unreachable!(),
+            };
             let remaining = &nibbles[depth..];
             let common = common_prefix(&path, remaining);
             if common == path.len() {
-                // Same key (both suffixes run to depth 64): overwrite the value.
+                // Same key (both suffixes run to depth 64): apply the op in place.
                 debug_assert_eq!(path.as_slice(), remaining);
-                leaf_node(path, value)
+                apply_op(store, cfg, old, path, op)?
             } else {
                 // The new key diverges partway along the leaf's suffix. Re-home the
-                // old leaf under a shorter suffix — its remaining path shrinks, so
-                // its Ethereum hash changes and is recomputed from `old_value` — and
-                // add the new leaf alongside.
+                // old leaf under a shorter suffix and add the new node alongside.
                 let mut children = empty_box_children();
                 let old_idx = path[common] as usize;
-                children[old_idx] =
-                    Some(Box::new(leaf_node(path[common + 1..].to_vec(), old_value)));
+                children[old_idx] = Some(Box::new(rehome(old, path[common + 1..].to_vec())));
                 let new_idx = remaining[common] as usize;
                 children[new_idx] =
-                    Some(Box::new(single_entry_node(key, value, depth + common + 1)));
+                    Some(Box::new(place_new(store, cfg, key, op, depth + common + 1)?));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -2421,7 +2582,7 @@ fn record_node_insert(
         Node::Extension { path, mut child, .. } => {
             let common = common_prefix(&path, &nibbles[depth..]);
             if common == path.len() {
-                record_node_insert(store, cfg, &mut child, depth + path.len(), key, value)?;
+                record_node_insert(store, cfg, &mut child, depth + path.len(), key, op)?;
                 make_extension(path, *child)
             } else {
                 // Diverges partway along the extension — no overflow edge here.
@@ -2435,7 +2596,7 @@ fn record_node_insert(
                 }));
                 let new_idx = nibbles[depth + common] as usize;
                 children[new_idx] =
-                    Some(Box::new(single_entry_node(key, value, depth + common + 1)));
+                    Some(Box::new(place_new(store, cfg, key, op, depth + common + 1)?));
                 let branch = make_branch(children);
                 if common == 0 {
                     branch
@@ -2453,9 +2614,9 @@ fn record_node_insert(
                     // on data written by this build.
                     unreachable!("on-disk Overflow under promote-on-max (option B)")
                 }
-                Some(child) => record_node_insert(store, cfg, child, depth + 1, key, value)?,
+                Some(child) => record_node_insert(store, cfg, child, depth + 1, key, op)?,
                 None => {
-                    children[idx] = Some(Box::new(single_entry_node(key, value, depth + 1)));
+                    children[idx] = Some(Box::new(place_new(store, cfg, key, op, depth + 1)?));
                 }
             }
             make_branch(children)
@@ -2465,6 +2626,27 @@ fn record_node_insert(
     };
     *node = updated;
     Ok(())
+}
+
+/// Apply a [`LeafOp`] to the existing node at an exact key match.
+fn apply_op(store: &FlatFile, cfg: &Config, old: Node, path: Vec<u8>, op: LeafOp) -> Result<Node> {
+    Ok(match (old, op) {
+        // Overwrite a value leaf.
+        (Node::Leaf { .. }, LeafOp::Value(value)) => leaf_node(path, value),
+        // Update account fields, keeping the existing storage subtree.
+        (Node::Account { storage, .. }, LeafOp::Account { nonce, balance, code_hash }) => {
+            account_node(path, nonce, balance, code_hash, *storage)
+        }
+        // Set one storage slot: insert into the account's nested storage, re-fold.
+        (
+            Node::Account { nonce, balance, code_hash, mut storage, .. },
+            LeafOp::Storage { slot, value },
+        ) => {
+            record_node_insert(store, cfg, &mut storage, 0, slot, LeafOp::Value(value))?;
+            account_node(path, nonce, balance, code_hash, *storage)
+        }
+        _ => bail!("leaf op does not match the existing node kind at this key"),
+    })
 }
 
 /// The nibble prefix of the record's top branch (record prefix + leading
@@ -2783,7 +2965,7 @@ fn fold_group(
     let depth = subtree.prefix.len();
     let t = std::time::Instant::now();
     for (key, value) in keys {
-        record_node_insert(store, cfg, &mut subtree.node, depth, *key, value.clone())?;
+        record_node_insert(store, cfg, &mut subtree.node, depth, *key, LeafOp::Value(value.clone()))?;
     }
     let rebuild_ns = t.elapsed().as_nanos() as u64;
 
@@ -3004,6 +3186,11 @@ fn node_size(node: &Node) -> usize {
             let n = children.iter().flatten().count();
             1 + 2 + ref_size(nref) + n * 4 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
         }
+        // tag + path + nonce(8) + balance(32) + code_hash(32) + storage subtree.
+        // The storage root + node ref are recomputed on read, not stored.
+        Node::Account { path, storage, .. } => {
+            1 + (1 + path.len().div_ceil(2)) + 8 + 32 + 32 + node_size(storage)
+        }
         Node::Overflow { .. } => 1 + 4 + 4 + 32,
         // Raw is already serialized — its byte length is its on-disk size.
         Node::Raw { len, .. } => *len,
@@ -3122,6 +3309,14 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
             out.extend_from_slice(&ptr.unit.to_le_bytes());
             out.extend_from_slice(&ptr.len.to_le_bytes());
             out.extend_from_slice(root);
+        }
+        Node::Account { path, nonce, balance, code_hash, storage, .. } => {
+            out.push(5);
+            write_nibble_path(out, path)?;
+            out.extend_from_slice(&nonce.to_le_bytes());
+            out.extend_from_slice(&balance.to_be_bytes::<32>());
+            out.extend_from_slice(code_hash);
+            write_node(out, storage)?;
         }
         // A Raw subtree is already its own `write_node` bytes — emit verbatim.
         Node::Raw { buf, off, len, .. } => out.extend_from_slice(&buf[*off..*off + *len]),
@@ -3270,6 +3465,15 @@ impl<'a> CompactReader<'a> {
                     root,
                 })
             }
+            5 => {
+                let path = self.read_nibble_path()?;
+                let nonce = u64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap());
+                let balance = U256::from_be_slice(self.read_bytes(32)?);
+                let mut code_hash = [0u8; 32];
+                code_hash.copy_from_slice(self.read_bytes(32)?);
+                let storage = self.read_node()?;
+                Ok(account_node(path, nonce, balance, code_hash, storage))
+            }
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
     }
@@ -3417,6 +3621,17 @@ impl LazyReader {
                     ptr: DiskPtr { unit, len },
                     root,
                 })
+            }
+            5 => {
+                let path = self.nibble_path()?;
+                let nonce = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+                let balance = U256::from_be_slice(self.take(32)?);
+                let mut code_hash = [0u8; 32];
+                code_hash.copy_from_slice(self.take(32)?);
+                // Parse the storage subtree lazily too (its branch children stay
+                // `Raw`); account_node reads their cached refs to fold the root.
+                let storage = self.node()?;
+                Ok(account_node(path, nonce, balance, code_hash, storage))
             }
             tag => bail!("invalid compact subtree node tag {tag}"),
         }
@@ -4210,9 +4425,10 @@ fn mk_ref(rlp: Vec<u8>) -> NodeRef {
 fn hash_node(node: &Node) -> NodeRef {
     match node {
         Node::Empty => NodeRef::Hash(empty_hash()),
-        Node::Leaf { nref, .. } | Node::Extension { nref, .. } | Node::Branch { nref, .. } => {
-            nref.clone()
-        }
+        Node::Leaf { nref, .. }
+        | Node::Extension { nref, .. }
+        | Node::Branch { nref, .. }
+        | Node::Account { nref, .. } => nref.clone(),
         Node::Overflow { root, .. } => NodeRef::Hash(*root),
         Node::Raw { nref, .. } => nref.clone(),
     }
