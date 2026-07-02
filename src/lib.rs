@@ -1175,22 +1175,11 @@ enum RamChild {
     // from `ptr.len`, so it isn't stored here.
     Disk { ptr: DiskPtr, root: Hash },
     /// A **promoted account**: an account whose storage grew past a record, lifted
-    /// into the frontier so its storage trie spans multiple records. `storage` is
-    /// the storage trie as a RAM subtree whose leaves are `Disk` storage records —
-    /// so the inter-record pointers live in RAM and GC relocates them like any other
-    /// frontier record (no on-disk pointer rewriting). The account leaf's hash is
-    /// `leaf_ref(path, RLP([nonce, balance, storage_root, code_hash]))`, where
-    /// `storage_root = hash_ram(storage)`; it is recomputed on demand (cheap) while
-    /// the storage subtree memoizes its own hash. `balance`/`code_hash` are stored as
-    /// bytes so the manifest (serde) needs no `U256` serde feature.
-    Account {
-        /// Remaining `keccak(address)` nibbles from this leaf's frontier position.
-        path: Vec<u8>,
-        nonce: u64,
-        balance: [u8; 32],
-        code_hash: Hash,
-        storage: Box<RamNode>,
-    },
+    /// into the frontier so its storage trie spans multiple records (see
+    /// [`PromotedAccount`]). Boxed so this rare variant doesn't inflate `RamChild`'s
+    /// size — every frontier branch holds a `[Option<RamChild>; 16]`, so an unboxed
+    /// ~100-byte variant would ~double the whole in-RAM frontier footprint.
+    Account(Box<PromotedAccount>),
     /// RAM-build leaf: the serialized record bytes held as their *own* heap object
     /// (an `Arc<[u8]>`), with no flat-file I/O. Reads clone the `Arc` (lock-free
     /// refcount bump); a rewrite drops the old `Arc` (malloc reclaims) and installs
@@ -1198,6 +1187,24 @@ enum RamChild {
     /// a manifest). Same Merkle root as the equivalent `Disk` leaf, so a leaf
     /// hashes identically either way.
     Mem(MemLeaf),
+}
+
+/// The payload of a promoted account (boxed inside [`RamChild::Account`]). `storage`
+/// is the account's storage trie as a RAM subtree whose leaves are `Disk` storage
+/// records — so the inter-record pointers live in RAM and GC relocates them like any
+/// other frontier record (no on-disk pointer rewriting). The account leaf's hash is
+/// `leaf_ref(path, RLP([nonce, balance, storage_root, code_hash]))`, where
+/// `storage_root = hash_ram(storage)`; recomputed on demand (cheap) while the storage
+/// subtree memoizes its own hash. `balance`/`code_hash` are stored as bytes so the
+/// manifest (serde) needs no `U256` serde feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PromotedAccount {
+    /// Remaining `keccak(address)` nibbles from this leaf's frontier position.
+    path: Vec<u8>,
+    nonce: u64,
+    balance: [u8; 32],
+    code_hash: Hash,
+    storage: Box<RamNode>,
 }
 
 /// A `Mem` leaf's bytes (the same `[prefix-path][node]` payload a disk record
@@ -2039,10 +2046,10 @@ fn ram_get(store: &FlatFile, node: &RamNode, nibbles: &[u8], depth: usize) -> Re
                 }
                 // A generic value read of a promoted account returns its account RLP.
                 // The child sits one nibble below this branch (like the Ram/Disk arms).
-                Some(RamChild::Account { path, nonce, balance, code_hash, storage }) => {
-                    if nibbles[depth + 1..] == path[..] {
-                        let sr = hash_ram(storage);
-                        Ok(Some(ram_account_rlp(*nonce, balance, code_hash, sr)))
+                Some(RamChild::Account(a)) => {
+                    if nibbles[depth + 1..] == a.path[..] {
+                        let sr = hash_ram(&a.storage);
+                        Ok(Some(ram_account_rlp(a.nonce, &a.balance, &a.code_hash, sr)))
                     } else {
                         Ok(None)
                     }
@@ -2129,9 +2136,9 @@ fn ram_get_storage(
             }
             // Promoted account (one nibble below this branch): descend its RAM
             // storage frontier with the slot key.
-            Some(RamChild::Account { path, storage, .. }) => {
-                if nibbles[depth + 1..] == path[..] {
-                    ram_get(store, storage, &key_nibbles(slot_key), 0)
+            Some(RamChild::Account(a)) => {
+                if nibbles[depth + 1..] == a.path[..] {
+                    ram_get(store, &a.storage, &key_nibbles(slot_key), 0)
                 } else {
                     Ok(None)
                 }
@@ -2300,30 +2307,27 @@ fn insert_into_child(
             }
             Ok(())
         }
-        Some(RamChild::Account { .. }) => {
+        Some(RamChild::Account(_)) => {
             let nibbles = key_nibbles(&key);
             let (common, path_len) = match slot.as_ref() {
-                Some(RamChild::Account { path, .. }) => {
-                    (common_prefix(path, &nibbles[child_prefix.len()..]), path.len())
+                Some(RamChild::Account(a)) => {
+                    (common_prefix(&a.path, &nibbles[child_prefix.len()..]), a.path.len())
                 }
                 _ => unreachable!(),
             };
             if common == path_len {
                 // Same account: apply the op in place (storage insert or field update).
-                let Some(RamChild::Account { nonce, balance, code_hash, storage, .. }) = slot.as_mut()
-                else {
-                    unreachable!()
-                };
+                let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
                 match op {
                     LeafOp::Storage { slot: skey, value } => {
                         // Descend the account's RAM storage frontier with the slot key
                         // (storage records are Disk, so ram=false).
-                        insert_ram(store, cfg, storage, Vec::new(), skey, LeafOp::Value(value), false)?;
+                        insert_ram(store, cfg, &mut a.storage, Vec::new(), skey, LeafOp::Value(value), false)?;
                     }
                     LeafOp::Account { nonce: n, balance: b, code_hash: ch } => {
-                        *nonce = n;
-                        *balance = b.to_be_bytes::<32>();
-                        *code_hash = ch;
+                        a.nonce = n;
+                        a.balance = b.to_be_bytes::<32>();
+                        a.code_hash = ch;
                     }
                     LeafOp::Value(_) => bail!("value op on a promoted account leaf"),
                 }
@@ -2332,19 +2336,13 @@ fn insert_into_child(
                 // A different account diverges: split into a frontier branch —
                 // re-home the promoted account under a shorter path, place the new
                 // key alongside.
-                let Some(RamChild::Account { path, nonce, balance, code_hash, storage }) = slot.take()
-                else {
-                    unreachable!()
-                };
+                let Some(RamChild::Account(mut a)) = slot.take() else { unreachable!() };
                 let mut children = empty_children();
-                let old_idx = path[common] as usize;
-                children[old_idx] = Some(RamChild::Account {
-                    path: path[common + 1..].to_vec(),
-                    nonce,
-                    balance,
-                    code_hash,
-                    storage,
-                });
+                let old_idx = a.path[common] as usize;
+                let rehomed_path = a.path[common + 1..].to_vec();
+                let split_path = a.path[..common].to_vec();
+                a.path = rehomed_path;
+                children[old_idx] = Some(RamChild::Account(a));
                 let new_idx = nibbles[child_prefix.len() + common] as usize;
                 let mut new_prefix = child_prefix.clone();
                 new_prefix
@@ -2357,7 +2355,7 @@ fn insert_into_child(
                     RamChild::Ram(Box::new(branch))
                 } else {
                     RamChild::Ram(Box::new(RamNode::Extension {
-                        path: path[..common].to_vec(),
+                        path: split_path,
                         child: Box::new(branch),
                         hash: HashCell::new(None),
                     }))
@@ -2910,13 +2908,13 @@ fn promote_account_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamC
         unreachable!("promote_account_to_ram called on a non-account record");
     };
     let storage_ram = promote_storage_to_ram(store, *storage)?;
-    Ok(RamChild::Account {
+    Ok(RamChild::Account(Box::new(PromotedAccount {
         path,
         nonce,
         balance: balance.to_be_bytes::<32>(),
         code_hash,
         storage: storage_ram,
-    })
+    })))
 }
 
 /// Outcome of applying a group's keys, before the new leaf record is written.
@@ -3338,7 +3336,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
                 Some(RamChild::Ram(child)) => install_at_key(child, key, depth + 1, new),
                 // Promoted accounts aren't relocated as whole records (their storage
                 // records are pinned from evacuation), so none is installed here.
-                Some(RamChild::Account { .. }) => false,
+                Some(RamChild::Account(_)) => false,
                 None => false,
             };
             if done {
@@ -3957,7 +3955,7 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                     // Promoted accounts are created on the disk path, so their storage
                     // records are already `Disk` (nothing to spill). RAM-build mode is
                     // not combined with account promotion.
-                    Some(RamChild::Account { .. }) => {}
+                    Some(RamChild::Account(_)) => {}
                 }
             }
             Ok(())
@@ -3994,7 +3992,7 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
                 }
                 // A promoted account is not a relocatable state record; its storage
                 // records are pinned from GC evacuation, so no reloc targets one here.
-                Some(RamChild::Account { .. }) => false,
+                Some(RamChild::Account(_)) => false,
                 None => false,
             }
         }
@@ -4411,7 +4409,7 @@ fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr
             match children[idx].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr(child, nibbles, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
-                RamChild::Mem(_) | RamChild::Account { .. } => None,
+                RamChild::Mem(_) | RamChild::Account(_) => None,
             }
         }
     }
@@ -4439,7 +4437,7 @@ fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr>
             match children[nibble_at(key, depth) as usize].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr_key(child, key, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
-                RamChild::Mem(_) | RamChild::Account { .. } => None,
+                RamChild::Mem(_) | RamChild::Account(_) => None,
             }
         }
     }
@@ -4550,8 +4548,8 @@ fn ram_child_hash(child: &RamChild) -> Hash {
         RamChild::Ram(node) => hash_ram(node),
         RamChild::Disk { root, .. } => *root,
         RamChild::Mem(m) => m.root,
-        RamChild::Account { path, nonce, balance, code_hash, storage } => {
-            ram_account_ref(path, *nonce, balance, code_hash, storage).finalize()
+        RamChild::Account(a) => {
+            ram_account_ref(&a.path, a.nonce, &a.balance, &a.code_hash, &a.storage).finalize()
         }
     }
 }
@@ -4565,7 +4563,7 @@ fn ram_child_stale(child: &RamChild) -> bool {
             RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.get().is_none(),
         },
         // A promoted account re-folds cheaply, but its storage subtree may be stale.
-        RamChild::Account { storage, .. } => match storage.as_ref() {
+        RamChild::Account(a) => match a.storage.as_ref() {
             RamNode::Empty => false,
             RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.get().is_none(),
         },
@@ -4744,7 +4742,7 @@ fn collect_leaf_stats(node: &RamNode, stats: &mut LeafStats) {
                         stats.page_hist[pages] += 1;
                     }
                     RamChild::Ram(n) => collect_leaf_stats(n, stats),
-                    RamChild::Account { storage, .. } => collect_leaf_stats(storage, stats),
+                    RamChild::Account(a) => collect_leaf_stats(&a.storage, stats),
                 }
             }
         }
@@ -4762,7 +4760,7 @@ fn count_disk_leaves(node: &RamNode) -> usize {
                 RamChild::Disk { .. } => 1,
                 RamChild::Mem(_) => 1,
                 RamChild::Ram(n) => count_disk_leaves(n),
-                RamChild::Account { storage, .. } => count_disk_leaves(storage),
+                RamChild::Account(a) => count_disk_leaves(&a.storage),
             })
             .sum(),
     }
@@ -4789,7 +4787,7 @@ fn recompute_live(node: &RamNode, live: &mut [u32]) {
                         }
                     }
                     // A promoted account's storage records are its own Disk leaves.
-                    RamChild::Account { storage, .. } => recompute_live(storage, live),
+                    RamChild::Account(a) => recompute_live(&a.storage, live),
                 }
             }
         }
