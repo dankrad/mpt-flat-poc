@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy-primitives = "1"
-alloy-rlp = "0.3"
+alloy-primitives = { version = "1", features = ["rlp"] }
+alloy-rlp = { version = "0.3", features = ["derive"] }
 anyhow = "1"
 bincode = "1"
 libc = "0.2"

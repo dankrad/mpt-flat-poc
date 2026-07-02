@@ -8,8 +8,63 @@
 //! it constructs a fresh logical trie from a key/value set and hashes it Ethereum-style
 //! — not the production trie.
 
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{B256, U256, keccak256};
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 use std::collections::BTreeMap;
+
+/// Ethereum's empty-trie root: `keccak256(RLP(""))`. Also every empty account's
+/// storage root.
+pub const EMPTY_ROOT: B256 =
+    alloy_primitives::b256!("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+/// `keccak256("")` — the code hash of an account with no code (EOAs).
+pub const EMPTY_CODE_HASH: B256 =
+    alloy_primitives::b256!("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+
+/// An Ethereum account. The `RlpEncodable` derive encodes the fields, in order, as
+/// an RLP list — exactly the mainnet account encoding `RLP([nonce, balance,
+/// storageRoot, codeHash])`. `nonce`/`balance` encode as minimal big-endian
+/// integers; the two hashes as 32-byte strings.
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+pub struct Account {
+    pub nonce: u64,
+    pub balance: U256,
+    pub storage_root: B256,
+    pub code_hash: B256,
+}
+
+impl Account {
+    /// An externally-owned account: no storage, no code.
+    pub fn eoa(nonce: u64, balance: U256) -> Self {
+        Self { nonce, balance, storage_root: EMPTY_ROOT, code_hash: EMPTY_CODE_HASH }
+    }
+
+    /// A contract account with the given storage root and code hash.
+    pub fn contract(nonce: u64, balance: U256, storage_root: B256, code_hash: B256) -> Self {
+        Self { nonce, balance, storage_root, code_hash }
+    }
+
+    /// RLP encoding — the value stored at the account's state-trie leaf.
+    pub fn rlp(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        alloy_rlp::Encodable::encode(self, &mut out);
+        out
+    }
+
+    /// Decode an account from its state-trie leaf value.
+    pub fn decode(mut bytes: &[u8]) -> Result<Self, alloy_rlp::Error> {
+        alloy_rlp::Decodable::decode(&mut bytes)
+    }
+}
+
+/// RLP encoding of a storage slot value — `RLP(U256)`, i.e. the big-endian integer
+/// with leading zeros trimmed (the value stored at a storage-trie leaf). A zero
+/// value encodes as the empty string; Ethereum never stores zero slots (they are
+/// deleted), so callers should treat `U256::ZERO` as a removal.
+pub fn storage_value_rlp(value: U256) -> Vec<u8> {
+    let mut out = Vec::new();
+    alloy_rlp::Encodable::encode(&value, &mut out);
+    out
+}
 
 /// Hex-prefix (compact) encoding of a nibble path. The first nibble is a flag:
 /// `0` extension-even, `1` extension-odd, `2` leaf-even, `3` leaf-odd; even paths get
@@ -185,6 +240,39 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(secure_root(&entries), want);
+    }
+
+    #[test]
+    fn account_rlp_roundtrip_and_constants() {
+        // EMPTY_ROOT / EMPTY_CODE_HASH constants.
+        assert_eq!(root(&[]), EMPTY_ROOT);
+        assert_eq!(EMPTY_CODE_HASH, keccak256([]));
+
+        // Each official account RLP decodes to an Account and re-encodes byte-for-
+        // byte; rebuilding the secure trie from the typed accounts reproduces the
+        // known state root — so Account's RLP is exactly the mainnet encoding.
+        let pairs = [
+            ("a94f5374fce5edbc8e2a8697c15331677e6ebf0b", "f848018405f446a7a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("095e7baea6a6c7c4c2dfeb977efac326af552d87", "f8440101a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a004bccc5d94f4d1f99aab44369a910179931772f2a5c001c3229f57831c102769"),
+            ("d2571607e241ecf590ed94b12d87c94babe36db6", "f8440180a0ba4b47865c55a341a4a78759bb913cd15c3ee8eaf30a62fa8d1c8863113d84e8a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("62c01474f089b07dae603491675dc5b5748f7049", "f8448080a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            ("2adc25665018aa1fe0e6bc666dac8fc2697ff9ba", "f8478083019a59a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a0c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+        ];
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (addr, rlp) in pairs {
+            let (addr, rlp) = (hx(addr), hx(rlp));
+            let acct = Account::decode(&rlp).unwrap();
+            assert_eq!(acct.rlp(), rlp, "account RLP round-trip mismatch");
+            entries.push((addr, acct.rlp()));
+        }
+        let want: B256 = "0x730a444e08ab4b8dee147c9b232fc52d34a223d600031c1e9d25bfc985cbd797"
+            .parse()
+            .unwrap();
+        assert_eq!(secure_root(&entries), want);
+
+        // The first account is a plain EOA (nonce 1, balance 0x05f446a7).
+        let eoa = Account::eoa(1, U256::from(0x05f446a7u64));
+        assert_eq!(eoa.rlp(), hx(pairs[0].1));
     }
 
     #[test]
