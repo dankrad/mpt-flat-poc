@@ -1101,21 +1101,21 @@ enum Node {
         /// extension+leaf). The full key is `position_prefix ++ path`, recovered
         /// from the tree position, so the key isn't stored.
         path: Vec<u8>,
-        /// The leaf's value bytes. Ethereum's leaf hash is `keccak256(RLP([
+        /// The leaf's value bytes. Ethereum's leaf reference is `ref(RLP([
         /// hex_prefix(path), value]))`, so it depends on `path`; when a split
-        /// re-homes the leaf to a shallower depth its `path` shrinks and `hash`
+        /// re-homes the leaf to a shallower depth its `path` shrinks and `nref`
         /// must be recomputed — which needs `value` here, in the trie.
         value: Vec<u8>,
-        hash: Hash,
+        nref: NodeRef,
     },
     Extension {
         path: Vec<u8>,
         child: Box<Node>,
-        hash: Hash,
+        nref: NodeRef,
     },
     Branch {
         children: [Option<Box<Node>>; 16],
-        hash: Hash,
+        nref: NodeRef,
     },
     /// A child subtree that lives in its *own* flat-file record rather than
     /// inline in this one (the "(3) overflow" of the paged-node design). `root`
@@ -1128,7 +1128,7 @@ enum Node {
         root: Hash,
     },
     /// A still-serialized child subtree: a zero-copy `[off, off+len)` slice of the
-    /// shared record buffer plus its root `hash`. Produced by the *lazy* reader so
+    /// shared record buffer plus its `nref`. Produced by the *lazy* reader so
     /// that, to change one key, we only parse the nodes on that key's path —
     /// untouched sibling subtrees stay `Raw` (no byte copy on read) and are written
     /// back verbatim. Expanded one level on demand by `record_node_insert`.
@@ -1136,7 +1136,7 @@ enum Node {
         buf: Arc<[u8]>,
         off: usize,
         len: usize,
-        hash: Hash,
+        nref: NodeRef,
     },
 }
 
@@ -2016,7 +2016,7 @@ fn meta_path(path: &Path) -> PathBuf {
 
 /// Serialize a subtree and wrap the bytes in their own `Arc` — a RAM-build leaf.
 fn make_mem_leaf(subtree: &DiskSubtree) -> Result<RamChild> {
-    let root = hash_node(&subtree.node);
+    let root = hash_node(&subtree.node).finalize();
     let (payload, _) = serialize_subtree(subtree)?;
     Ok(RamChild::Mem(MemLeaf { bytes: Arc::from(payload), root }))
 }
@@ -2027,7 +2027,7 @@ fn make_leaf_child(store: &FlatFile, ram: bool, subtree: DiskSubtree) -> Result<
     if ram {
         make_mem_leaf(&subtree)
     } else {
-        let root = hash_node(&subtree.node);
+        let root = hash_node(&subtree.node).finalize();
         let (payload, _) = serialize_subtree(&subtree)?;
         let ptr = store.write_payload(&payload)?;
         Ok(RamChild::Disk { ptr, root })
@@ -2117,7 +2117,7 @@ fn insert_into_child(
                 let (payload, _) = serialize_subtree(&subtree)?;
                 store.free(old_ptr);
                 *ptr = store.write_payload(&payload)?;
-                *root = hash_node(&subtree.node);
+                *root = hash_node(&subtree.node).finalize();
             }
             Ok(())
         }
@@ -2242,29 +2242,29 @@ fn nibble_at(key: &Key, i: usize) -> u8 {
 // --- Disk-node constructors: compute and cache the node hash exactly once. ---
 
 /// A leaf holding the suffix `path` (key nibbles from its position to depth 64)
-/// and its `value`, hashing them the Ethereum way (`leaf_hash`). Recomputes the
-/// hash from `path` + `value`, so callers can re-home a leaf to a new depth just
-/// by handing it a shorter `path`.
+/// and its `value`, computing its Ethereum node reference (`leaf_ref`). Recomputes
+/// the reference from `path` + `value`, so callers can re-home a leaf to a new
+/// depth just by handing it a shorter `path`.
 fn leaf_node(path: Vec<u8>, value: Vec<u8>) -> Node {
-    let hash = leaf_hash(&path, &value);
-    Node::Leaf { path, value, hash }
+    let nref = leaf_ref(&path, &value);
+    Node::Leaf { path, value, nref }
 }
 
 fn make_extension(path: Vec<u8>, child: Node) -> Node {
-    let hash = ext_hash(&path, &hash_node(&child));
+    let nref = ext_ref(&path, &hash_node(&child));
     Node::Extension {
         path,
         child: Box::new(child),
-        hash,
+        nref,
     }
 }
 
-/// Ethereum branch node hash over the 16 child slots (see `branch_hash_streaming`).
-/// An `Overflow` child contributes its `root` via `hash_node`, so a branch hashes
+/// Ethereum branch node reference over the 16 child slots (see `branch_ref`). An
+/// `Overflow` child contributes its `root` via `hash_node`, so a branch references
 /// identically whether a child is inline or overflowed.
-fn branch_hash(children: &[Option<Box<Node>>; 16]) -> Hash {
+fn branch_node_ref(children: &[Option<Box<Node>>; 16]) -> NodeRef {
     let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-    branch_hash_streaming(bitmap, children.iter().flatten().map(|c| hash_node(c)))
+    branch_ref(bitmap, children.iter().flatten().map(|c| hash_node(c)))
 }
 
 /// Pack a child-presence iterator (16 slots) into a little-endian bitmap.
@@ -2280,8 +2280,8 @@ fn branch_bitmap(present: impl Iterator<Item = bool>) -> u16 {
 
 fn make_branch(children: [Option<Box<Node>>; 16]) -> Node {
     // Disk-side branches never carry a value (every key is a full 64-nibble path).
-    let hash = branch_hash(&children);
-    Node::Branch { children, hash }
+    let nref = branch_node_ref(&children);
+    Node::Branch { children, nref }
 }
 
 /// Canonical node for a single entry at `depth`: a bare leaf carrying the key's
@@ -2529,7 +2529,7 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
             other => {
                 let mut cp = branch_prefix.clone();
                 cp.push(i as u8);
-                let root = hash_node(&other);
+                let root = hash_node(&other).finalize();
                 let (payload, _) = serialize_subtree(&DiskSubtree { prefix: cp, node: other })?;
                 payloads.push(payload);
                 batched_slots.push((i, root));
@@ -2798,7 +2798,7 @@ fn fold_group(
         store.free(ptr);
         GroupOut::Leaf {
             payload,
-            root: hash_node(&subtree.node),
+            root: hash_node(&subtree.node).finalize(),
         }
     };
     stats::on_group(read_ns, rebuild_ns, t.elapsed().as_nanos() as u64);
@@ -2993,18 +2993,44 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
 fn node_size(node: &Node) -> usize {
     match node {
         Node::Empty => 1,
-        Node::Leaf { path, value, .. } => 1 + (1 + path.len().div_ceil(2)) + 4 + value.len() + 32,
-        Node::Extension { path, child, .. } => {
-            1 + (1 + path.len().div_ceil(2)) + 32 + node_size(child)
+        Node::Leaf { path, value, nref } => {
+            1 + (1 + path.len().div_ceil(2)) + 4 + value.len() + ref_size(nref)
         }
-        Node::Branch { children, .. } => {
-            // tag + bitmap + hash + child-length table (u32 per present child) + children.
+        Node::Extension { path, child, nref } => {
+            1 + (1 + path.len().div_ceil(2)) + ref_size(nref) + node_size(child)
+        }
+        Node::Branch { children, nref } => {
+            // tag + bitmap + ref + child-length table (u32 per present child) + children.
             let n = children.iter().flatten().count();
-            1 + 2 + 32 + n * 4 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
+            1 + 2 + ref_size(nref) + n * 4 + children.iter().flatten().map(|c| node_size(c)).sum::<usize>()
         }
         Node::Overflow { .. } => 1 + 4 + 4 + 32,
         // Raw is already serialized — its byte length is its on-disk size.
         Node::Raw { len, .. } => *len,
+    }
+}
+
+/// On-disk size of a serialized node reference (matches [`write_ref`]).
+fn ref_size(nref: &NodeRef) -> usize {
+    1 + match nref {
+        NodeRef::Hash(_) => 32,
+        NodeRef::Inline(rlp) => 1 + rlp.len(),
+    }
+}
+
+/// Serialize a node reference: tag `0` + 32-byte hash, or tag `1` + `u8` length +
+/// the inline RLP (`< 32` bytes).
+fn write_ref(out: &mut Vec<u8>, nref: &NodeRef) {
+    match nref {
+        NodeRef::Hash(h) => {
+            out.push(0);
+            out.extend_from_slice(h);
+        }
+        NodeRef::Inline(rlp) => {
+            out.push(1);
+            out.push(rlp.len() as u8);
+            out.extend_from_slice(rlp);
+        }
     }
 }
 
@@ -3048,22 +3074,22 @@ fn deserialize_subtree(payload: &[u8]) -> Result<DiskSubtree> {
 fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     match node {
         Node::Empty => out.push(0),
-        Node::Leaf { path, value, hash } => {
+        Node::Leaf { path, value, nref } => {
             out.push(1);
             write_nibble_path(out, path)?;
             out.extend_from_slice(&(value.len() as u32).to_le_bytes());
             out.extend_from_slice(value);
-            out.extend_from_slice(hash);
+            write_ref(out, nref);
         }
-        Node::Extension { path, child, hash } => {
+        Node::Extension { path, child, nref } => {
             out.push(2);
             write_nibble_path(out, path)?;
-            out.extend_from_slice(hash);
+            write_ref(out, nref);
             write_node(out, child)?;
         }
         Node::Branch {
             children,
-            hash,
+            nref,
         } => {
             out.push(3);
             let mut bitmap = 0u16;
@@ -3073,7 +3099,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) -> Result<()> {
                 }
             }
             out.extend_from_slice(&bitmap.to_le_bytes());
-            out.extend_from_slice(hash);
+            write_ref(out, nref);
             // Child-length table: a u32 per present child, so a reader can jump to
             // child `i` by summing lengths 0..i instead of scanning siblings. Not
             // hashed (the branch hash is over the child digests), so it doesn't
@@ -3193,6 +3219,17 @@ impl<'a> CompactReader<'a> {
         Ok(())
     }
 
+    fn read_ref(&mut self) -> Result<NodeRef> {
+        match self.read_u8()? {
+            0 => Ok(NodeRef::Hash(self.read_hash()?)),
+            1 => {
+                let len = self.read_u8()? as usize;
+                Ok(NodeRef::Inline(self.read_bytes(len)?.to_vec()))
+            }
+            t => bail!("invalid node-ref tag {t}"),
+        }
+    }
+
     fn read_node(&mut self) -> Result<Node> {
         match self.read_u8()? {
             0 => Ok(Node::Empty),
@@ -3200,18 +3237,18 @@ impl<'a> CompactReader<'a> {
                 let path = self.read_nibble_path()?;
                 let vlen = self.read_u32()? as usize;
                 let value = self.read_bytes(vlen)?.to_vec();
-                let hash = self.read_hash()?;
-                Ok(Node::Leaf { path, value, hash })
+                let nref = self.read_ref()?;
+                Ok(Node::Leaf { path, value, nref })
             }
             2 => {
                 let path = self.read_nibble_path()?;
-                let hash = self.read_hash()?;
+                let nref = self.read_ref()?;
                 let child = Box::new(self.read_node()?);
-                Ok(Node::Extension { path, child, hash })
+                Ok(Node::Extension { path, child, nref })
             }
             3 => {
                 let bitmap = self.read_u16()?;
-                let hash = self.read_hash()?;
+                let nref = self.read_ref()?;
                 // Skip the child-length table; the full parse reads children
                 // sequentially and doesn't need it.
                 let n = bitmap.count_ones() as usize;
@@ -3222,7 +3259,7 @@ impl<'a> CompactReader<'a> {
                         *slot = Some(Box::new(self.read_node()?));
                     }
                 }
-                Ok(Node::Branch { children, hash })
+                Ok(Node::Branch { children, nref })
             }
             4 => {
                 let unit = self.read_u32()?;
@@ -3306,6 +3343,17 @@ impl LazyReader {
 
     /// Parse this node and its extension/branch spine; branch child subtrees stay
     /// `Raw`. Children are located via the branch's length table (no sibling scan).
+    fn node_ref(&mut self) -> Result<NodeRef> {
+        match self.u8()? {
+            0 => Ok(NodeRef::Hash(self.hash()?)),
+            1 => {
+                let len = self.u8()? as usize;
+                Ok(NodeRef::Inline(self.take(len)?.to_vec()))
+            }
+            t => bail!("invalid node-ref tag {t}"),
+        }
+    }
+
     fn node(&mut self) -> Result<Node> {
         match self.u8()? {
             0 => Ok(Node::Empty),
@@ -3313,18 +3361,18 @@ impl LazyReader {
                 let path = self.nibble_path()?;
                 let vlen = self.u32()? as usize;
                 let value = self.take(vlen)?.to_vec();
-                let hash = self.hash()?;
-                Ok(Node::Leaf { path, value, hash })
+                let nref = self.node_ref()?;
+                Ok(Node::Leaf { path, value, nref })
             }
             2 => {
                 let path = self.nibble_path()?;
-                let hash = self.hash()?;
+                let nref = self.node_ref()?;
                 let child = Box::new(self.node()?);
-                Ok(Node::Extension { path, child, hash })
+                Ok(Node::Extension { path, child, nref })
             }
             3 => {
                 let bitmap = self.u16()?;
-                let hash = self.hash()?;
+                let nref = self.node_ref()?;
                 let n = bitmap.count_ones() as usize;
                 let mut lens = [0u32; 16];
                 for l in lens.iter_mut().take(n) {
@@ -3347,19 +3395,19 @@ impl LazyReader {
                     match self.peek_u8()? {
                         1 | 2 | 3 => {
                             let off = self.pos;
-                            let hash = extract_hash(&self.buf[off..off + len])?;
+                            let nref = extract_ref(&self.buf[off..off + len])?;
                             self.pos += len;
                             *slot = Some(Box::new(Node::Raw {
                                 buf: self.buf.clone(),
                                 off,
                                 len,
-                                hash,
+                                nref,
                             }));
                         }
                         _ => *slot = Some(Box::new(self.node()?)),
                     }
                 }
-                Ok(Node::Branch { children, hash })
+                Ok(Node::Branch { children, nref })
             }
             4 => {
                 let unit = self.u32()?;
@@ -3375,30 +3423,30 @@ impl LazyReader {
     }
 }
 
-/// Read a node's root hash from the front of its serialized `bytes` — a shallow
+/// Read a node's reference from the front of its serialized `bytes` — a shallow
 /// header parse (tag + path/bitmap), no recursion into the subtree.
-fn extract_hash(bytes: &[u8]) -> Result<Hash> {
+fn extract_ref(bytes: &[u8]) -> Result<NodeRef> {
     let mut r = CompactReader::new(bytes);
     match r.read_u8()? {
-        0 => Ok(empty_hash()),
+        0 => Ok(NodeRef::Hash(empty_hash())),
         1 => {
-            // Leaf: tag, path, value (u32-len-prefixed), hash.
+            // Leaf: tag, path, value (u32-len-prefixed), ref.
             r.skip_nibble_path()?;
             let vlen = r.read_u32()? as usize;
             let _ = r.read_bytes(vlen)?;
-            r.read_hash()
+            r.read_ref()
         }
         2 => {
             r.skip_nibble_path()?;
-            r.read_hash()
+            r.read_ref()
         }
         3 => {
             let _ = r.read_u16()?;
-            r.read_hash()
+            r.read_ref()
         }
         4 => {
             let _ = r.read_bytes(4 + 4)?;
-            r.read_hash()
+            Ok(NodeRef::Hash(r.read_hash()?))
         }
         tag => bail!("invalid compact subtree node tag {tag}"),
     }
@@ -4014,8 +4062,10 @@ fn hash_ram(node: &RamNode) -> Hash {
             // Extension hashing is identical on the RAM and disk sides, so a
             // node's hash depends only on its structure, never on which side of
             // the storage boundary it currently lives on — see
-            // `root_is_independent_of_leaf_size`.
-            let computed = ext_hash(path, &hash_ram(child));
+            // `root_is_independent_of_leaf_size`. Frontier nodes are always ≥ 32
+            // bytes (their children are whole records), so the ref finalizes to a
+            // plain hash — inlining only happens inside records.
+            let computed = ext_ref(path, &NodeRef::Hash(hash_ram(child))).finalize();
             hash.set(Some(computed));
             computed
         }
@@ -4023,18 +4073,15 @@ fn hash_ram(node: &RamNode) -> Hash {
             if let Some(cached) = hash.get() {
                 return cached;
             }
-            // Same Ethereum branch encoding as the disk side (`branch_hash`), so
+            // Same Ethereum branch encoding as the disk side (`branch_node_ref`), so
             // RAM and disk branches with the same structure hash identically
             // (storage-independent root).
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-            let computed = branch_hash_streaming(
+            let computed = branch_ref(
                 bitmap,
-                children.iter().flatten().map(|child| match child {
-                    RamChild::Ram(node) => hash_ram(node),
-                    RamChild::Disk { root, .. } => *root,
-                    RamChild::Mem(m) => m.root,
-                }),
-            );
+                children.iter().flatten().map(|child| NodeRef::Hash(ram_child_hash(child))),
+            )
+            .finalize();
             hash.set(Some(computed));
             computed
         }
@@ -4055,7 +4102,7 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
                 return cached;
             }
             // One child: parallelism is at the branch below, so recurse parallel.
-            let computed = ext_hash(path, &hash_ram_parallel(child));
+            let computed = ext_ref(path, &NodeRef::Hash(hash_ram_parallel(child))).finalize();
             hash.set(Some(computed));
             computed
         }
@@ -4086,7 +4133,8 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
                     .collect()
             });
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
-            let computed = branch_hash_streaming(bitmap, child_hashes.into_iter());
+            let computed =
+                branch_ref(bitmap, child_hashes.into_iter().map(NodeRef::Hash)).finalize();
             hash.set(Some(computed));
             computed
         }
@@ -4116,43 +4164,78 @@ fn ram_child_stale(child: &RamChild) -> bool {
     }
 }
 
-/// Disk-node hash accessor: returns the cached hash (computed at construction).
-fn hash_node(node: &Node) -> Hash {
-    match node {
-        Node::Empty => empty_hash(),
-        Node::Leaf { hash, .. } | Node::Extension { hash, .. } | Node::Branch { hash, .. } => {
-            *hash
+/// A node's *reference* as embedded in its parent: `keccak256(RLP)` when the node's
+/// RLP is ≥ 32 bytes, or the RLP inlined verbatim when it is `< 32` (Ethereum's
+/// inline rule). Small storage-slot leaves and their tiny parents are the case that
+/// makes `Inline` occur; state-trie nodes are always `Hash`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NodeRef {
+    Hash(Hash),
+    Inline(Vec<u8>),
+}
+
+impl NodeRef {
+    /// The bytes this reference contributes as one item of its parent's RLP list:
+    /// `RLP(hash)` (a 33-byte string) when hashed, or the node's own RLP verbatim
+    /// when inlined.
+    fn embed(&self) -> Vec<u8> {
+        match self {
+            NodeRef::Hash(h) => crate::eth::rlp_string(h),
+            NodeRef::Inline(rlp) => rlp.clone(),
         }
-        // The overflowed subtree's root is exactly the hash the inline node would
-        // have had — that equivalence is what keeps the root storage-independent.
-        Node::Overflow { root, .. } => *root,
-        // A lazily-unparsed subtree carries its own root hash.
-        Node::Raw { hash, .. } => *hash,
+    }
+    /// The 32-byte hash this node exposes as a trie root: `keccak256(RLP)` — for an
+    /// inlined node that means hashing its RLP (the root is always keccak'd, never
+    /// inlined).
+    fn finalize(&self) -> Hash {
+        match self {
+            NodeRef::Hash(h) => *h,
+            NodeRef::Inline(rlp) => keccak(rlp),
+        }
     }
 }
 
-/// Ethereum extension node: `keccak256(RLP([hex_prefix(path, leaf=false),
-/// ref(child)]))`. The child of an extension is always a branch, whose RLP is far
-/// larger than 32 bytes, so its reference is always the hashed form
-/// `RLP(child_hash)` — the inline-`<32` case never applies here.
-fn ext_hash(path: &[u8], child: &Hash) -> Hash {
-    let node = crate::eth::rlp_list(&[
-        crate::eth::rlp_string(&crate::eth::hex_prefix(path, false)),
-        crate::eth::rlp_string(child),
-    ]);
-    keccak(&node)
+/// Build a node reference from the node's RLP: inline it if `< 32` bytes, else hash.
+fn mk_ref(rlp: Vec<u8>) -> NodeRef {
+    if rlp.len() < 32 {
+        NodeRef::Inline(rlp)
+    } else {
+        NodeRef::Hash(keccak(&rlp))
+    }
 }
 
-/// Ethereum leaf node: `keccak256(RLP([hex_prefix(path, leaf=true), value]))`.
+/// Disk-node reference accessor: returns the cached reference (computed at
+/// construction). A `Overflow`/cross-record child is always a large subtree, so its
+/// reference is the hashed form.
+fn hash_node(node: &Node) -> NodeRef {
+    match node {
+        Node::Empty => NodeRef::Hash(empty_hash()),
+        Node::Leaf { nref, .. } | Node::Extension { nref, .. } | Node::Branch { nref, .. } => {
+            nref.clone()
+        }
+        Node::Overflow { root, .. } => NodeRef::Hash(*root),
+        Node::Raw { nref, .. } => nref.clone(),
+    }
+}
+
+/// Ethereum extension node reference: `ref(RLP([hex_prefix(path, leaf=false),
+/// embed(child)]))`.
+fn ext_ref(path: &[u8], child: &NodeRef) -> NodeRef {
+    mk_ref(crate::eth::rlp_list(&[
+        crate::eth::rlp_string(&crate::eth::hex_prefix(path, false)),
+        child.embed(),
+    ]))
+}
+
+/// Ethereum leaf node reference: `ref(RLP([hex_prefix(path, leaf=true), value]))`.
 /// `path` is the leaf's remaining nibbles at its current position, so this must be
 /// recomputed whenever the leaf is re-homed to a different depth (see the split in
 /// `record_node_insert`) — which is why the value now lives in the leaf.
-fn leaf_hash(path: &[u8], value: &[u8]) -> Hash {
-    let node = crate::eth::rlp_list(&[
+fn leaf_ref(path: &[u8], value: &[u8]) -> NodeRef {
+    mk_ref(crate::eth::rlp_list(&[
         crate::eth::rlp_string(&crate::eth::hex_prefix(path, true)),
         crate::eth::rlp_string(value),
-    ]);
-    keccak(&node)
+    ]))
 }
 
 
@@ -4163,25 +4246,24 @@ fn keccak(bytes: &[u8]) -> Hash {
     output
 }
 
-/// Ethereum branch node: `keccak256(RLP([ref_0, …, ref_15, value]))`. `bitmap`
-/// marks the present child slots (little-endian) and `child_hashes` yields their
-/// hashes in slot order; absent slots encode as the empty string `0x80`. Every
-/// child of a real branch has RLP ≥ 32 bytes, so its reference is the hashed form
-/// `RLP(child_hash)`. All keys are full 64-nibble paths, so no key terminates at a
-/// branch — the 17th (value) slot is always the empty string.
-fn branch_hash_streaming(bitmap: u16, mut child_hashes: impl Iterator<Item = Hash>) -> Hash {
+/// Ethereum branch node reference: `ref(RLP([ref_0, …, ref_15, value]))`. `bitmap`
+/// marks the present child slots (little-endian) and `child_refs` yields their
+/// references in slot order; absent slots encode as the empty string `0x80`. All
+/// keys are full 64-nibble paths, so no key terminates at a branch — the 17th
+/// (value) slot is always the empty string.
+fn branch_ref(bitmap: u16, mut child_refs: impl Iterator<Item = NodeRef>) -> NodeRef {
     let empty = crate::eth::rlp_string(&[]);
     let mut items: Vec<Vec<u8>> = Vec::with_capacity(17);
     for i in 0..16 {
         if bitmap & (1 << i) != 0 {
-            let ch = child_hashes.next().expect("bitmap/child-hash count mismatch");
-            items.push(crate::eth::rlp_string(&ch));
+            let ch = child_refs.next().expect("bitmap/child-ref count mismatch");
+            items.push(ch.embed());
         } else {
             items.push(empty.clone());
         }
     }
     items.push(empty); // 17th value slot: always empty (secure trie, full-length keys)
-    keccak(&crate::eth::rlp_list(&items))
+    mk_ref(crate::eth::rlp_list(&items))
 }
 
 /// Hash of the empty trie: `keccak256(RLP("")) = keccak256(0x80)` — Ethereum's
@@ -4415,6 +4497,46 @@ mod tests {
         let oracle: Vec<(Vec<u8>, Vec<u8>)> =
             entries.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
         assert_eq!(mpt2.root().as_slice(), crate::eth::root(&oracle).as_slice());
+    }
+
+    /// Storage-trie shape: 32-byte keys with *tiny* values, so deep leaves (and the
+    /// branches above them) have RLP < 32 bytes and must be **inlined** into their
+    /// parent per Ethereum's rule. Matching the oracle (which inlines) proves the
+    /// engine's inline-`<32` node references are correct — the Phase-4a prerequisite
+    /// for exact storage roots. Tiny leaves force many records so inline nodes span
+    /// the disk path, not just one in-RAM record.
+    #[test]
+    fn engine_matches_oracle_with_inline_nodes() {
+        let cfg = Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        // 1-3 byte values (like RLP(U256) storage slots) => sub-32-byte leaf/branch RLP.
+        let entries: Vec<(Key, Vec<u8>)> = (0..8000u64)
+            .map(|i| {
+                let k = hashed_key(i.to_le_bytes());
+                let v = vec![(i as u8) | 1; 1 + (i % 3) as usize]; // non-empty, 1..3 bytes
+                (k, v)
+            })
+            .collect();
+        let oracle: Vec<(Vec<u8>, Vec<u8>)> =
+            entries.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+        let want = crate::eth::root(&oracle);
+
+        // Disk build (batched) and one-by-one must both match the inline-aware oracle.
+        let mut batched = db(cfg.clone());
+        for chunk in entries.chunks(97) {
+            batched.insert_batch(chunk.to_vec()).unwrap();
+        }
+        assert_eq!(batched.root().as_slice(), want.as_slice(), "batched root vs oracle");
+
+        let mut one = db(cfg);
+        for (k, v) in &entries {
+            one.insert(*k, v.clone()).unwrap();
+        }
+        assert_eq!(one.root().as_slice(), want.as_slice(), "one-by-one root vs oracle");
+
+        // Values still retrievable through the inline nodes.
+        for (k, v) in entries.iter().take(200) {
+            assert_eq!(batched.get_value(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
     }
 
     #[test]
@@ -4651,7 +4773,7 @@ mod tests {
         //      (the Overflow.root equals the inline node's hash).
         let _key = hashed_key("x");
         let inline_child = leaf_node(vec![5, 6, 7], vec![9u8; 32]);
-        let inline_hash = hash_node(&inline_child);
+        let inline_hash = hash_node(&inline_child).finalize();
 
         // Build branch B1 with the child inline at slot 3.
         let mut c1 = empty_box_children();
