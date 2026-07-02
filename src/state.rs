@@ -200,6 +200,13 @@ impl EthState {
         B256::from(self.trie.root())
     }
 
+    /// Number of on-disk records the frontier points at (incl. promoted accounts'
+    /// storage records) — used by tests to observe promotion. `(count, avg_bytes)`.
+    pub fn record_stats(&self) -> (usize, u64) {
+        let ls = self.trie.leaf_stats();
+        (self.trie.disk_leaves(), ls.avg_bytes())
+    }
+
     /// Checkpoint the trie and flush the code log.
     pub fn persist(&mut self) -> Result<()> {
         self.trie.persist()?;
@@ -358,6 +365,83 @@ mod tests {
         let st2 = EthState::open(tmp.path()).unwrap();
         assert_eq!(st2.get_account(&contract).unwrap().unwrap().storage_root, expected_storage_root);
         assert_eq!(st2.get_storage(&contract, U256::from(2u64)).unwrap(), Some(U256::from(0xdead_beefu64)));
+    }
+
+    /// Phase 4b (large contracts): with a small leaf cap, a contract with many
+    /// storage slots must **promote** — its storage trie spans many bounded records
+    /// (each ≤ the leaf cap) instead of one giant inline record — while still
+    /// reproducing the exact storageRoot / stateRoot, reading slots back, and
+    /// surviving reopen.
+    #[test]
+    fn large_contract_storage_promotes_and_stays_correct() {
+        let cfg = crate::Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let tmp = NamedTempFile::new().unwrap();
+
+        // Several EOAs so the state trie's top is a real branch.
+        let eoas: Vec<(Address, Account)> = (1u64..=8)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[19] = i as u8;
+                (Address::from(a), Account::eoa(i, U256::from(i)))
+            })
+            .collect();
+        let contract: Address = "0x00000000000000000000000000000000c0ffee01".parse().unwrap();
+        let code_hash = keccak256(b"big-contract");
+
+        // Many storage slots — far more than fit one 1 KiB record.
+        let n_slots = 400u64;
+        let val = |i: u64| U256::from(i.wrapping_mul(0x9E3779B1).wrapping_add(1));
+
+        let build = |st: &mut EthState| {
+            for (addr, acct) in &eoas {
+                st.set_account(addr, acct).unwrap();
+            }
+            st.set_account(&contract, &Account::contract(9, U256::from(5u64), crate::eth::EMPTY_ROOT, code_hash))
+                .unwrap();
+            for i in 0..n_slots {
+                st.set_storage(&contract, U256::from(i), val(i)).unwrap();
+            }
+        };
+
+        let mut st = EthState::create(tmp.path(), cfg.clone()).unwrap();
+        build(&mut st);
+
+        // Promotion happened: the storage trie is spread across many bounded records
+        // (not one giant inline account record).
+        let (records, avg) = st.record_stats();
+        assert!(records > 9 + 8, "expected promotion to split storage into many records, got {records}");
+        assert!(avg <= cfg.max_leaf_bytes as u64, "records must stay bounded, avg {avg}");
+
+        // Exact storageRoot via the oracle.
+        let storage_entries: Vec<(Vec<u8>, Vec<u8>)> = (0..n_slots)
+            .map(|i| (U256::from(i).to_be_bytes::<32>().to_vec(), crate::eth::storage_value_rlp(val(i))))
+            .collect();
+        let expected_sr = crate::eth::secure_root(&storage_entries);
+        assert_eq!(st.get_account(&contract).unwrap().unwrap().storage_root, expected_sr);
+
+        // Slots read back through the promoted (multi-record) storage.
+        for i in [0u64, 1, 199, 200, 399] {
+            assert_eq!(st.get_storage(&contract, U256::from(i)).unwrap(), Some(val(i)));
+        }
+        assert_eq!(st.get_storage(&contract, U256::from(100_000u64)).unwrap(), None);
+
+        // Exact state root via the oracle.
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> =
+            eoas.iter().map(|(a, acct)| (a.as_slice().to_vec(), acct.rlp())).collect();
+        entries.push((
+            contract.as_slice().to_vec(),
+            Account::contract(9, U256::from(5u64), expected_sr, code_hash).rlp(),
+        ));
+        assert_eq!(st.state_root(), crate::eth::secure_root(&entries));
+
+        // Survives persist + reopen.
+        st.persist().unwrap();
+        let root_before = st.state_root();
+        drop(st);
+        let st2 = EthState::open(tmp.path()).unwrap();
+        assert_eq!(st2.state_root(), root_before);
+        assert_eq!(st2.get_account(&contract).unwrap().unwrap().storage_root, expected_sr);
+        assert_eq!(st2.get_storage(&contract, U256::from(199u64)).unwrap(), Some(val(199)));
     }
 
     #[test]
