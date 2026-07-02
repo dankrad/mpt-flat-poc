@@ -4858,6 +4858,21 @@ mod tests {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
     }
 
+    /// Guard the frontier's per-node footprint. `RamChild` lives 16-per-branch in
+    /// `RamNode`, so any growth multiplies across the whole in-RAM index (an unboxed
+    /// ~104 B `Account` variant once nearly doubled it). `RamChild` is 56 B = its
+    /// largest inline variant `Mem` (Arc<[u8]> 16 + root Hash 32 = 48) + an 8 B
+    /// discriminant; the 32-byte leaf root is what lets the frontier re-hash without
+    /// reading records. Rare variants (`Ram`, `Account`) are boxed to a pointer.
+    #[test]
+    fn frontier_node_stays_compact() {
+        use std::mem::size_of;
+        assert!(size_of::<RamChild>() <= 56, "RamChild grew to {}", size_of::<RamChild>());
+        assert!(size_of::<RamNode>() <= 936, "RamNode grew to {}", size_of::<RamNode>());
+        // Box the rare variants so they never set the width.
+        assert_eq!(size_of::<Box<PromotedAccount>>(), 8);
+    }
+
     /// The engine must reproduce Ethereum's exact MPT roots: the empty root, the
     /// official secure-trie account vector's known root, and — over an arbitrary
     /// key/value set — the `eth` reference oracle. All values here are ≥ 32 bytes,
