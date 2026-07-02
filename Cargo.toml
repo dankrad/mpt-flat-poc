@@ -9,7 +9,6 @@ alloy-rlp = "0.3"
 anyhow = "1"
 bincode = "1"
 libc = "0.2"
-rocksdb = "0.22"
 serde = { version = "1", features = ["derive"] }
 sha3 = "0.10"
 tempfile = "3"

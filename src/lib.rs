@@ -1,7 +1,6 @@
 pub mod eth;
 
 use anyhow::{Result, anyhow, bail};
-use rocksdb::{BlockBasedOptions, Cache, DB, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
@@ -15,10 +14,6 @@ use std::{
     sync::Mutex,
     sync::atomic::{AtomicU64, Ordering},
 };
-
-/// Number of buffered values before the overlay is flushed to RocksDB as one
-/// `WriteBatch`, amortizing per-`put` overhead.
-const VALUE_BATCH: usize = 256;
 
 /// Flat-file allocation granularity. Records are page-aligned and occupy a whole
 /// number of pages, and `write_payload` zero-pads each record to its full page
@@ -303,8 +298,8 @@ pub mod prof {
         "flat-file read (syscall)",
         "flat-file write (syscall)",
         "flat-file flush",
-        "rocksdb put (value store)",
-        "rocksdb get (value store)",
+        "value put (unused)",
+        "value get (trie point-read)",
     ];
 
     #[derive(Clone, Copy)]
@@ -1257,16 +1252,12 @@ pub struct RamReport {
     pub free_regions: usize,
     /// Stored-data bytes for the free list (excludes BTree container overhead).
     pub free_list_bytes: usize,
-    /// Values buffered but not yet flushed to RocksDB.
-    pub overlay_entries: usize,
-    /// Heap bytes held by the value overlay (keys + value buffers).
-    pub overlay_bytes: usize,
 }
 
 impl RamReport {
     /// Estimated total in-RAM index bytes.
     pub fn total_bytes(&self) -> usize {
-        self.frontier_bytes + self.free_list_bytes + self.overlay_bytes
+        self.frontier_bytes + self.free_list_bytes
     }
 }
 
@@ -1275,14 +1266,7 @@ pub struct FlatMpt {
     cfg: Config,
     store: FlatFile,
     upper: RamNode,
-    /// Disk-backed key -> value store. Holds the actual values; the trie only
-    /// ever deals in `value_hash`.
-    values: DB,
-    /// Buffer of values not yet flushed to `values`. Flushed in one batch every
-    /// `VALUE_BATCH` inserts (and on `persist`); read by `get_value` first so
-    /// reads always observe the latest write.
-    overlay: HashMap<Key, Vec<u8>>,
-    /// Path of the flat file; the value store and manifest are derived from it.
+    /// Path of the flat file; the manifest is derived from it.
     path: PathBuf,
     /// Inline-GC cleaning rate: victim regions to evacuate per batch, adjusted by
     /// the proportional controller to hold utilization at `TARGET_UTIL`.
@@ -1322,20 +1306,11 @@ impl FlatMpt {
         let direct = direct_io();
         let file = open_flat(path, true, direct)?;
 
-        // RocksDB instance lives in a sibling directory. `create` is a fresh
-        // start, so discard any leftover store from a previous run at this path.
-        let values_path = values_path(path);
-        let (opts, _cache) = value_db_opts();
-        let _ = DB::destroy(&opts, &values_path);
-        let values = DB::open(&opts, &values_path)?;
-
         let (ram_mode, spill_threshold) = ram_build_config();
         Ok(Self {
             cfg,
             store: FlatFile::new(file, direct),
             upper: RamNode::Empty,
-            values,
-            overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
             ram_mode,
@@ -1388,15 +1363,10 @@ impl FlatMpt {
         }
         store.end_page.store(num_regions * REGION_PAGES, Ordering::SeqCst);
 
-        let (opts, _cache) = value_db_opts();
-        let values = DB::open(&opts, values_path(path))?;
-
         Ok(Self {
             cfg,
             store,
             upper,
-            values,
-            overlay: HashMap::new(),
             path: path.to_path_buf(),
             gc_regions: 0,
             // A reopened DB is disk-resident; RAM-build mode is for fresh creation.
@@ -1405,47 +1375,20 @@ impl FlatMpt {
         })
     }
 
-    /// Flush buffered values to RocksDB and the flat file's writer. Call this to
-    /// make all preceding inserts visible in the value store without a full
-    /// [`persist`](Self::persist) checkpoint.
+    /// Flush the flat file's writer so all preceding inserts are on disk, without a
+    /// full [`persist`](Self::persist) checkpoint.
     pub fn flush(&mut self) -> Result<()> {
-        self.flush_values()?;
         self.store.flush()
     }
 
-    /// Flush the buffered value overlay to RocksDB as a single batch.
-    fn flush_values(&mut self) -> Result<()> {
-        if self.overlay.is_empty() {
-            return Ok(());
-        }
-        let _g = prof::scope(prof::Cat::ValuePut);
-        let mut batch = WriteBatch::default();
-        for (key, value) in &self.overlay {
-            batch.put(key, value);
-        }
-        if wal_disabled() {
-            let mut wo = rocksdb::WriteOptions::default();
-            wo.disable_wal(true);
-            self.values.write_opt(batch, &wo)?;
-        } else {
-            self.values.write(batch)?;
-        }
-        self.overlay.clear();
-        Ok(())
-    }
-
     /// Checkpoint the in-RAM state to disk so the database can later be reopened
-    /// with [`FlatMpt::open`]. Flushes buffered values, fsyncs the flat file, then
+    /// with [`FlatMpt::open`]. Spills in-RAM leaves, fsyncs the flat file, then
     /// writes the manifest atomically (temp file + rename) so a crash can't leave
     /// a torn manifest.
     pub fn persist(&mut self) -> Result<()> {
         // The manifest stores disk ptrs only; spill any in-RAM leaves to the file
         // first (they're not serializable and would be lost on reopen).
         self.spill_mem()?;
-        self.flush_values()?;
-        // With the WAL disabled, values live only in the memtable until flushed —
-        // flush them to SST so the checkpoint is durable (no-op cost when WAL is on).
-        self.values.flush()?;
         self.store.sync()?;
         let manifest = ManifestRef {
             cfg: &self.cfg,
@@ -1464,10 +1407,6 @@ impl FlatMpt {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Hash> {
-        self.overlay.insert(key, value.clone());
-        if self.overlay.len() >= VALUE_BATCH {
-            self.flush_values()?;
-        }
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
         insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, value, ram)?;
@@ -1477,10 +1416,9 @@ impl FlatMpt {
 
     /// Insert/overwrite many key/value pairs at once. Equivalent in result to
     /// calling [`insert`](Self::insert) for each pair (last value wins on a
-    /// duplicate key within the batch), but far cheaper: values are written to
-    /// RocksDB in one batch, and the trie is updated by grouping keys per route
-    /// so every touched disk leaf is read/rebuilt/written exactly once and every
-    /// node is re-hashed at most once. Returns the new root.
+    /// duplicate key within the batch), but far cheaper: the trie is updated by
+    /// grouping keys per route so every touched disk leaf is read/rebuilt/written
+    /// exactly once and every node is re-hashed at most once. Returns the new root.
     pub fn insert_batch(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<Hash> {
         if entries.is_empty() {
             return Ok(self.root());
@@ -1489,24 +1427,13 @@ impl FlatMpt {
         // cost-benefit cleaner leaves them alone until they settle.
         self.store.seg.lock().unwrap().bump_epoch();
         let t_a = std::time::Instant::now();
-        let sv = skip_values();
-        // Async values (one-writer path): leave the overlay unflushed here; the
-        // one-writer branch writes it on a thread concurrent with Phase B.
-        let defer_values = async_values() && one_writer();
-        // Dedup entries into the per-leaf value map (last write wins) and buffer
-        // the values for the RocksDB overlay. The Ethereum leaf hash is
-        // position-dependent, so it can't be precomputed here (as the old
-        // position-independent hash was) — it's computed when the leaf is placed,
+        // Dedup entries into the per-leaf value map (last write wins). The value
+        // now lives in its trie leaf; the Ethereum leaf hash is position-dependent,
+        // so it can't be precomputed here — it's computed when the leaf is placed,
         // inside the parallel per-record fold of Phase B.
         let mut leaves: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
         for (key, value) in entries.into_iter() {
-            if !sv {
-                self.overlay.insert(key, value.clone());
-            }
             leaves.insert(key, value);
-        }
-        if !sv && !defer_values {
-            self.flush_values()?;
         }
         let cfg = self.cfg.clone();
 
@@ -1629,16 +1556,7 @@ impl FlatMpt {
             // evacuation of the region's other live records — the relocated payloads
             // ride the same single writer, so GC adds no second read of those regions
             // and no append contention. Without `opp`: plain fold, no evacuation.
-            //
-            // Async values: hand the overlay to a worker that writes it concurrently
-            // with the reads (joined inside the scope, before the batch returns).
-            let v_overlay = if defer_values {
-                std::mem::take(&mut self.overlay)
-            } else {
-                HashMap::new()
-            };
             let store = &self.store;
-            let values = &self.values;
             let upper = &self.upper;
             // Read phase: readers fold to payloads (device reading), and — when
             // `opp` — also collect relocated survivors from low-util regions.
@@ -1649,11 +1567,6 @@ impl FlatMpt {
                 Vec<(Key, RamChild)>,
                 Vec<(Vec<u8>, Vec<u8>, DiskPtr)>,
             ) = std::thread::scope(|scope| -> Result<_> {
-                let vh = if !v_overlay.is_empty() {
-                    Some(scope.spawn(|| write_value_batch(values, &v_overlay)))
-                } else {
-                    None
-                };
                 let folded = if opp {
                     process_fold_gc(store, upper, &cfg, &groups)?
                 } else {
@@ -1672,9 +1585,6 @@ impl FlatMpt {
                     }
                     (lv, pr, Vec::new())
                 };
-                if let Some(vh) = vh {
-                    vh.join().expect("value writer thread panicked")?;
-                }
                 Ok(folded)
             })?;
             let read_ns = t_read.elapsed().as_nanos() as u64;
@@ -1765,11 +1675,6 @@ impl FlatMpt {
                 evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
             };
             stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
-        }
-        // Async-values deferred the flush but the one-writer branch wasn't taken
-        // (small batch): flush now so values are durable before the manifest.
-        if defer_values && !self.overlay.is_empty() {
-            self.flush_values()?;
         }
 
         let b_ns = t_b.elapsed().as_nanos() as u64;
@@ -2000,9 +1905,8 @@ impl FlatMpt {
         (alloc_live, true_live)
     }
 
-    /// Heap held by the in-RAM index — the part of the database that is *not*
-    /// on disk: the trie frontier, the region allocator, and the unflushed value
-    /// overlay. Excludes the OS page cache and RocksDB's own (C++) memory.
+    /// Heap held by the in-RAM index — the part of the database that is *not* on
+    /// disk: the trie frontier and the region allocator. Excludes the OS page cache.
     pub fn ram_report(&self) -> RamReport {
         let frontier_nodes = count_ram_nodes(&self.upper);
         let frontier_bytes = frontier_bytes(&self.upper);
@@ -2010,19 +1914,11 @@ impl FlatMpt {
         // The region allocator is one u32 of live-count per region; report that.
         let free_list_bytes =
             self.store.seg.lock().unwrap().live.len() * std::mem::size_of::<u32>();
-        let overlay_entries = self.overlay.len();
-        let overlay_bytes: usize = self
-            .overlay
-            .iter()
-            .map(|(k, v)| k.len() + v.capacity())
-            .sum();
         RamReport {
             frontier_nodes,
             frontier_bytes,
             free_regions,
             free_list_bytes,
-            overlay_entries,
-            overlay_bytes,
         }
     }
 
@@ -2108,13 +2004,6 @@ fn node_get(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Resu
             node_get(store, &n, nibbles, depth)
         }
     }
-}
-
-/// Sibling path for the RocksDB value store, e.g. `db.flat` -> `db.flat.values`.
-fn values_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".values");
-    path.with_file_name(name)
 }
 
 /// Sibling path for the manifest, e.g. `db.flat` -> `db.flat.meta`.
@@ -2744,54 +2633,6 @@ fn one_writer() -> bool {
     *ON.get_or_init(|| std::env::var("MPT_ONE_WRITER").as_deref() == Ok("1"))
 }
 
-/// `MPT_SKIP_VALUES=1` — diagnostic: skip the RocksDB value writes. (run) −
-/// (run with skip-values) isolates the value-store cost.
-fn skip_values() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MPT_SKIP_VALUES").as_deref() == Ok("1"))
-}
-
-/// `MPT_NO_WAL=1`: write values with the WAL disabled. Durability then rests on the
-/// checkpoint (`persist` flushes the memtable to SST + fsyncs) — the same recovery
-/// model as the flat file's manifest. Removes the per-batch WAL serialize + write.
-fn wal_disabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MPT_NO_WAL").as_deref() == Ok("1"))
-}
-
-/// `MPT_ASYNC_VALUES=1` (one-writer path only): write the batch's values to RocksDB
-/// on a thread that runs concurrently with Phase B, joined before the batch returns
-/// (so reads-after-write stay correct — no cross-batch in-flight state). The value
-/// write is mostly memtable-insert CPU, so it hides under the I/O-bound reads;
-/// pair with MPT_NO_WAL so it carries no WAL I/O to contend with the flat file.
-fn async_values() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MPT_ASYNC_VALUES").as_deref() == Ok("1"))
-}
-
-/// Write a value overlay to RocksDB as one batch (honours `MPT_NO_WAL`). Free
-/// function so it can run on a scoped worker thread (`&DB` is `Sync`).
-fn write_value_batch(values: &DB, overlay: &HashMap<Key, Vec<u8>>) -> Result<()> {
-    if overlay.is_empty() {
-        return Ok(());
-    }
-    let mut batch = WriteBatch::default();
-    for (key, value) in overlay {
-        batch.put(key, value);
-    }
-    if wal_disabled() {
-        let mut wo = rocksdb::WriteOptions::default();
-        wo.disable_wal(true);
-        values.write_opt(batch, &wo)?;
-    } else {
-        values.write(batch)?;
-    }
-    Ok(())
-}
-
 /// Whether the disk batch path sorts groups by file offset and reads them via
 /// coalesced multi-MB spans (the sequential-merge fold). On by default;
 /// `MPT_FOLD=0` reverts to the original unsorted per-leaf `pread` path for A/B.
@@ -2823,51 +2664,13 @@ fn gc_opp_util() -> f64 {
     })
 }
 
-/// RocksDB options with a bounded (~5 GiB) memory footprint for the value store.
-/// RocksDB does not shrink to free RAM on its own; left default, its index + filter
-/// blocks grow *resident and unbounded* with the dataset, inflating process RSS and
-/// tripping the RAM-build spill threshold long before the trie fills it. We pin a
-/// fixed block cache (4 GiB) that also holds the index/filter blocks, and cap total
-/// memtable memory (~1 GiB). The value bytes themselves live in on-disk SSTs, not
-/// RSS. Returns the `Cache` so the caller keeps it alive until `DB::open`.
-fn value_db_opts() -> (Options, Cache) {
-    let cache = Cache::new_lru_cache(4 * (1 << 30)); // 4 GiB
-    let mut bbt = BlockBasedOptions::default();
-    bbt.set_block_cache(&cache);
-    bbt.set_cache_index_and_filter_blocks(true);
-    bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    opts.set_block_based_table_factory(&bbt);
-    // Bulk-load tuning for the value store. The build's dominant serial cost used
-    // to be `flush_values`: writing one big value `WriteBatch` per insert batch
-    // into the default skiplist memtable, which pays ~1.9 us/value of cache-miss-
-    // heavy random inserts and gets *worse* as the memtable grows (so big batches
-    // hurt — a 100M-key batch was ~37 us/key). The vector memtable makes the write
-    // path an O(1) append and defers the sort to the background flush, cutting the
-    // value flush ~20x (to ~0.1 us/key). Its poor point-read performance never
-    // matters here: values are write-only during the build. The remaining knobs
-    // give it plural memtables + parallel background jobs so flushes stay off the
-    // write path, and a relaxed L0 trigger so the bulk load never throttles.
-    opts.set_allow_concurrent_memtable_write(false); // required by the vector rep
-    opts.set_memtable_factory(rocksdb::MemtableFactory::Vector);
-    opts.set_write_buffer_size(256 << 20); // 256 MiB memtables (flush often, in bg)
-    opts.set_max_write_buffer_number(6); // plenty buffered while bg threads flush
-    opts.set_min_write_buffer_number_to_merge(1);
-    opts.set_max_background_jobs(8); // parallel flush + compaction
-    opts.set_max_subcompactions(4);
-    opts.set_level_zero_slowdown_writes_trigger(-1); // don't slow down on L0 buildup
-    opts.set_level_zero_stop_writes_trigger(1 << 20); // effectively never stop
-    (opts, cache)
-}
-
 /// RAM-build config read once: `(enabled, spill-threshold-bytes)`. `MPT_RAM_BUILD=1`
 /// keeps fresh leaves in RAM (each its own `Arc`, no flat-file I/O or GC) until
 /// memory footprint crosses the threshold, then spills to disk. `MPT_RAM_BUILD_GIB`
 /// overrides the threshold. Defaults leave real headroom below installed RAM for
-/// RocksDB, the page cache, and the spill-time transient — the footprint per key
-/// runs higher than a naive value-size estimate (a 1B run measured ~214 B/key),
-/// so the threshold must trip well before the box gets tight.
+/// the page cache and the spill-time transient — the footprint per key runs higher
+/// than a naive value-size estimate, so the threshold must trip before the box
+/// gets tight.
 fn ram_build_config() -> (bool, u64) {
     use std::sync::OnceLock;
     static CFG: OnceLock<(bool, u64)> = OnceLock::new();
