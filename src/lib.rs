@@ -1482,6 +1482,45 @@ impl FlatMpt {
         Ok(self.root())
     }
 
+    /// Delete the value leaf at `key`. Absent keys are a no-op (Ethereum
+    /// semantics). Returns the new root.
+    pub fn delete(&mut self, key: Key) -> Result<Hash> {
+        self.delete_op(key, DeleteOp::Value)
+    }
+
+    /// Delete the account at `key` including its entire storage (EIP-158
+    /// clearing / selfdestruct). Also removes an opaque-storage account stored
+    /// as a plain value leaf.
+    pub fn delete_account(&mut self, key: Key) -> Result<Hash> {
+        self.delete_op(key, DeleteOp::Account)
+    }
+
+    /// Delete one storage slot of the account at `key` (`SSTORE` to zero). A
+    /// missing account or slot is a no-op.
+    pub fn delete_storage(&mut self, key: Key, slot: Key) -> Result<Hash> {
+        self.delete_op(key, DeleteOp::Storage(slot))
+    }
+
+    /// Clear all storage of the account at `key`, keeping the account fields
+    /// (reth `BundleState` wipe: destroy-then-recreate within one block).
+    pub fn wipe_storage(&mut self, key: Key) -> Result<Hash> {
+        self.delete_op(key, DeleteOp::WipeStorage)
+    }
+
+    fn delete_op(&mut self, key: Key, op: DeleteOp) -> Result<Hash> {
+        let cfg = self.cfg.clone();
+        let ram = self.ram_mode;
+        match delete_ram(&self.store, &cfg, &mut self.upper, Vec::new(), &key, op, ram)? {
+            RamDelete::Absent | RamDelete::Changed => {}
+            RamDelete::Removed => self.upper = RamNode::Empty,
+            RamDelete::Collapsed { edge, survivor } => {
+                self.upper = collapse_root(&self.store, edge, survivor)?;
+            }
+        }
+        self.store.flush()?;
+        Ok(self.root())
+    }
+
     /// Insert/overwrite many key/value pairs at once. Equivalent in result to
     /// calling [`insert`](Self::insert) for each pair (last value wins on a
     /// duplicate key within the batch), but far cheaper: the trie is updated by
@@ -2468,6 +2507,405 @@ fn insert_ram(
 }
 
 
+/// Outcome of a delete descending the RAM frontier.
+enum RamDelete {
+    /// Key not present — frontier and records untouched.
+    Absent,
+    /// Something changed below; hashes along the path were invalidated.
+    Changed,
+    /// This whole frontier subtree is now empty.
+    Removed,
+    /// This frontier subtree collapsed to a single record/promoted-account child.
+    /// `edge` are the nibbles from this node's position down to the survivor's old
+    /// position — they must be prepended to the survivor's content when it is
+    /// re-homed at this node's position. Only `Disk`/`Mem`/`Account` survivors
+    /// escape this way; a `Ram` survivor merges in place as an extension.
+    Collapsed { edge: Vec<u8>, survivor: RamChild },
+}
+
+/// Delete `key` from the frontier subtree at `prefix` — the removal mirror of
+/// [`insert_ram`]. Maintains the canonical-form invariant that no frontier branch
+/// has fewer than two children: a branch left with one child either becomes an
+/// extension (RAM survivor) or collapses into its surviving record
+/// ([`RamDelete::Collapsed`], materialized by the parent via [`rehome_child`]).
+fn delete_ram(
+    store: &FlatFile,
+    cfg: &Config,
+    node: &mut RamNode,
+    prefix: Vec<u8>,
+    key: &Key,
+    op: DeleteOp,
+    ram: bool,
+) -> Result<RamDelete> {
+    let nibbles = key_nibbles(key);
+    match std::mem::replace(node, RamNode::Empty) {
+        RamNode::Empty => Ok(RamDelete::Absent),
+        RamNode::Extension { path, mut child, hash } => {
+            if !nibbles[prefix.len()..].starts_with(&path) {
+                *node = RamNode::Extension { path, child, hash };
+                return Ok(RamDelete::Absent);
+            }
+            let mut next = prefix;
+            next.extend_from_slice(&path);
+            match delete_ram(store, cfg, &mut child, next, key, op, ram)? {
+                RamDelete::Absent => {
+                    *node = RamNode::Extension { path, child, hash };
+                    Ok(RamDelete::Absent)
+                }
+                RamDelete::Removed => Ok(RamDelete::Removed),
+                RamDelete::Collapsed { edge, survivor } => {
+                    // The extension collapses with its child: extend the edge.
+                    let mut full = path;
+                    full.extend_from_slice(&edge);
+                    Ok(RamDelete::Collapsed { edge: full, survivor })
+                }
+                RamDelete::Changed => {
+                    // If the child branch collapsed into an extension in place,
+                    // merge ext→ext for the canonical form.
+                    *node = match *child {
+                        RamNode::Extension { path: cp, child: cc, .. } => {
+                            let mut p = path;
+                            p.extend_from_slice(&cp);
+                            RamNode::Extension { path: p, child: cc, hash: HashCell::new(None) }
+                        }
+                        other => RamNode::Extension {
+                            path,
+                            child: Box::new(other),
+                            hash: HashCell::new(None),
+                        },
+                    };
+                    Ok(RamDelete::Changed)
+                }
+            }
+        }
+        RamNode::Branch { mut children, hash } => {
+            let idx = nibbles[prefix.len()] as usize;
+            let mut child_prefix = prefix;
+            child_prefix.push(idx as u8);
+            let out = delete_in_child(store, cfg, &mut children[idx], child_prefix, key, op, ram)?;
+            match out {
+                RamDelete::Absent => {
+                    *node = RamNode::Branch { children, hash };
+                    Ok(RamDelete::Absent)
+                }
+                RamDelete::Changed => {
+                    hash.set(None);
+                    *node = RamNode::Branch { children, hash };
+                    Ok(RamDelete::Changed)
+                }
+                RamDelete::Collapsed { .. } => {
+                    unreachable!("collapse is materialized in delete_in_child")
+                }
+                RamDelete::Removed => {
+                    let survivors = children.iter().filter(|c| c.is_some()).count();
+                    match survivors {
+                        0 => Ok(RamDelete::Removed),
+                        1 => {
+                            let j = children.iter().position(|c| c.is_some()).unwrap();
+                            let survivor = children[j].take().unwrap();
+                            match survivor {
+                                RamChild::Ram(sub) => {
+                                    // Merge in place: the branch becomes an extension
+                                    // over its lone RAM child (merging ext→ext).
+                                    *node = match *sub {
+                                        RamNode::Extension { path: cp, child: cc, .. } => {
+                                            let mut p = vec![j as u8];
+                                            p.extend_from_slice(&cp);
+                                            RamNode::Extension {
+                                                path: p,
+                                                child: cc,
+                                                hash: HashCell::new(None),
+                                            }
+                                        }
+                                        b @ RamNode::Branch { .. } => RamNode::Extension {
+                                            path: vec![j as u8],
+                                            child: Box::new(b),
+                                            hash: HashCell::new(None),
+                                        },
+                                        RamNode::Empty => {
+                                            unreachable!("empty RamNode as a branch child")
+                                        }
+                                    };
+                                    Ok(RamDelete::Changed)
+                                }
+                                other => Ok(RamDelete::Collapsed {
+                                    edge: vec![j as u8],
+                                    survivor: other,
+                                }),
+                            }
+                        }
+                        _ => {
+                            hash.set(None);
+                            *node = RamNode::Branch { children, hash };
+                            Ok(RamDelete::Changed)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Delete `key` from one frontier branch slot — the removal mirror of
+/// [`insert_into_child`]. `Removed` means the slot is now `None` (the caller
+/// checks its branch for collapse); a collapse of a `Ram` child subtree is
+/// materialized here by re-homing the survivor at this slot's position.
+fn delete_in_child(
+    store: &FlatFile,
+    cfg: &Config,
+    slot: &mut Option<RamChild>,
+    child_prefix: Vec<u8>,
+    key: &Key,
+    op: DeleteOp,
+    ram: bool,
+) -> Result<RamDelete> {
+    match slot {
+        None => Ok(RamDelete::Absent),
+        Some(RamChild::Ram(sub)) => {
+            match delete_ram(store, cfg, sub, child_prefix.clone(), key, op, ram)? {
+                RamDelete::Absent => Ok(RamDelete::Absent),
+                RamDelete::Changed => Ok(RamDelete::Changed),
+                RamDelete::Removed => {
+                    *slot = None;
+                    Ok(RamDelete::Removed)
+                }
+                RamDelete::Collapsed { edge, survivor } => {
+                    *slot = Some(rehome_child(store, ram, survivor, &edge, child_prefix)?);
+                    Ok(RamDelete::Changed)
+                }
+            }
+        }
+        Some(RamChild::Mem(_)) => {
+            let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
+            let bytes = m.bytes.clone();
+            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let depth = subtree.prefix.len();
+            match record_node_delete(&mut subtree.node, depth, key, op)? {
+                NodeDelete::Absent => {
+                    // Untouched: restore the original bytes (no re-serialize).
+                    *slot = Some(RamChild::Mem(MemLeaf { bytes, root: m.root }));
+                    Ok(RamDelete::Absent)
+                }
+                NodeDelete::Changed => {
+                    *slot = Some(make_mem_leaf(&subtree)?);
+                    Ok(RamDelete::Changed)
+                }
+                NodeDelete::Removed => Ok(RamDelete::Removed),
+            }
+        }
+        Some(RamChild::Disk { ptr, root }) => {
+            let old_ptr = *ptr;
+            let mut subtree = store.read_lazy(old_ptr)?;
+            match record_node_delete(&mut subtree.node, subtree.prefix.len(), key, op)? {
+                NodeDelete::Absent => Ok(RamDelete::Absent),
+                NodeDelete::Changed => {
+                    let (payload, _) = serialize_subtree(&subtree)?;
+                    store.free(old_ptr);
+                    *ptr = store.write_payload(&payload)?;
+                    *root = hash_node(&subtree.node).finalize();
+                    Ok(RamDelete::Changed)
+                }
+                NodeDelete::Removed => {
+                    store.free(old_ptr);
+                    *slot = None;
+                    Ok(RamDelete::Removed)
+                }
+            }
+        }
+        Some(RamChild::Account(_)) => {
+            let nibbles = key_nibbles(key);
+            {
+                let Some(RamChild::Account(a)) = slot.as_ref() else { unreachable!() };
+                if nibbles[child_prefix.len()..] != a.path[..] {
+                    return Ok(RamDelete::Absent);
+                }
+            }
+            match op {
+                DeleteOp::Value => bail!("value delete on a promoted account leaf"),
+                DeleteOp::Account => {
+                    let Some(RamChild::Account(a)) = slot.take() else { unreachable!() };
+                    free_ram_records(store, &a.storage);
+                    Ok(RamDelete::Removed)
+                }
+                DeleteOp::WipeStorage => {
+                    let Some(RamChild::Account(a)) = slot.take() else { unreachable!() };
+                    free_ram_records(store, &a.storage);
+                    // No storage left: demote back to a plain account record.
+                    let node = account_node(
+                        a.path,
+                        a.nonce,
+                        U256::from_be_bytes(a.balance),
+                        a.code_hash,
+                        Node::Empty,
+                    );
+                    let subtree = DiskSubtree { prefix: child_prefix, node };
+                    *slot = Some(make_leaf_child(store, ram, subtree)?);
+                    Ok(RamDelete::Changed)
+                }
+                DeleteOp::Storage(skey) => {
+                    let storage_out = {
+                        let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
+                        delete_ram(store, cfg, &mut a.storage, Vec::new(), &skey, DeleteOp::Value, ram)?
+                    };
+                    match storage_out {
+                        RamDelete::Absent => Ok(RamDelete::Absent),
+                        RamDelete::Changed => Ok(RamDelete::Changed),
+                        RamDelete::Removed | RamDelete::Collapsed { .. } => {
+                            // The storage frontier shrank below promoted form:
+                            // demote the account, inlining what remains.
+                            let Some(RamChild::Account(a)) = slot.take() else {
+                                unreachable!()
+                            };
+                            let storage_node = match storage_out {
+                                RamDelete::Removed => Node::Empty,
+                                RamDelete::Collapsed { edge, survivor } => {
+                                    materialize_storage_survivor(store, survivor, &edge)?
+                                }
+                                _ => unreachable!(),
+                            };
+                            let node = account_node(
+                                a.path,
+                                a.nonce,
+                                U256::from_be_bytes(a.balance),
+                                a.code_hash,
+                                storage_node,
+                            );
+                            let subtree = DiskSubtree { prefix: child_prefix, node };
+                            *slot = Some(if should_promote_account(cfg, &subtree) {
+                                // Still too big to inline: re-promote (re-splitting
+                                // the storage into records).
+                                promote_account_to_ram(store, subtree)?
+                            } else {
+                                make_leaf_child(store, ram, subtree)?
+                            });
+                            Ok(RamDelete::Changed)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Re-home a collapse survivor at `new_prefix`, prepending the collapsed `edge`
+/// nibbles to its content (a record is rewritten; a promoted account just extends
+/// its path). The survivor's hash changes — its top path changed — so the new
+/// child's root is recomputed.
+fn rehome_child(
+    store: &FlatFile,
+    ram: bool,
+    survivor: RamChild,
+    edge: &[u8],
+    new_prefix: Vec<u8>,
+) -> Result<RamChild> {
+    Ok(match survivor {
+        RamChild::Ram(sub) => RamChild::Ram(Box::new(match *sub {
+            RamNode::Extension { path, child, .. } => {
+                let mut p = edge.to_vec();
+                p.extend_from_slice(&path);
+                RamNode::Extension { path: p, child, hash: HashCell::new(None) }
+            }
+            b @ RamNode::Branch { .. } => RamNode::Extension {
+                path: edge.to_vec(),
+                child: Box::new(b),
+                hash: HashCell::new(None),
+            },
+            RamNode::Empty => unreachable!("empty RamNode survivor"),
+        })),
+        RamChild::Disk { ptr, .. } => {
+            let subtree = store.read_lazy(ptr)?;
+            let node = prepend_path(subtree.node, edge)?;
+            store.free(ptr);
+            make_leaf_child(store, ram, DiskSubtree { prefix: new_prefix, node })?
+        }
+        RamChild::Mem(m) => {
+            let subtree = parse_payload_lazy(m.bytes)?;
+            let node = prepend_path(subtree.node, edge)?;
+            make_mem_leaf(&DiskSubtree { prefix: new_prefix, node })?
+        }
+        RamChild::Account(mut a) => {
+            let mut p = edge.to_vec();
+            p.extend_from_slice(&a.path);
+            a.path = p;
+            RamChild::Account(a)
+        }
+    })
+}
+
+/// Turn a collapsed storage-frontier survivor back into an inline storage `Node`
+/// (for demoting a promoted account), freeing its record.
+fn materialize_storage_survivor(
+    store: &FlatFile,
+    survivor: RamChild,
+    edge: &[u8],
+) -> Result<Node> {
+    match survivor {
+        RamChild::Disk { ptr, .. } => {
+            let subtree = store.read_lazy(ptr)?;
+            let node = prepend_path(subtree.node, edge)?;
+            store.free(ptr);
+            Ok(node)
+        }
+        RamChild::Mem(m) => {
+            let subtree = parse_payload_lazy(m.bytes)?;
+            prepend_path(subtree.node, edge)
+        }
+        RamChild::Ram(_) | RamChild::Account(_) => {
+            unreachable!("storage frontiers collapse only to record survivors")
+        }
+    }
+}
+
+/// Free every flat-file record referenced by a frontier subtree (used when an
+/// account with promoted storage is deleted or wiped).
+fn free_ram_records(store: &FlatFile, node: &RamNode) {
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { child, .. } => free_ram_records(store, child),
+        RamNode::Branch { children, .. } => {
+            for c in children.iter().flatten() {
+                match c {
+                    RamChild::Ram(sub) => free_ram_records(store, sub),
+                    RamChild::Disk { ptr, .. } => store.free(*ptr),
+                    RamChild::Mem(_) => {}
+                    RamChild::Account(a) => free_ram_records(store, &a.storage),
+                }
+            }
+        }
+    }
+}
+
+/// Rebuild the trie root after the top-level frontier collapsed to a single
+/// record: promote the survivor's content back into a RAM frontier node. A trie
+/// that shrinks to a single leaf has no frontier representation — Ethereum state
+/// tries never have fewer than two accounts — so that case errors loudly.
+fn collapse_root(store: &FlatFile, edge: Vec<u8>, survivor: RamChild) -> Result<RamNode> {
+    let node = match survivor {
+        RamChild::Disk { ptr, .. } => {
+            let subtree = store.read_lazy(ptr)?;
+            let node = prepend_path(subtree.node, &edge)?;
+            store.free(ptr);
+            node
+        }
+        RamChild::Mem(m) => {
+            let subtree = parse_payload_lazy(m.bytes)?;
+            prepend_path(subtree.node, &edge)?
+        }
+        RamChild::Account(_) => {
+            bail!("trie collapsed to a single account at the root (unsupported below 2 keys)")
+        }
+        RamChild::Ram(_) => unreachable!("Ram survivors merge in place"),
+    };
+    let subtree = DiskSubtree { prefix: Vec::new(), node };
+    if top_branch_prefix(&subtree).is_none() {
+        bail!("trie collapsed to a single leaf at the root (unsupported below 2 keys)");
+    }
+    match promote_record_to_ram(store, subtree)? {
+        RamChild::Ram(r) => Ok(*r),
+        _ => unreachable!("promote_record_to_ram returns a Ram node"),
+    }
+}
+
 /// The `i`-th nibble of a key (i in 0..64), without allocating.
 fn nibble_at(key: &Key, i: usize) -> u8 {
     let byte = key[i / 2];
@@ -2774,6 +3212,199 @@ fn apply_op(store: &FlatFile, cfg: &Config, old: Node, path: Vec<u8>, op: LeafOp
             account_node(path, nonce, balance, code_hash, *storage)
         }
         _ => bail!("leaf op does not match the existing node kind at this key"),
+    })
+}
+
+/// What to delete at a key's leaf position — the removal mirror of [`LeafOp`].
+/// Ethereum requires deletion constantly (`SSTORE` to zero, EIP-158 account
+/// clearing, selfdestruct), and an MPT delete is structural: removing a leaf can
+/// collapse its parent branch into an extension/leaf, which must re-fold for the
+/// canonical (hash-exact) form.
+#[derive(Clone)]
+enum DeleteOp {
+    /// Delete a generic value leaf (storage-trie slot, or a plain trie key).
+    Value,
+    /// Delete the account at this key, including its entire storage. Also removes
+    /// an opaque-storage account stored as a plain value leaf.
+    Account,
+    /// Delete one storage slot of the account at this key.
+    Storage(Key),
+    /// Clear all storage of the account at this key, keeping the account fields
+    /// (reth `BundleState` wipe semantics: destroy-then-recreate in one block).
+    WipeStorage,
+}
+
+/// Outcome of a delete inside a record's node tree.
+enum NodeDelete {
+    /// The key/slot was not present — the subtree is unchanged, so callers skip
+    /// the record rewrite (and the root is untouched).
+    Absent,
+    /// The subtree changed in place (node re-folded canonically).
+    Changed,
+    /// The whole subtree was removed (the deleted leaf was its only content).
+    Removed,
+}
+
+/// Re-root `node` one or more levels shallower by prepending `edge` nibbles to its
+/// top path — the inverse of a branch split, used when a branch collapses to a
+/// single survivor. `Raw` survivors are parsed first (their path is in the bytes).
+fn prepend_path(node: Node, edge: &[u8]) -> Result<Node> {
+    let node = if let Node::Raw { buf, off, len, .. } = &node {
+        parse_node_lazy(buf, *off, *len)?
+    } else {
+        node
+    };
+    if edge.is_empty() {
+        return Ok(node);
+    }
+    let mut p = edge.to_vec();
+    Ok(match node {
+        Node::Leaf { path, value, .. } => {
+            p.extend_from_slice(&path);
+            leaf_node(p, value)
+        }
+        Node::Account { path, nonce, balance, code_hash, storage, .. } => {
+            p.extend_from_slice(&path);
+            account_node(p, nonce, balance, code_hash, *storage)
+        }
+        Node::Extension { path, child, .. } => {
+            p.extend_from_slice(&path);
+            make_extension(p, *child)
+        }
+        b @ Node::Branch { .. } => make_extension(p, b),
+        Node::Empty | Node::Overflow { .. } | Node::Raw { .. } => {
+            unreachable!("only leaf/account/extension/branch survivors are re-rooted")
+        }
+    })
+}
+
+/// Delete `key`'s leaf from the node tree rooted at `depth`, re-folding the
+/// structure canonically: a branch left with one child merges into its survivor
+/// (extension/leaf path prepend), extensions merge with collapsed children. The
+/// dual of [`record_node_insert`] — same descent, inverse structural rules.
+fn record_node_delete(node: &mut Node, depth: usize, key: &Key, op: DeleteOp) -> Result<NodeDelete> {
+    // Expand a lazily-unparsed subtree one level before navigating into it.
+    if let Node::Raw { buf, off, len, .. } = node {
+        *node = parse_node_lazy(buf, *off, *len)?;
+    }
+    let nibbles = key_nibbles(key);
+    let (updated, outcome) = match std::mem::replace(node, Node::Empty) {
+        Node::Empty => (Node::Empty, NodeDelete::Absent),
+        old @ (Node::Leaf { .. } | Node::Account { .. }) => {
+            let matches = match &old {
+                Node::Leaf { path, .. } | Node::Account { path, .. } => {
+                    path[..] == nibbles[depth..]
+                }
+                _ => unreachable!(),
+            };
+            if matches {
+                match apply_delete_op(old, op)? {
+                    Applied::Absent(n) => (n, NodeDelete::Absent),
+                    Applied::Changed(n) => (n, NodeDelete::Changed),
+                    Applied::Removed => (Node::Empty, NodeDelete::Removed),
+                }
+            } else {
+                (old, NodeDelete::Absent)
+            }
+        }
+        Node::Extension { path, mut child, nref } => {
+            if nibbles[depth..].starts_with(&path) {
+                match record_node_delete(&mut child, depth + path.len(), key, op)? {
+                    NodeDelete::Absent => {
+                        (Node::Extension { path, child, nref }, NodeDelete::Absent)
+                    }
+                    NodeDelete::Removed => (Node::Empty, NodeDelete::Removed),
+                    NodeDelete::Changed => {
+                        // Re-fold: if the child collapsed to a leaf/extension, the
+                        // extension must merge with it for the canonical form.
+                        (prepend_path(*child, &path)?, NodeDelete::Changed)
+                    }
+                }
+            } else {
+                (Node::Extension { path, child, nref }, NodeDelete::Absent)
+            }
+        }
+        Node::Branch { mut children, nref } => {
+            let idx = nibbles[depth] as usize;
+            let out = match children[idx].as_deref_mut() {
+                None => NodeDelete::Absent,
+                Some(Node::Overflow { .. }) => {
+                    unreachable!("on-disk Overflow under promote-on-max (option B)")
+                }
+                Some(child) => record_node_delete(child, depth + 1, key, op)?,
+            };
+            match out {
+                NodeDelete::Absent => (Node::Branch { children, nref }, NodeDelete::Absent),
+                NodeDelete::Changed => (make_branch(children), NodeDelete::Changed),
+                NodeDelete::Removed => {
+                    children[idx] = None;
+                    let survivors = children.iter().filter(|c| c.is_some()).count();
+                    match survivors {
+                        0 => (Node::Empty, NodeDelete::Removed),
+                        1 => {
+                            // Canonical collapse: the branch disappears and its lone
+                            // survivor re-roots one level up, absorbing the nibble.
+                            let j = children.iter().position(|c| c.is_some()).unwrap();
+                            let survivor = *children[j].take().unwrap();
+                            (prepend_path(survivor, &[j as u8])?, NodeDelete::Changed)
+                        }
+                        _ => (make_branch(children), NodeDelete::Changed),
+                    }
+                }
+            }
+        }
+        Node::Overflow { .. } => {
+            unreachable!("overflow is only reached via its parent branch slot")
+        }
+        Node::Raw { .. } => unreachable!("Raw is expanded before the match"),
+    };
+    *node = updated;
+    Ok(outcome)
+}
+
+/// Result of applying a [`DeleteOp`] at an exact key match.
+enum Applied {
+    /// Nothing to do (e.g. the storage slot was absent) — node returned unchanged.
+    Absent(Node),
+    /// The node changed (e.g. a storage slot removed, fields re-folded).
+    Changed(Node),
+    /// The node is gone entirely.
+    Removed,
+}
+
+/// Apply a [`DeleteOp`] to the existing node at an exact key match — the removal
+/// mirror of [`apply_op`].
+fn apply_delete_op(old: Node, op: DeleteOp) -> Result<Applied> {
+    Ok(match (old, op) {
+        // A value leaf deletes outright; `Account` also accepts one because an
+        // opaque-storage account is stored as a plain value leaf (`EthState`).
+        (Node::Leaf { .. }, DeleteOp::Value | DeleteOp::Account) => Applied::Removed,
+        // Deleting an account removes its nested storage with it (inline storage
+        // lives in the same record; promoted storage is handled at the frontier).
+        (Node::Account { .. }, DeleteOp::Account) => Applied::Removed,
+        (
+            Node::Account { path, nonce, balance, code_hash, mut storage, .. },
+            DeleteOp::Storage(slot),
+        ) => match record_node_delete(&mut storage, 0, &slot, DeleteOp::Value)? {
+            NodeDelete::Absent => {
+                Applied::Absent(account_node(path, nonce, balance, code_hash, *storage))
+            }
+            NodeDelete::Removed => {
+                // Last slot removed: the storage root folds back to EMPTY_ROOT.
+                Applied::Changed(account_node(path, nonce, balance, code_hash, Node::Empty))
+            }
+            NodeDelete::Changed => {
+                Applied::Changed(account_node(path, nonce, balance, code_hash, *storage))
+            }
+        },
+        (Node::Account { path, nonce, balance, code_hash, storage, .. }, DeleteOp::WipeStorage) => {
+            if matches!(*storage, Node::Empty) {
+                Applied::Absent(account_node(path, nonce, balance, code_hash, Node::Empty))
+            } else {
+                Applied::Changed(account_node(path, nonce, balance, code_hash, Node::Empty))
+            }
+        }
+        _ => bail!("delete op does not match the existing node kind at this key"),
     })
 }
 
@@ -5491,5 +6122,131 @@ mod tests {
             db.insert(key, vec![i; 32]).unwrap();
         }
         assert!(db.ram_nodes() < 20, "ram_nodes={}", db.ram_nodes());
+    }
+
+    /// WP1 gate: randomized insert/overwrite/delete sequences must track the
+    /// `eth` reference oracle exactly. Small leaf caps force promotion, so
+    /// deletions exercise every structural case: in-record branch collapse,
+    /// frontier branch collapse onto RAM and record survivors (re-homing a
+    /// record across the frontier boundary), extension merging, and whole-record
+    /// removal. Also checks reads-after-delete, allocator liveness parity, and
+    /// persist/reopen.
+    #[test]
+    fn delete_matches_oracle_randomized() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::collections::BTreeMap;
+
+        let cfg =
+            Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let tmp = NamedTempFile::new().unwrap();
+        let mut mpt = FlatMpt::create(tmp.path(), cfg).unwrap();
+        let mut rng = StdRng::seed_from_u64(0xDE1E7E);
+        let mut live: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+
+        let oracle = |live: &BTreeMap<Key, Vec<u8>>| -> Hash {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> =
+                live.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+            crate::eth::root(&entries).0
+        };
+        let rand_val = |rng: &mut StdRng, i: usize| -> Vec<u8> {
+            // Mix tiny (inline-ref) and normal values.
+            let len = if i % 3 == 0 { rng.gen_range(1..=8) } else { rng.gen_range(40..=80) };
+            (0..len).map(|_| rng.r#gen()).collect()
+        };
+
+        // Build 600 keys one by one (the serial path deletion mirrors).
+        let mut keys: Vec<Key> = Vec::new();
+        for i in 0..600 {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            let v = rand_val(&mut rng, i);
+            keys.push(k);
+            live.insert(k, v.clone());
+            mpt.insert(k, v).unwrap();
+        }
+        assert_eq!(mpt.root(), oracle(&live), "post-build");
+
+        // Interleaved delete / overwrite / insert / absent-delete rounds.
+        for round in 0..6 {
+            for i in 0..80 {
+                match rng.gen_range(0..10u32) {
+                    0..=5 => {
+                        if live.len() > 30 {
+                            let k = keys[rng.gen_range(0..keys.len())];
+                            mpt.delete(k).unwrap();
+                            live.remove(&k);
+                        }
+                    }
+                    6..=7 => {
+                        let k = keys[rng.gen_range(0..keys.len())];
+                        if live.contains_key(&k) {
+                            let v = rand_val(&mut rng, i);
+                            live.insert(k, v.clone());
+                            mpt.insert(k, v).unwrap();
+                        }
+                    }
+                    8 => {
+                        // Deleting an absent key is a no-op.
+                        let mut k = [0u8; 32];
+                        rng.fill(&mut k);
+                        if !live.contains_key(&k) {
+                            let before = mpt.root();
+                            mpt.delete(k).unwrap();
+                            assert_eq!(mpt.root(), before, "absent delete must not change root");
+                        }
+                    }
+                    _ => {
+                        let mut k = [0u8; 32];
+                        rng.fill(&mut k);
+                        let v = rand_val(&mut rng, i);
+                        keys.push(k);
+                        live.insert(k, v.clone());
+                        mpt.insert(k, v).unwrap();
+                    }
+                }
+            }
+            assert_eq!(mpt.root(), oracle(&live), "round {round}");
+        }
+
+        // Reads see deletions; live keys still read back.
+        let gone = keys.iter().find(|k| !live.contains_key(*k)).unwrap();
+        assert_eq!(mpt.get_value(gone).unwrap(), None);
+        let (k, v) = live.iter().next().unwrap();
+        assert_eq!(mpt.get_value(k).unwrap().as_deref(), Some(v.as_slice()));
+
+        // Mass delete: empty out everything under two top nibbles (removes whole
+        // frontier subtrees) and then all but ~40 keys — a collapse storm.
+        let doomed: Vec<Key> = live
+            .keys()
+            .filter(|k| k[0] >> 4 <= 1)
+            .copied()
+            .collect();
+        for k in doomed {
+            mpt.delete(k).unwrap();
+            live.remove(&k);
+        }
+        assert_eq!(mpt.root(), oracle(&live), "after subtree wipe");
+        while live.len() > 40 {
+            let k = *live.keys().next().unwrap();
+            mpt.delete(k).unwrap();
+            live.remove(&k);
+        }
+        assert_eq!(mpt.root(), oracle(&live), "after mass delete");
+
+        // Every structural change kept the allocator's liveness in sync with the
+        // frontier (freed records really freed, rewrites accounted).
+        let (alloc_live, true_live) = mpt.audit_live_units();
+        assert_eq!(alloc_live, true_live, "allocator vs frontier liveness");
+
+        // Deletion survives persist + reopen; deletes keep working after.
+        mpt.persist().unwrap();
+        let root_before = mpt.root();
+        drop(mpt);
+        let mut mpt = FlatMpt::open(tmp.path()).unwrap();
+        assert_eq!(mpt.root(), root_before, "root after reopen");
+        let k = *live.keys().next().unwrap();
+        mpt.delete(k).unwrap();
+        live.remove(&k);
+        assert_eq!(mpt.root(), oracle(&live), "delete after reopen");
     }
 }

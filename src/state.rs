@@ -156,15 +156,40 @@ impl EthState {
 
     /// Set one storage slot of an account (auto-creating an empty account if none
     /// exists). `slot` is the raw slot key; it is `keccak`-hashed (secure trie). A
-    /// zero value is a deletion in Ethereum — callers should handle that; here it is
-    /// written verbatim as `RLP(0)`.
+    /// zero value is a deletion (Ethereum never stores zero slots): the leaf is
+    /// removed and the storage trie re-folds canonically.
     pub fn set_storage(&mut self, addr: &Address, slot: U256, value: U256) -> Result<()> {
         let slot_key = keccak256(slot.to_be_bytes::<32>()).0;
-        self.trie.insert_storage(
-            account_key(addr),
-            slot_key,
-            crate::eth::storage_value_rlp(value),
-        )?;
+        if value.is_zero() {
+            self.trie.delete_storage(account_key(addr), slot_key)?;
+        } else {
+            self.trie.insert_storage(
+                account_key(addr),
+                slot_key,
+                crate::eth::storage_value_rlp(value),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Delete an account outright, including its entire storage (EIP-158
+    /// clearing / selfdestruct). A missing account is a no-op.
+    pub fn delete_account(&mut self, addr: &Address) -> Result<()> {
+        self.trie.delete_account(account_key(addr))?;
+        Ok(())
+    }
+
+    /// Delete one storage slot (`SSTORE` to zero). Missing account/slot: no-op.
+    pub fn delete_storage(&mut self, addr: &Address, slot: U256) -> Result<()> {
+        let slot_key = keccak256(slot.to_be_bytes::<32>()).0;
+        self.trie.delete_storage(account_key(addr), slot_key)?;
+        Ok(())
+    }
+
+    /// Clear all storage of an account, keeping its fields (reth `BundleState`
+    /// wipe semantics for destroy-then-recreate within one block).
+    pub fn wipe_storage(&mut self, addr: &Address) -> Result<()> {
+        self.trie.wipe_storage(account_key(addr))?;
         Ok(())
     }
 
@@ -470,5 +495,138 @@ mod tests {
         let st = EthState::open(tmp.path()).unwrap();
         assert_eq!(st.get_code(&h1).unwrap().unwrap(), b"contract-one");
         assert_eq!(st.get_code(&h2).unwrap().unwrap(), b"contract-two-longer-bytecode");
+    }
+
+    /// WP1 gate (state level): storage zeroing, wipes, account deletion, and a
+    /// promoted large contract shrinking back down must all reproduce the oracle
+    /// state root exactly, phase by phase, and survive persist + reopen.
+    #[test]
+    fn deletion_reproduces_oracle_roots() {
+        use std::collections::BTreeMap;
+
+        // Small caps so the large contract's storage promotes into the frontier.
+        let cfg = crate::Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let tmp = NamedTempFile::new().unwrap();
+        let mut st = EthState::create(tmp.path(), cfg).unwrap();
+
+        // Model: address -> (nonce, balance, code_hash, live slots). The oracle
+        // folds each account's storage root and takes the secure trie root.
+        type Model = BTreeMap<Address, (u64, U256, B256, BTreeMap<U256, U256>)>;
+        let oracle = |m: &Model| -> B256 {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = m
+                .iter()
+                .map(|(addr, (nonce, balance, code_hash, slots))| {
+                    let storage_root = if slots.is_empty() {
+                        crate::eth::EMPTY_ROOT
+                    } else {
+                        let se: Vec<(Vec<u8>, Vec<u8>)> = slots
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.to_be_bytes::<32>().to_vec(), crate::eth::storage_value_rlp(*v))
+                            })
+                            .collect();
+                        crate::eth::secure_root(&se)
+                    };
+                    let acct = Account {
+                        nonce: *nonce,
+                        balance: *balance,
+                        storage_root,
+                        code_hash: *code_hash,
+                    };
+                    (addr.as_slice().to_vec(), acct.rlp())
+                })
+                .collect();
+            crate::eth::secure_root(&entries)
+        };
+        let addr = |i: u8| -> Address {
+            let mut a = [0u8; 20];
+            a[0] = 0xAA;
+            a[19] = i;
+            Address::from(a)
+        };
+        let val = |i: u64| U256::from(i.wrapping_mul(0x9E3779B1).wrapping_add(1));
+
+        let mut model: Model = BTreeMap::new();
+
+        // 10 EOAs + three contracts: small (3 slots), medium (30), large (300 —
+        // promotes under the 1 KiB cap).
+        for i in 1..=10u8 {
+            let a = addr(i);
+            st.set_account(&a, &Account::eoa(i as u64, U256::from(i))).unwrap();
+            model.insert(a, (i as u64, U256::from(i), EMPTY_CODE_HASH, BTreeMap::new()));
+        }
+        let (small, medium, large) = (addr(101), addr(102), addr(103));
+        for (a, n_slots) in [(small, 3u64), (medium, 30), (large, 300)] {
+            let ch = keccak256(a.as_slice());
+            st.set_account(&a, &Account::contract(1, U256::from(7u64), crate::eth::EMPTY_ROOT, ch))
+                .unwrap();
+            let mut slots = BTreeMap::new();
+            for k in 0..n_slots {
+                st.set_storage(&a, U256::from(k), val(k)).unwrap();
+                slots.insert(U256::from(k), val(k));
+            }
+            model.insert(a, (1, U256::from(7u64), ch, slots));
+        }
+        assert_eq!(st.state_root(), oracle(&model), "post-build");
+        let (records_full, _) = st.record_stats();
+
+        // Phase 2: SSTORE-to-zero via set_storage(0) — deletes the slots.
+        for k in [0u64, 2] {
+            st.set_storage(&small, U256::from(k), U256::ZERO).unwrap();
+            model.get_mut(&small).unwrap().3.remove(&U256::from(k));
+        }
+        for k in 0..15u64 {
+            st.set_storage(&medium, U256::from(k), U256::ZERO).unwrap();
+            model.get_mut(&medium).unwrap().3.remove(&U256::from(k));
+        }
+        assert_eq!(st.state_root(), oracle(&model), "after slot zeroing");
+        assert_eq!(st.get_storage(&small, U256::from(0u64)).unwrap(), None);
+        assert_eq!(st.get_storage(&small, U256::from(1u64)).unwrap(), Some(val(1)));
+
+        // Phase 3: shrink the promoted large contract to 2 slots — its storage
+        // frontier collapses and the account demotes back to a plain record.
+        for k in 2..300u64 {
+            st.delete_storage(&large, U256::from(k)).unwrap();
+            model.get_mut(&large).unwrap().3.remove(&U256::from(k));
+        }
+        assert_eq!(st.state_root(), oracle(&model), "after large-contract shrink");
+        assert_eq!(st.get_storage(&large, U256::from(0u64)).unwrap(), Some(val(0)));
+        assert_eq!(st.get_storage(&large, U256::from(5u64)).unwrap(), None);
+        let (records_shrunk, _) = st.record_stats();
+        assert!(
+            records_shrunk < records_full,
+            "demotion should shed records: {records_shrunk} vs {records_full}"
+        );
+
+        // Phase 4: wipe the medium contract's storage, fields kept.
+        st.wipe_storage(&medium).unwrap();
+        model.get_mut(&medium).unwrap().3.clear();
+        assert_eq!(st.state_root(), oracle(&model), "after wipe");
+        let acct = st.get_account(&medium).unwrap().unwrap();
+        assert_eq!(acct.storage_root, crate::eth::EMPTY_ROOT);
+        assert_eq!(acct.nonce, 1);
+
+        // Phase 5: delete accounts — an EOA, the small contract (with live
+        // storage), and the demoted large contract.
+        for a in [addr(3), small, large] {
+            st.delete_account(&a).unwrap();
+            model.remove(&a);
+        }
+        assert_eq!(st.state_root(), oracle(&model), "after account deletion");
+        assert_eq!(st.get_account(&small).unwrap(), None);
+        assert_eq!(st.get_storage(&small, U256::from(1u64)).unwrap(), None);
+        // Deleting a missing account is a no-op.
+        st.delete_account(&addr(200)).unwrap();
+        assert_eq!(st.state_root(), oracle(&model), "absent account delete");
+
+        // Phase 6: persist + reopen — deletions are durable.
+        st.persist().unwrap();
+        let root = st.state_root();
+        drop(st);
+        let mut st = EthState::open(tmp.path()).unwrap();
+        assert_eq!(st.state_root(), root, "root after reopen");
+        st.delete_account(&addr(4)).unwrap();
+        model.remove(&addr(4));
+        assert_eq!(st.state_root(), oracle(&model), "delete after reopen");
     }
 }
