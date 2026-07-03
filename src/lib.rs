@@ -1900,6 +1900,82 @@ impl FlatMpt {
         Ok(())
     }
 
+    /// Bulk-insert whole accounts (fields + full storage) — the nested-model
+    /// analogue of [`insert_batch`], for mainnet-scale ingest. Each account's
+    /// record is built/patched in RAM once (one parse + one serialize regardless
+    /// of slot count) via the same fused per-account updater `apply_block` uses;
+    /// in RAM-build mode the work fans across the top branch's 16 disjoint
+    /// subtrees. Existing accounts are overwritten (fields set, slots added).
+    pub fn insert_batch_accounts(&mut self, entries: Vec<(Key, AccountSeed)>) -> Result<Hash> {
+        let cfg = self.cfg.clone();
+        let ram = self.ram_mode;
+        let to_net = |seed: AccountSeed| NetUpdate {
+            wipe: false,
+            account: AccountOutcome::Set {
+                nonce: seed.nonce,
+                balance: seed.balance,
+                code_hash: seed.code_hash,
+            },
+            slots: seed.slots.into_iter().map(|(k, v)| (k, Some(v))).collect(),
+        };
+        let mut buckets: [Vec<(Key, NetUpdate)>; 16] = std::array::from_fn(|_| Vec::new());
+        for (key, seed) in entries {
+            buckets[nibble_at(&key, 0) as usize].push((key, to_net(seed)));
+        }
+        // Bootstrap the top branch (see insert_batch_ram) so the rest of even the
+        // first batch takes the parallel path.
+        if !matches!(self.upper, RamNode::Branch { .. }) {
+            for b in buckets.iter_mut() {
+                if let Some((key, upd)) = b.pop() {
+                    let mut sink = Vec::new();
+                    apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut sink, ram)?;
+                    break;
+                }
+            }
+        }
+        if matches!(self.upper, RamNode::Branch { .. }) {
+            let store = &self.store;
+            if let RamNode::Branch { children, hash } = &mut self.upper {
+                hash.set(None);
+                std::thread::scope(|scope| -> Result<()> {
+                    let cfg = &cfg;
+                    let mut handles = Vec::new();
+                    for (k, slot) in children.iter_mut().enumerate() {
+                        let items = std::mem::take(&mut buckets[k]);
+                        if items.is_empty() {
+                            continue;
+                        }
+                        handles.push(scope.spawn(move || -> Result<()> {
+                            let mut sink = Vec::new();
+                            for (key, upd) in items {
+                                apply_group_child(store, cfg, slot, vec![k as u8], &key, &upd, &mut sink, ram)?;
+                                sink.clear();
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join().expect("account fan-out thread panicked")?;
+                    }
+                    Ok(())
+                })?;
+            }
+        } else {
+            let store = &self.store;
+            let mut sink = Vec::new();
+            for (key, upd) in buckets.into_iter().flatten() {
+                apply_ram_group(store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut sink, ram)?;
+                sink.clear();
+            }
+        }
+        if ram {
+            self.maybe_spill()?;
+        } else {
+            self.store.flush()?;
+        }
+        Ok(self.root())
+    }
+
     /// If a RAM build has crossed the resident-size threshold, spill its in-RAM
     /// leaves to disk and revert to disk mode for subsequent batches.
     fn maybe_spill(&mut self) -> Result<()> {
@@ -2952,6 +3028,17 @@ pub enum StateOp {
     SetStorage { slot: Key, value: Vec<u8> },
     /// Remove one storage slot.
     DeleteStorage { slot: Key },
+}
+
+/// Seed data for one account in a bulk nested load
+/// ([`FlatMpt::insert_batch_accounts`]).
+#[derive(Debug, Clone)]
+pub struct AccountSeed {
+    pub nonce: u64,
+    pub balance: U256,
+    pub code_hash: Hash,
+    /// (hashed slot key, RLP value) — the account's full storage.
+    pub slots: Vec<(Key, Vec<u8>)>,
 }
 
 /// An account's per-block outcome after normalization.
@@ -7367,5 +7454,91 @@ mod tests {
         // Liveness stayed consistent through the whole churn.
         let (alloc_live, true_live) = mpt.audit_live_units();
         assert_eq!(alloc_live, true_live, "allocator vs frontier liveness");
+    }
+
+    /// Bulk nested ingest matches the oracle: whole accounts (fields + storage,
+    /// including a contract big enough to promote) loaded via
+    /// `insert_batch_accounts`, then updated via `apply_block` on top.
+    #[test]
+    fn insert_batch_accounts_matches_oracle() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::collections::BTreeMap;
+
+        let cfg =
+            Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut mpt = db(cfg);
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+
+        let mut entries: Vec<(Key, AccountSeed)> = Vec::new();
+        let mut oracle_accts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..400u64 {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            let n_slots = match i % 10 {
+                0 => rng.gen_range(1..8),
+                1 => rng.gen_range(50..120), // promotes at the 1 KiB cap
+                _ => 0,
+            };
+            let mut slots: Vec<(Key, Vec<u8>)> = Vec::new();
+            let mut sm: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for _ in 0..n_slots {
+                let mut sk = [0u8; 32];
+                rng.fill(&mut sk);
+                let v: Vec<u8> = (0..rng.gen_range(1..=33)).map(|_| rng.r#gen()).collect();
+                sm.insert(sk.to_vec(), v.clone());
+                slots.push((sk, v));
+            }
+            let storage_root = if sm.is_empty() {
+                eth::EMPTY_ROOT
+            } else {
+                let se: Vec<(Vec<u8>, Vec<u8>)> =
+                    sm.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+                eth::root(&se)
+            };
+            let acct = eth::Account {
+                nonce: i,
+                balance: U256::from(i * 31),
+                storage_root,
+                code_hash: B256::from([7u8; 32]),
+            };
+            oracle_accts.push((k.to_vec(), acct.rlp()));
+            entries.push((
+                k,
+                AccountSeed {
+                    nonce: i,
+                    balance: U256::from(i * 31),
+                    code_hash: [7u8; 32],
+                    slots,
+                },
+            ));
+        }
+        let keys: Vec<Key> = entries.iter().map(|(k, _)| *k).collect();
+        let root = mpt.insert_batch_accounts(entries).unwrap();
+        assert_eq!(root, eth::root(&oracle_accts).0, "bulk nested ingest vs oracle");
+
+        // apply_block on top of the bulk load works (delete one, update one).
+        let (root2, _) = mpt
+            .apply_block(vec![
+                (keys[0], StateOp::DeleteAccount),
+                (
+                    keys[1],
+                    StateOp::SetAccount {
+                        nonce: 999,
+                        balance: U256::from(1u64),
+                        code_hash: [7u8; 32],
+                    },
+                ),
+            ])
+            .unwrap();
+        let mut oracle2 = oracle_accts.clone();
+        oracle2.remove(0);
+        let sr = {
+            // keys[1] had i=1 → the 50..120-slot contract; recompute its RLP with
+            // new fields but the same storage root.
+            let acct = eth::Account::decode(&oracle_accts[1].1).unwrap();
+            eth::Account { nonce: 999, balance: U256::from(1u64), ..acct }
+        };
+        oracle2[0] = (keys[1].to_vec(), sr.rlp());
+        assert_eq!(root2, eth::root(&oracle2).0, "apply_block on bulk load");
     }
 }
