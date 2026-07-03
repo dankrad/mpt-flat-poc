@@ -41,7 +41,7 @@ fn main() {
     let mut acc_none = 0u64;
     let mut n = 0u64;
     for (i, line) in BufReader::new(std::fs::File::open(&accounts_tsv).unwrap()).lines().enumerate() {
-        if i % 97 != 0 { continue; }
+        let _ = i;
         let l = line.unwrap();
         let addr = hex32(l.split('\t').next().unwrap());
         n += 1;
@@ -52,7 +52,7 @@ fn main() {
             Ok(None) => { acc_none += 1; if acc_none < 3 { println!("account NONE: {}", mpt_flat_poc::hex(addr)); } }
             Err(e) => { acc_err += 1; if acc_err < 4 { println!("account ERR {}: {e}", mpt_flat_poc::hex(addr)); } }
         }
-        if n >= 2_000 { break; }
+        if n >= 20_000 { break; }
     }
     println!("accounts probed {n}: errors {acc_err}, missing {acc_none}");
 
@@ -79,7 +79,7 @@ fn main() {
             Ok(None) => { s_none += 1; if s_none < 3 { println!("slot NONE: {} {}", mpt_flat_poc::hex(addr), mpt_flat_poc::hex(slot)); } }
             Err(e) => { s_err += 1; if s_err < 4 { println!("slot ERR {} {}: {e}", mpt_flat_poc::hex(addr), mpt_flat_poc::hex(slot)); } }
         }
-        if m >= 30_000 { break; }
+        if m >= 50_000 { break; }
     }
     println!("slots probed {m}: errors {s_err}, missing {s_none}, slow(>5ms) {slow}, mean {}us, worst {}us at {}",
         tot_us / m.max(1), worst.0, mpt_flat_poc::hex(worst.1));

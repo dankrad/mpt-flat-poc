@@ -34,24 +34,19 @@ fn main() {
     let n_blocks: usize = args.next().unwrap().parse().unwrap();
 
     // Sample existing account keys and (account, slot) pairs from the TSVs.
-    let sample_every = 37;
     let mut accounts: Vec<Key> = Vec::new();
-    for (i, line) in BufReader::new(std::fs::File::open(&accounts_tsv).unwrap()).lines().enumerate() {
-        if i % sample_every == 0 {
-            accounts.push(hex32(line.unwrap().split('\t').next().unwrap()));
-        }
-        if accounts.len() >= 200_000 {
+    for line in BufReader::new(std::fs::File::open(&accounts_tsv).unwrap()).lines() {
+        accounts.push(hex32(line.unwrap().split('\t').next().unwrap()));
+        if accounts.len() >= 400_000 {
             break;
         }
     }
     let mut slots: Vec<(Key, Key)> = Vec::new();
-    for (i, line) in BufReader::new(std::fs::File::open(&storages_tsv).unwrap()).lines().enumerate() {
-        if i % sample_every == 0 {
-            let l = line.unwrap();
-            let mut it = l.split('\t');
-            slots.push((hex32(it.next().unwrap()), hex32(it.next().unwrap())));
-        }
-        if slots.len() >= 400_000 {
+    for line in BufReader::new(std::fs::File::open(&storages_tsv).unwrap()).lines() {
+        let l = line.unwrap();
+        let mut it = l.split('\t');
+        slots.push((hex32(it.next().unwrap()), hex32(it.next().unwrap())));
+        if slots.len() >= 600_000 {
             break;
         }
     }
@@ -136,6 +131,7 @@ fn main() {
         hex(db.root()),
         process_footprint_bytes() as f64 / (1u64 << 30) as f64,
     );
+    db.persist().unwrap();
     // With --features profiling: wall-clock attribution across categories.
     if mpt_flat_poc::prof::ENABLED {
         for (name, (ns, calls)) in mpt_flat_poc::prof::CATS.iter().zip(mpt_flat_poc::prof::snapshot()) {
