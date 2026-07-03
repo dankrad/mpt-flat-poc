@@ -1340,6 +1340,9 @@ pub struct FlatMpt {
     ram_mode: bool,
     /// Resident-size ceiling (bytes) at which a RAM build spills to disk.
     spill_threshold: u64,
+    /// Footprint ceiling for the hot-record cache (post-open baseline +
+    /// `MPT_HOT_GIB`): crossing it spills the cached `Mem` records.
+    hot_spill_at: u64,
 }
 
 /// On-disk checkpoint of everything that otherwise lives only in RAM: the trie
@@ -1378,6 +1381,7 @@ impl FlatMpt {
             gc_regions: 0,
             ram_mode,
             spill_threshold,
+            hot_spill_at: process_footprint_bytes() + hot_budget_bytes(),
         })
     }
 
@@ -1435,6 +1439,7 @@ impl FlatMpt {
             // A reopened DB is disk-resident; RAM-build mode is for fresh creation.
             ram_mode: false,
             spill_threshold: ram_build_config().1,
+            hot_spill_at: process_footprint_bytes() + hot_budget_bytes(),
         })
     }
 
@@ -1640,6 +1645,14 @@ impl FlatMpt {
                     }
                 }
             }
+        }
+        // Hot-record cache budget: spill cached Mem records when the process
+        // footprint crosses the ceiling (persist() also spills them all).
+        if !self.ram_mode
+            && hot_records_enabled()
+            && process_footprint_bytes() >= self.hot_spill_at
+        {
+            self.spill_mem()?;
         }
         self.store.flush()?;
         Ok((self.root(), inv))
@@ -2568,6 +2581,9 @@ fn insert_into_child(
             } else if should_promote_account(cfg, &subtree) {
                 store.free(old_ptr);
                 *slot = Some(promote_account_to_ram(store, subtree)?);
+            } else if hot_records_enabled() {
+                store.free(old_ptr);
+                *slot = Some(make_mem_leaf(&subtree)?);
             } else {
                 let (payload, _) = serialize_subtree(&subtree)?;
                 store.free(old_ptr);
@@ -2929,10 +2945,14 @@ fn delete_in_child(
             match record_node_delete(&mut subtree.node, subtree.prefix.len(), key, op)? {
                 NodeDelete::Absent => Ok(RamDelete::Absent),
                 NodeDelete::Changed => {
-                    let (payload, _) = serialize_subtree(&subtree)?;
                     store.free(old_ptr);
-                    *ptr = store.write_payload(&payload)?;
-                    *root = hash_node(&subtree.node).finalize();
+                    if hot_records_enabled() {
+                        *slot = Some(make_mem_leaf(&subtree)?);
+                    } else {
+                        let (payload, _) = serialize_subtree(&subtree)?;
+                        *ptr = store.write_payload(&payload)?;
+                        *root = hash_node(&subtree.node).finalize();
+                    }
                     Ok(RamDelete::Changed)
                 }
                 NodeDelete::Removed => {
@@ -3588,6 +3608,39 @@ fn collect_disk_ptrs(node: &RamNode, out: &mut Vec<DiskPtr>) {
     }
 }
 
+/// `MPT_HOT_RECORDS=0` disables the Mem-on-rewrite hot-record cache (A/B).
+/// When on (default), a Disk record rewritten by an update stays in RAM as a
+/// `Mem` leaf — repeat-touched (hot) records coalesce K rewrites between
+/// checkpoints into one disk write, and re-reads skip the pread. Spilled by
+/// `persist()` and by the footprint guard (`MPT_HOT_GIB`, default 3).
+fn hot_records_enabled() -> bool {
+    match HOT_RECORDS.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("MPT_HOT_RECORDS").ok().as_deref() != Some("0");
+            HOT_RECORDS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+        1 => true,
+        _ => false,
+    }
+}
+static HOT_RECORDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Override the hot-record cache mode (tests / tuning harnesses; the env var
+/// `MPT_HOT_RECORDS` sets the process default on first use).
+pub fn set_hot_records(on: bool) {
+    HOT_RECORDS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Hot-cache footprint budget in GiB above the post-open baseline.
+fn hot_budget_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static GIB: OnceLock<u64> = OnceLock::new();
+    *GIB.get_or_init(|| {
+        std::env::var("MPT_HOT_GIB").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
+    }) * (1 << 30)
+}
+
 /// `MPT_PREFETCH=0` disables the apply_block pre-read pass (A/B).
 fn prefetch_enabled() -> bool {
     use std::sync::OnceLock;
@@ -3864,7 +3917,10 @@ fn apply_group_child(
                 }
                 NodeDelete::Changed => {
                     store.free(old_ptr);
-                    *slot = Some(finish_child(store, cfg, subtree, ram)?);
+                    // Hot-record cache: a just-rewritten record stays in RAM as
+                    // a Mem leaf (deferred write-back — spilled at persist or
+                    // by the footprint guard).
+                    *slot = Some(finish_child(store, cfg, subtree, ram || hot_records_enabled())?);
                     Ok(RamDelete::Changed)
                 }
                 NodeDelete::Removed => {
@@ -5788,10 +5844,16 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                         }
                     }
                     Some(RamChild::Disk { .. }) | None => {}
-                    // Promoted accounts are created on the disk path, so their storage
-                    // records are already `Disk` (nothing to spill). RAM-build mode is
-                    // not combined with account promotion.
-                    Some(RamChild::Account(_)) => {}
+                    // A promoted account's storage frontier may hold Mem leaves
+                    // (hot-record cache): spill them with the composite prefix
+                    // (the account's full 64 nibbles ++ storage-relative nibbles
+                    // — unambiguous, and install_ptr_by_prefix descends it).
+                    Some(RamChild::Account(a)) => {
+                        let mut cp = prefix.clone();
+                        cp.push(i as u8);
+                        cp.extend_from_slice(&a.path);
+                        spill_walk(&mut a.storage, cp, store, buf, chunk)?;
+                    }
                 }
             }
             Ok(())
@@ -5821,6 +5883,14 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
                 Some(RamChild::Disk { ptr, .. }) => {
                     *ptr = new_ptr;
                     true
+                }
+                Some(RamChild::Account(a)) => {
+                    // Composite prefix: 64 account nibbles ++ storage nibbles.
+                    if prefix.get(depth + 1..depth + 1 + a.path.len()) == Some(a.path.as_slice()) {
+                        install_ptr_by_prefix(&mut a.storage, prefix, depth + 1 + a.path.len(), new_ptr)
+                    } else {
+                        false
+                    }
                 }
                 Some(RamChild::Mem(_)) => false,
                 Some(RamChild::Ram(child)) => {
@@ -6690,6 +6760,12 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// Tests that assert on-disk record behavior (GC, disk-access counts) need
+    /// the hot-record cache OFF; cache-behavior tests need it ON. They hold
+    /// this lock for their duration so parallel test threads can't flip the
+    /// process-wide mode mid-test. Mode-agnostic tests ignore it.
+    static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn db(cfg: Config) -> FlatMpt {
         FlatMpt::create(NamedTempFile::new().unwrap().path(), cfg).unwrap()
     }
@@ -6984,6 +7060,8 @@ mod tests {
 
     #[test]
     fn root_is_independent_of_leaf_size() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
         // The Merkle root must be a pure function of the key set — independent of
         // `max_leaf_bytes`, i.e. of where the RAM/disk storage boundary falls.
         // Tiny leaves push almost everything into the RAM frontier (many splits);
@@ -7085,6 +7163,8 @@ mod tests {
 
     #[test]
     fn repeated_insert_overwrites_value_hash() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
         let mut db = db(Config::default());
         let key = hashed_key("alice");
         let root1 = db.insert(key, b"100".to_vec()).unwrap();
@@ -7234,6 +7314,8 @@ mod tests {
 
     #[test]
     fn active_gc_bounds_file_under_churn() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
         // Build a file well past the GC floor, then overwrite every key many
         // times. Without active GC the high-water would grow ~per round; the
         // inline cleaner must reclaim regions for reuse so it stays bounded.
@@ -7453,6 +7535,110 @@ mod tests {
         mpt.delete(k).unwrap();
         live.remove(&k);
         assert_eq!(mpt.root(), oracle(&live), "delete after reopen");
+    }
+
+    /// Hot-record cache: rewrites coalesce in RAM (`Mem`) — the flat file does
+    /// not grow under repeated overwrites until persist spills them once; the
+    /// spilled checkpoint reopens with the exact same root and values.
+    #[test]
+    fn hot_record_cache_coalesces_writes() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.flat");
+        let cfg = Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut db = FlatMpt::create(&path, cfg).unwrap();
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x407);
+        let mut keys: Vec<Key> = Vec::new();
+        let mut seed: Vec<(Key, StateOp)> = Vec::new();
+        for _ in 0..2000 {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            keys.push(k);
+            seed.push((k, StateOp::SetAccount {
+                nonce: 1,
+                balance: U256::from(1u64),
+                code_hash: [1u8; 32],
+            }));
+        }
+        // Plus a contract big enough to promote (storage frontier over its own
+        // records): its hot slot rewrites become Mem leaves INSIDE the promoted
+        // storage, exercising the composite-prefix spill/install path.
+        let contract = keys[0];
+        let mut slot_keys: Vec<Key> = Vec::new();
+        for _ in 0..300 {
+            let mut s = [0u8; 32];
+            rng.fill(&mut s);
+            slot_keys.push(s);
+            seed.push((contract, StateOp::SetStorage {
+                slot: s,
+                value: eth::storage_value_rlp(U256::from(11u64)),
+            }));
+        }
+        db.apply_block(seed).unwrap();
+        db.persist().unwrap(); // all records on disk
+        let base_len = db.flat_file_len();
+        let (base_alloc, base_true) = db.audit_live_units();
+        assert_eq!(base_alloc, base_true);
+
+        // 30 rounds of overwrites (accounts + the promoted contract's slots):
+        // hot records stay in RAM. The first rounds may settle (promotions
+        // write a few records once); steady state must not grow the file.
+        let mut settled_len = 0u64;
+        for round in 0..30u8 {
+            let mut ops: Vec<(Key, StateOp)> = keys[1..]
+                .iter()
+                .map(|k| {
+                    (*k, StateOp::SetAccount {
+                        nonce: round as u64,
+                        balance: U256::from(round),
+                        code_hash: [round; 32],
+                    })
+                })
+                .collect();
+            for s in &slot_keys {
+                ops.push((contract, StateOp::SetStorage {
+                    slot: *s,
+                    value: eth::storage_value_rlp(U256::from(round as u64 + 1)),
+                }));
+            }
+            db.apply_block(ops).unwrap();
+            if round == 2 {
+                settled_len = db.flat_file_len();
+            }
+        }
+        assert!(
+            db.flat_file_len() <= base_len + (256 << 10),
+            "hot rewrites grew the file: {} -> {}",
+            base_len,
+            db.flat_file_len()
+        );
+        assert_eq!(
+            db.flat_file_len(),
+            settled_len,
+            "steady-state hot rewrites must not grow the file"
+        );
+        let root_hot = db.root();
+
+        let slot_keys_probe: Vec<u8> = slot_keys[7].to_vec();
+        // Persist spills the cache once; the reopened state is identical.
+        db.persist().unwrap();
+        drop(db);
+        let db = FlatMpt::open(&path).unwrap();
+        assert_eq!(db.root(), root_hot, "root after spill + reopen");
+        assert_eq!(
+            db.get_value(&keys[1]).unwrap().map(|v| v[..4].to_vec()),
+            Some(eth::Account { nonce: 29, balance: U256::from(29u8), storage_root: eth::EMPTY_ROOT, code_hash: B256::from([29u8; 32]) }.rlp()[..4].to_vec()),
+        );
+        let (a, t) = db.audit_live_units();
+        assert_eq!(a, t, "liveness parity after spill");
+        // The promoted contract's slots read back through the spilled records.
+        assert_eq!(
+            db.get_storage(&keys[0], &{ let mut s = [0u8; 32]; s.copy_from_slice(&slot_keys_probe); s }).unwrap(),
+            Some(eth::storage_value_rlp(U256::from(30u64))),
+            "promoted-storage slot after spill + reopen"
+        );
     }
 
     /// WP2 gate: randomized block-shaped updates (account upserts/deletes, slot

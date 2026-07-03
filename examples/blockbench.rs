@@ -52,6 +52,12 @@ fn main() {
     }
     eprintln!("sampled {} accounts, {} slots", accounts.len(), slots.len());
 
+    // Zipf-ish skew: with probability MPT_BENCH_HOT_FRAC, slot overwrites draw
+    // from the first MPT_BENCH_HOT_SET sampled slots (mainnet is heavily skewed).
+    let hot_frac: f64 = std::env::var("MPT_BENCH_HOT_FRAC").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let hot_set: usize = std::env::var("MPT_BENCH_HOT_SET").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000).min(slots.len());
+    let wb0 = mpt_flat_poc::stats::WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+
     let mut db = FlatMpt::open(&flat).unwrap();
     let mut rng = StdRng::seed_from_u64(0xB33F);
     let mut times_us: Vec<f64> = Vec::new();
@@ -63,7 +69,11 @@ fn main() {
             match rng.gen_range(0..100u32) {
                 // Overwrite an existing slot (the dominant real-block op).
                 0..=59 => {
-                    let (a, s) = slots[rng.gen_range(0..slots.len())];
+                    let (a, s) = if hot_frac > 0.0 && rng.gen_bool(hot_frac) {
+                        slots[rng.gen_range(0..hot_set)]
+                    } else {
+                        slots[rng.gen_range(0..slots.len())]
+                    };
                     ops.push((a, StateOp::SetStorage {
                         slot: s,
                         value: eth::storage_value_rlp(U256::from(rng.r#gen::<u64>())),
@@ -120,7 +130,7 @@ fn main() {
     println!(
         "ops/block {ops_per_block}  blocks {n_blocks}  wall {:.1}s\n\
          per-block ms: mean {:.1}  p50 {:.1}  p90 {:.1}  p99 {:.1}  max {:.1}\n\
-         per-op us: mean {:.2}  root {}  RSS {:.1} GiB",
+         per-op us: mean {:.2}  root {}  RSS {:.1} GiB  disk-writes {:.1} MiB",
         t0.elapsed().as_secs_f64(),
         tot / times_us.len() as f64 / 1000.0,
         pct(0.50) / 1000.0,
@@ -130,6 +140,7 @@ fn main() {
         tot / (times_us.len() * ops_per_block) as f64,
         hex(db.root()),
         process_footprint_bytes() as f64 / (1u64 << 30) as f64,
+        (mpt_flat_poc::stats::WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed) - wb0) as f64 / (1u64 << 20) as f64,
     );
     db.persist().unwrap();
     // With --features profiling: wall-clock attribution across categories.
