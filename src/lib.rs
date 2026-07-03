@@ -1561,6 +1561,19 @@ impl FlatMpt {
             for (key, upd) in net {
                 buckets[nibble_at(&key, 0) as usize].push((key, upd));
             }
+            // Pre-read pass: warm every group's target records through a deep
+            // read queue before the 16 appliers run. In the integrated node the
+            // EVM's own reads do this for free (values live in the trie); here
+            // it decouples I/O from apply so the appliers run page-cache-hot.
+            if prefetch_enabled() {
+                let mut ptrs: Vec<DiskPtr> = Vec::new();
+                for b in &buckets {
+                    for (key, upd) in b {
+                        route_group_ptrs(&self.upper, 0, key, upd, &mut ptrs);
+                    }
+                }
+                prefetch_records(&self.store, ptrs);
+            }
             let store = &self.store;
             let RamNode::Branch { children, hash } = &mut self.upper else { unreachable!() };
             hash.set(None);
@@ -3499,6 +3512,120 @@ fn finish_child(store: &FlatFile, cfg: &Config, subtree: DiskSubtree, ram: bool)
     } else {
         make_leaf_child(store, ram, subtree)
     }
+}
+
+/// Read-only routing: collect the flat-file records a group's update will
+/// touch — the owning account record, a promoted account's storage records for
+/// each touched slot, or its whole storage on wipe/delete (the inverse-diff
+/// enumeration reads them all). Purely advisory: the prefetch pass warms these
+/// through a deep read queue before the appliers run, so a stale route (an
+/// earlier group re-homed a sibling record) costs nothing but a wasted read.
+fn route_group_ptrs(node: &RamNode, prefix_len: usize, key: &Key, upd: &NetUpdate, out: &mut Vec<DiskPtr>) {
+    let nibbles = key_nibbles(key);
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { path, child, .. } => {
+            if nibbles[prefix_len..].starts_with(path) {
+                route_group_ptrs(child, prefix_len + path.len(), key, upd, out);
+            }
+        }
+        RamNode::Branch { children, .. } => {
+            match &children[nibbles[prefix_len] as usize] {
+                None | Some(RamChild::Mem(_)) => {}
+                Some(RamChild::Ram(sub)) => route_group_ptrs(sub, prefix_len + 1, key, upd, out),
+                Some(RamChild::Disk { ptr, .. }) => out.push(*ptr),
+                Some(RamChild::Account(a)) => {
+                    if nibbles[prefix_len + 1..] != a.path[..] {
+                        return;
+                    }
+                    if upd.account == AccountOutcome::Delete || upd.wipe {
+                        collect_disk_ptrs(&a.storage, out);
+                        return;
+                    }
+                    for (skey, _) in &upd.slots {
+                        route_slot_ptr(&a.storage, 0, skey, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Routing within a promoted account's storage frontier: the record owning one
+/// slot key.
+fn route_slot_ptr(node: &RamNode, depth: usize, skey: &Key, out: &mut Vec<DiskPtr>) {
+    let nibbles = key_nibbles(skey);
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                route_slot_ptr(child, depth + path.len(), skey, out);
+            }
+        }
+        RamNode::Branch { children, .. } => match &children[nibbles[depth] as usize] {
+            Some(RamChild::Disk { ptr, .. }) => out.push(*ptr),
+            Some(RamChild::Ram(sub)) => route_slot_ptr(sub, depth + 1, skey, out),
+            _ => {}
+        },
+    }
+}
+
+/// Every Disk record under a frontier subtree (wipe/delete enumeration targets).
+fn collect_disk_ptrs(node: &RamNode, out: &mut Vec<DiskPtr>) {
+    match node {
+        RamNode::Empty => {}
+        RamNode::Extension { child, .. } => collect_disk_ptrs(child, out),
+        RamNode::Branch { children, .. } => {
+            for c in children.iter().flatten() {
+                match c {
+                    RamChild::Ram(sub) => collect_disk_ptrs(sub, out),
+                    RamChild::Disk { ptr, .. } => out.push(*ptr),
+                    RamChild::Mem(_) => {}
+                    RamChild::Account(a) => collect_disk_ptrs(&a.storage, out),
+                }
+            }
+        }
+    }
+}
+
+/// `MPT_PREFETCH=0` disables the apply_block pre-read pass (A/B).
+fn prefetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MPT_PREFETCH").ok().as_deref() != Some("0"))
+}
+
+/// Warm a set of records through a deep read queue (page cache population):
+/// sorted, deduplicated, fanned across `worker_count()` blocking readers — the
+/// same concurrency shape as insert_batch's Phase B, so the device sees a deep
+/// queue instead of the 16 serial readers the apply fan-out alone would issue.
+fn prefetch_records(store: &FlatFile, mut ptrs: Vec<DiskPtr>) {
+    if ptrs.len() < 2 {
+        return;
+    }
+    ptrs.sort_by_key(|p| p.unit);
+    ptrs.dedup_by_key(|p| p.unit);
+    let workers = worker_count().min(ptrs.len());
+    let chunk = ptrs.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        for w in ptrs.chunks(chunk) {
+            scope.spawn(move || {
+                let mut buf: Vec<u8> = Vec::new();
+                for p in w {
+                    let len = RECORD_HDR as usize + p.len as usize;
+                    buf.resize(len.max(buf.len()), 0);
+                    // Advisory: an error here just means no warm-up for this one.
+                    let _ = read_at_into(&store.file, p.offset(), &mut buf[..len]);
+                }
+            });
+        }
+    });
+}
+
+#[cfg(unix)]
+fn read_at_into(f: &File, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
 }
 
 /// Apply one account's net update through the frontier — insert and delete
