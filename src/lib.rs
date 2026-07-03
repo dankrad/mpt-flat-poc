@@ -460,6 +460,10 @@ const ADDR_UNIT: u64 = 256;
 const UNITS_PER_PAGE: u64 = PAGE / ADDR_UNIT;
 const REGION_UNITS: u64 = REGION_PAGES * UNITS_PER_PAGE;
 const REGION_BYTES: usize = (REGION_PAGES * PAGE) as usize;
+/// Largest serialized record payload that fits one region (records never
+/// straddle regions — the allocator's core invariant). Oversized subtrees must
+/// promote recursively instead of being written as one record.
+const MAX_RECORD_BYTES: usize = REGION_BYTES - RECORD_HDR as usize;
 
 /// 256 B units needed to hold `bytes` (a framed record).
 fn units_for(bytes: u32) -> u32 {
@@ -557,7 +561,10 @@ impl RegionAlloc {
     /// stays within one region. Returns the start page. `live_units` is the
     /// records' true 256 B footprint — the page-rounding pad is left as garbage.
     fn alloc(&mut self, run_pages: u32, live_units: u32, end_page: &AtomicU64) -> u64 {
-        debug_assert!(run_pages as u64 <= REGION_PAGES);
+        // Hard invariant: a record never spans regions. A violation here would
+        // silently overrun the neighbouring regions' liveness accounting and
+        // let later allocations/GC overwrite the record's tail.
+        assert!(run_pages as u64 <= REGION_PAGES, "record of {run_pages} pages exceeds a region");
         let region_end = self.head_region * REGION_PAGES + REGION_PAGES;
         if self.live.is_empty() || self.next_page + run_pages as u64 > region_end {
             self.open_new_head(end_page);
@@ -815,6 +822,9 @@ impl FlatFile {
     /// tail needn't be zeroed beyond the payload. Safe to call concurrently: the
     /// allocation holds the region lock only briefly; the `pwrite` is lock-free.
     fn write_payload(&self, payload: &[u8]) -> Result<DiskPtr> {
+        if payload.len() > MAX_RECORD_BYTES {
+            bail!("record payload {} B exceeds the region capacity", payload.len());
+        }
         let total = payload.len() as u32;
         stats::on_write(total as usize);
         let run_pages = pages_for(RECORD_HDR + total);
@@ -844,6 +854,9 @@ impl FlatFile {
     /// stays on the bandwidth plateau, and no record straddles a region). Returns a
     /// `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        if let Some(p) = payloads.iter().find(|p| p.len() > MAX_RECORD_BYTES) {
+            bail!("record payload {} B exceeds the region capacity", p.len());
+        }
         let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
         let mut ptrs = Vec::with_capacity(payloads.len());
         let mut i = 0;
@@ -903,6 +916,9 @@ impl FlatFile {
     /// offsets hit the device's multi-thread write rate (~6-10 GB/s) instead of the
     /// single-stream ~3.5. No tail contention since every run is a different region.
     fn write_batch_parallel(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        if let Some(p) = payloads.iter().find(|p| p.len() > MAX_RECORD_BYTES) {
+            bail!("record payload {} B exceeds the region capacity", p.len());
+        }
         let aligned = |bytes: usize| units_for(bytes as u32) as usize * ADDR_UNIT as usize;
         let mut ptrs: Vec<DiskPtr> = vec![DiskPtr { unit: 0, len: 0 }; payloads.len()];
         // Plan + allocate pass (single, locked): pack runs (each ≤ one region),
@@ -2366,7 +2382,7 @@ fn parse_payload_lazy(bytes: Arc<[u8]>) -> Result<DiskSubtree> {
 
 /// Like [`promote_record_to_ram`], but the lifted branch's children become in-RAM
 /// `Mem` leaves (each its own `Arc`) instead of serialized `Disk` records — no I/O.
-fn promote_to_mem(subtree: DiskSubtree) -> Result<RamChild> {
+fn promote_to_mem(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
     let DiskSubtree { prefix, node } = subtree;
     let (ext_path, branch_node) = match node {
         Node::Branch { .. } => (Vec::new(), node),
@@ -2383,7 +2399,15 @@ fn promote_to_mem(subtree: DiskSubtree) -> Result<RamChild> {
         if let Some(boxed) = slot {
             let mut cp = branch_prefix.clone();
             cp.push(i as u8);
-            ram_children[i] = Some(make_mem_leaf(&DiskSubtree { prefix: cp, node: *boxed })?);
+            let subtree = DiskSubtree { prefix: cp, node: *boxed };
+            // Oversized children keep splitting (see promote_record_to_ram) —
+            // a Mem leaf's bytes are spilled verbatim as one record later, so
+            // the same region bound applies.
+            ram_children[i] = Some(if record_size(subtree.prefix.len(), &subtree.node) > MAX_RECORD_BYTES {
+                promote_oversized_mem(store, subtree)?
+            } else {
+                make_mem_leaf(&subtree)?
+            });
         }
     }
     let branch = RamNode::Branch {
@@ -2398,6 +2422,28 @@ fn promote_to_mem(subtree: DiskSubtree) -> Result<RamChild> {
             child: Box::new(branch),
             hash: HashCell::new(None),
         })))
+    }
+}
+
+/// Promote an oversized subtree that cannot be one record: branches/extensions
+/// split recursively; a lone account promotes its storage into the frontier.
+/// (A single value leaf over the bound cannot be split — unreachable for
+/// Ethereum data, whose values are ≤ ~110 B.)
+fn promote_oversized(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
+    match &subtree.node {
+        Node::Branch { .. } | Node::Extension { .. } => promote_record_to_ram(store, subtree),
+        Node::Account { .. } => promote_account_to_ram(store, subtree),
+        _ => bail!("oversized unsplittable record ({} B)", record_size(subtree.prefix.len(), &subtree.node)),
+    }
+}
+
+/// RAM-build variant of [`promote_oversized`] (children become `Mem` leaves;
+/// a lone account's storage records still go to disk).
+fn promote_oversized_mem(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
+    match &subtree.node {
+        Node::Branch { .. } | Node::Extension { .. } => promote_to_mem(store, subtree),
+        Node::Account { .. } => promote_account_to_ram(store, subtree),
+        _ => bail!("oversized unsplittable Mem record ({} B)", record_size(subtree.prefix.len(), &subtree.node)),
     }
 }
 
@@ -2424,7 +2470,7 @@ fn insert_into_child(
             let depth = subtree.prefix.len();
             record_node_insert(store, cfg, &mut subtree.node, depth, key, op)?;
             *slot = Some(if should_promote(cfg, &subtree) {
-                promote_to_mem(subtree)?
+                promote_to_mem(store, subtree)?
             } else if should_promote_account(cfg, &subtree) {
                 promote_account_to_ram(store, subtree)?
             } else {
@@ -3016,7 +3062,8 @@ fn collapse_root(store: &FlatFile, edge: Vec<u8>, survivor: RamChild) -> Result<
 /// unit of a per-block update ([`FlatMpt::apply_block`]). Shaped after reth's
 /// `BundleState`: per block an account has at most one outcome, a set of final
 /// slot values, and possibly a wipe (selfdestruct / destroy-then-recreate).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serde is for the shadow follower's per-block diff corpus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateOp {
     /// Create/update the account's fields (storage preserved unless wiped).
     SetAccount { nonce: u64, balance: U256, code_hash: Hash },
@@ -3379,7 +3426,7 @@ fn creation_child(
 /// otherwise write it as one record (or a `Mem` leaf in RAM-build mode).
 fn finish_child(store: &FlatFile, cfg: &Config, subtree: DiskSubtree, ram: bool) -> Result<RamChild> {
     if should_promote(cfg, &subtree) {
-        if ram { promote_to_mem(subtree) } else { promote_record_to_ram(store, subtree) }
+        if ram { promote_to_mem(store, subtree) } else { promote_record_to_ram(store, subtree) }
     } else if should_promote_account(cfg, &subtree) {
         promote_account_to_ram(store, subtree)
     } else {
@@ -4397,6 +4444,15 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
             other => {
                 let mut cp = branch_prefix.clone();
                 cp.push(i as u8);
+                // An oversized child (e.g. one shard of a monster contract's
+                // storage) cannot be written as a single record — records must
+                // fit a region. Promote it recursively: the frontier deepens
+                // until every written record is bounded.
+                if record_size(cp.len(), &other) > MAX_RECORD_BYTES {
+                    ram_children[i] =
+                        Some(promote_oversized(store, DiskSubtree { prefix: cp, node: other })?);
+                    continue;
+                }
                 let root = hash_node(&other).finalize();
                 let (payload, _) = serialize_subtree(&DiskSubtree { prefix: cp, node: other })?;
                 payloads.push(payload);
