@@ -1552,12 +1552,79 @@ impl FlatMpt {
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
         let mut inv: Vec<(Key, StateOp)> = Vec::new();
-        for (key, upd) in net {
-            match apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut inv, ram)? {
-                RamDelete::Absent | RamDelete::Changed => {}
-                RamDelete::Removed => self.upper = RamNode::Empty,
-                RamDelete::Collapsed { edge, survivor } => {
-                    self.upper = collapse_root(&self.store, edge, survivor)?;
+
+        // Fast path: fan the per-account groups across the top branch's 16
+        // disjoint child subtrees (one thread each — group record reads are the
+        // per-block bottleneck and they parallelize perfectly across subtrees).
+        if matches!(self.upper, RamNode::Branch { .. }) {
+            let mut buckets: [Vec<(Key, NetUpdate)>; 16] = std::array::from_fn(|_| Vec::new());
+            for (key, upd) in net {
+                buckets[nibble_at(&key, 0) as usize].push((key, upd));
+            }
+            let store = &self.store;
+            let RamNode::Branch { children, hash } = &mut self.upper else { unreachable!() };
+            hash.set(None);
+            let sinks: Vec<Vec<(Key, StateOp)>> = std::thread::scope(|scope| {
+                let cfg = &cfg;
+                let mut handles = Vec::new();
+                for (k, slot) in children.iter_mut().enumerate() {
+                    let items = std::mem::take(&mut buckets[k]);
+                    if items.is_empty() {
+                        continue;
+                    }
+                    handles.push(scope.spawn(move || -> Result<Vec<(Key, StateOp)>> {
+                        let mut sink = Vec::new();
+                        for (key, upd) in items {
+                            apply_group_child(store, cfg, slot, vec![k as u8], &key, &upd, &mut sink, ram)?;
+                        }
+                        Ok(sink)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("apply_block fan-out thread panicked"))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for s in sinks {
+                inv.extend(s);
+            }
+            // Deletions may have emptied top-level slots; keep canonical form
+            // (no 1-child branch) — the same collapse rules as delete_ram's.
+            let survivors = children.iter().filter(|c| c.is_some()).count();
+            if survivors < 2 {
+                if survivors == 0 {
+                    self.upper = RamNode::Empty;
+                } else {
+                    let j = children.iter().position(|c| c.is_some()).unwrap();
+                    let survivor = children[j].take().unwrap();
+                    self.upper = match survivor {
+                        RamChild::Ram(sub) => match *sub {
+                            RamNode::Extension { path: cp, child: cc, .. } => {
+                                let mut p = vec![j as u8];
+                                p.extend_from_slice(&cp);
+                                RamNode::Extension { path: p, child: cc, hash: HashCell::new(None) }
+                            }
+                            b @ RamNode::Branch { .. } => RamNode::Extension {
+                                path: vec![j as u8],
+                                child: Box::new(b),
+                                hash: HashCell::new(None),
+                            },
+                            RamNode::Empty => unreachable!("empty RamNode as a branch child"),
+                        },
+                        other => collapse_root(&self.store, vec![j as u8], other)?,
+                    };
+                }
+            }
+        } else {
+            // Small/odd-shaped tries: the serial descent handles every case
+            // (creation from Empty, extension tops, root collapse).
+            for (key, upd) in net {
+                match apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut inv, ram)? {
+                    RamDelete::Absent | RamDelete::Changed => {}
+                    RamDelete::Removed => self.upper = RamNode::Empty,
+                    RamDelete::Collapsed { edge, survivor } => {
+                        self.upper = collapse_root(&self.store, edge, survivor)?;
+                    }
                 }
             }
         }
