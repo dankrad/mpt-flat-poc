@@ -1521,6 +1521,34 @@ impl FlatMpt {
         Ok(self.root())
     }
 
+    /// Apply one block's state changes — account upserts/deletions, storage
+    /// writes/clears, wipes — and return the new root plus the **inverse block**:
+    /// a [`StateOp`] list that, applied via `apply_block`, restores the exact
+    /// pre-block state (the rollback primitive for reorgs).
+    ///
+    /// Ops are folded to per-account net updates (reth `BundleState` semantics:
+    /// wipe → account outcome → final slot values; last write wins per slot;
+    /// `DeleteAccount` then `SetAccount` is destroy-then-recreate). Each
+    /// account's owning record is parsed and written **once** regardless of how
+    /// many of its slots the block touches.
+    pub fn apply_block(&mut self, ops: Vec<(Key, StateOp)>) -> Result<(Hash, Vec<(Key, StateOp)>)> {
+        let net = normalize_block(ops);
+        let cfg = self.cfg.clone();
+        let ram = self.ram_mode;
+        let mut inv: Vec<(Key, StateOp)> = Vec::new();
+        for (key, upd) in net {
+            match apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut inv, ram)? {
+                RamDelete::Absent | RamDelete::Changed => {}
+                RamDelete::Removed => self.upper = RamNode::Empty,
+                RamDelete::Collapsed { edge, survivor } => {
+                    self.upper = collapse_root(&self.store, edge, survivor)?;
+                }
+            }
+        }
+        self.store.flush()?;
+        Ok((self.root(), inv))
+    }
+
     /// Insert/overwrite many key/value pairs at once. Equivalent in result to
     /// calling [`insert`](Self::insert) for each pair (last value wins on a
     /// duplicate key within the batch), but far cheaper: the trie is updated by
@@ -1920,8 +1948,8 @@ impl FlatMpt {
         let (live_units, free_units) = self.store.live_and_free_units();
         let active = (end * UNITS_PER_PAGE).saturating_sub(free_units).max(1);
         let u = live_units as f64 / active as f64;
-        let adj = ((TARGET_UTIL - u) * GC_GAIN).round() as i64;
-        let r = (self.gc_regions as i64 + adj).clamp(0, GC_R_MAX as i64) as usize;
+        let adj = ((TARGET_UTIL - u) * gc_gain()).round() as i64;
+        let r = (self.gc_regions as i64 + adj).clamp(0, gc_r_max() as i64) as usize;
         self.gc_regions = r;
         r
     }
@@ -2745,7 +2773,7 @@ fn delete_in_child(
                 DeleteOp::Storage(skey) => {
                     let storage_out = {
                         let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
-                        delete_ram(store, cfg, &mut a.storage, Vec::new(), &skey, DeleteOp::Value, ram)?
+                        delete_ram(store, cfg, &mut a.storage, Vec::new(), &skey, DeleteOp::Value, false)?
                     };
                     match storage_out {
                         RamDelete::Absent => Ok(RamDelete::Absent),
@@ -2903,6 +2931,813 @@ fn collapse_root(store: &FlatFile, edge: Vec<u8>, survivor: RamChild) -> Result<
     match promote_record_to_ram(store, subtree)? {
         RamChild::Ram(r) => Ok(*r),
         _ => unreachable!("promote_record_to_ram returns a Ram node"),
+    }
+}
+
+// --- Block-level updates (WP2): per-account net ops + inverse diffs. ---
+
+/// One state-trie operation, keyed by the (hashed) account key — the public
+/// unit of a per-block update ([`FlatMpt::apply_block`]). Shaped after reth's
+/// `BundleState`: per block an account has at most one outcome, a set of final
+/// slot values, and possibly a wipe (selfdestruct / destroy-then-recreate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateOp {
+    /// Create/update the account's fields (storage preserved unless wiped).
+    SetAccount { nonce: u64, balance: U256, code_hash: Hash },
+    /// Remove the account entirely, including its storage.
+    DeleteAccount,
+    /// Clear all storage, keeping the account fields.
+    WipeStorage,
+    /// Set one storage slot (`slot` is the hashed slot key, `value` its RLP).
+    SetStorage { slot: Key, value: Vec<u8> },
+    /// Remove one storage slot.
+    DeleteStorage { slot: Key },
+}
+
+/// An account's per-block outcome after normalization.
+#[derive(Debug, Clone, PartialEq)]
+enum AccountOutcome {
+    Keep,
+    Set { nonce: u64, balance: U256, code_hash: Hash },
+    Delete,
+}
+
+/// One account's net update for a block: wipe → account outcome → final slot
+/// values, in that fixed application order (reth `BundleState` semantics).
+#[derive(Debug, Clone)]
+struct NetUpdate {
+    wipe: bool,
+    account: AccountOutcome,
+    /// Final value per touched slot (`None` = delete). Last write wins.
+    slots: Vec<(Key, Option<Vec<u8>>)>,
+}
+
+impl NetUpdate {
+    /// Whether this update can create structure (a missing account/leaf).
+    fn creates(&self) -> bool {
+        matches!(self.account, AccountOutcome::Set { .. })
+            || self.slots.iter().any(|(_, v)| v.is_some())
+    }
+}
+
+/// Fold a block's op list into per-account net updates. `DeleteAccount`
+/// followed by `SetAccount` in the same block is destroy-then-recreate: the
+/// wipe is kept, earlier slot writes are dropped, the account is re-set.
+fn normalize_block(ops: Vec<(Key, StateOp)>) -> Vec<(Key, NetUpdate)> {
+    let mut map: BTreeMap<Key, NetUpdate> = BTreeMap::new();
+    for (key, op) in ops {
+        let upd = map.entry(key).or_insert(NetUpdate {
+            wipe: false,
+            account: AccountOutcome::Keep,
+            slots: Vec::new(),
+        });
+        match op {
+            StateOp::SetAccount { nonce, balance, code_hash } => {
+                // After an in-block DeleteAccount this is destroy-then-recreate
+                // (the wipe stays set).
+                upd.account = AccountOutcome::Set { nonce, balance, code_hash };
+            }
+            StateOp::DeleteAccount => {
+                upd.account = AccountOutcome::Delete;
+                upd.wipe = true;
+                upd.slots.clear();
+            }
+            StateOp::WipeStorage => {
+                upd.wipe = true;
+                upd.slots.clear();
+            }
+            StateOp::SetStorage { slot, value } => {
+                if upd.account == AccountOutcome::Delete {
+                    // A slot write on the (just-deleted, hence missing) account
+                    // auto-creates an empty one — sequential semantics.
+                    upd.account = AccountOutcome::Set {
+                        nonce: 0,
+                        balance: U256::ZERO,
+                        code_hash: eth::EMPTY_CODE_HASH.0,
+                    };
+                }
+                upd.slots.retain(|(k, _)| *k != slot);
+                upd.slots.push((slot, Some(value)));
+            }
+            StateOp::DeleteStorage { slot } => {
+                if upd.account == AccountOutcome::Delete {
+                    // Deleting a slot of a just-deleted account: nothing to do.
+                    continue;
+                }
+                upd.slots.retain(|(k, _)| *k != slot);
+                upd.slots.push((slot, None));
+            }
+        }
+    }
+    map.into_iter().collect()
+}
+
+/// Pack a full 64-nibble path back into its 32-byte key.
+fn nibbles_to_key(nibbles: &[u8]) -> Key {
+    debug_assert_eq!(nibbles.len(), 64);
+    let mut k = [0u8; 32];
+    for (i, pair) in nibbles.chunks(2).enumerate() {
+        k[i] = (pair[0] << 4) | pair[1];
+    }
+    k
+}
+
+/// Collect every (slot key, RLP value) of a storage subtree rooted at `path`
+/// nibbles (relative to the slot-key root). `Raw` children are parsed
+/// transiently; the subtree is not modified.
+fn collect_storage_subtree(node: &Node, path: &mut Vec<u8>, out: &mut Vec<(Key, Vec<u8>)>) -> Result<()> {
+    match node {
+        Node::Empty => Ok(()),
+        Node::Leaf { path: lp, value, .. } => {
+            let n = path.len();
+            path.extend_from_slice(lp);
+            out.push((nibbles_to_key(path), value.clone()));
+            path.truncate(n);
+            Ok(())
+        }
+        Node::Extension { path: ep, child, .. } => {
+            let n = path.len();
+            path.extend_from_slice(ep);
+            collect_storage_subtree(child, path, out)?;
+            path.truncate(n);
+            Ok(())
+        }
+        Node::Branch { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                if let Some(c) = c {
+                    path.push(i as u8);
+                    collect_storage_subtree(c, path, out)?;
+                    path.pop();
+                }
+            }
+            Ok(())
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let parsed = parse_node_lazy(buf, *off, *len)?;
+            collect_storage_subtree(&parsed, path, out)
+        }
+        Node::Account { .. } | Node::Overflow { .. } => {
+            unreachable!("storage subtrees contain only value nodes")
+        }
+    }
+}
+
+/// Descend a record subtree to the account at `nibbles` and collect all its
+/// storage slots (empty if the account is absent, opaque, or storage-less).
+fn node_collect_storage(node: &Node, nibbles: &[u8], depth: usize) -> Result<Vec<(Key, Vec<u8>)>> {
+    match node {
+        Node::Empty | Node::Leaf { .. } => Ok(Vec::new()),
+        Node::Account { path, storage, .. } => {
+            let mut out = Vec::new();
+            if nibbles[depth..] == path[..] {
+                collect_storage_subtree(storage, &mut Vec::new(), &mut out)?;
+            }
+            Ok(out)
+        }
+        Node::Extension { path, child, .. } => {
+            if nibbles[depth..].starts_with(path) {
+                node_collect_storage(child, nibbles, depth + path.len())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Node::Branch { children, .. } => match children[nibbles[depth] as usize].as_deref() {
+            None => Ok(Vec::new()),
+            Some(child) => node_collect_storage(child, nibbles, depth + 1),
+        },
+        Node::Raw { buf, off, len, .. } => {
+            let parsed = parse_node_lazy(buf, *off, *len)?;
+            node_collect_storage(&parsed, nibbles, depth)
+        }
+        Node::Overflow { .. } => unreachable!("on-disk Overflow under promote-on-max"),
+    }
+}
+
+/// Collect all storage slots of a promoted account's storage frontier (RAM
+/// subtree whose leaves are storage records).
+fn ram_collect_storage(
+    store: &FlatFile,
+    node: &RamNode,
+    path: &mut Vec<u8>,
+    out: &mut Vec<(Key, Vec<u8>)>,
+) -> Result<()> {
+    match node {
+        RamNode::Empty => Ok(()),
+        RamNode::Extension { path: ep, child, .. } => {
+            let n = path.len();
+            path.extend_from_slice(ep);
+            ram_collect_storage(store, child, path, out)?;
+            path.truncate(n);
+            Ok(())
+        }
+        RamNode::Branch { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                let Some(c) = c else { continue };
+                path.push(i as u8);
+                match c {
+                    RamChild::Ram(sub) => ram_collect_storage(store, sub, path, out)?,
+                    RamChild::Disk { ptr, .. } => {
+                        let sub = store.read_lazy(*ptr)?;
+                        // The record's prefix is its absolute (storage-relative)
+                        // position — it already includes this branch path.
+                        let mut p = sub.prefix.clone();
+                        collect_storage_subtree(&sub.node, &mut p, out)?;
+                    }
+                    RamChild::Mem(m) => {
+                        let sub = parse_payload_lazy(m.bytes.clone())?;
+                        let mut p = sub.prefix.clone();
+                        collect_storage_subtree(&sub.node, &mut p, out)?;
+                    }
+                    RamChild::Account(_) => {
+                        unreachable!("no accounts inside a storage frontier")
+                    }
+                }
+                path.pop();
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Prior account fields at `key` inside a record subtree, for inverse ops.
+/// Decodes the leaf RLP — both structured accounts and opaque account leaves
+/// carry `RLP([nonce, balance, storageRoot, codeHash])`.
+fn node_prior_account(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Result<Option<eth::Account>> {
+    match node_get(store, node, nibbles, depth)? {
+        None => Ok(None),
+        Some(rlp) => Ok(Some(eth::Account::decode(&rlp).map_err(|e| anyhow::anyhow!("account leaf did not decode: {e}"))?)),
+    }
+}
+
+/// Apply one account's [`NetUpdate`] inside a record's node tree (all in RAM;
+/// the caller writes the record once), pushing inverse ops for every change.
+/// Order: wipe → account outcome → slots.
+fn apply_net_in_record(
+    store: &FlatFile,
+    cfg: &Config,
+    node: &mut Node,
+    depth: usize,
+    key: &Key,
+    upd: &NetUpdate,
+    inv: &mut Vec<(Key, StateOp)>,
+) -> Result<NodeDelete> {
+    let nibbles = key_nibbles(key);
+    let prior = node_prior_account(store, node, &nibbles, depth)?;
+    // An account created by this block (fields or auto-created by a slot write)
+    // rolls back to *absent*: its inverse is a lone `DeleteAccount`, never
+    // per-slot deletes (those would leave an empty account leaf behind).
+    let created = prior.is_none();
+    let mut changed = false;
+
+    if upd.account == AccountOutcome::Delete {
+        let Some(pf) = prior else { return Ok(NodeDelete::Absent) };
+        // Inverse: recreate with prior fields + every prior slot. (The wipe in
+        // the inverse handles slots the block might have added before deleting.)
+        inv.push((*key, StateOp::WipeStorage));
+        inv.push((
+            *key,
+            StateOp::SetAccount { nonce: pf.nonce, balance: pf.balance, code_hash: pf.code_hash.0 },
+        ));
+        for (skey, v) in node_collect_storage(node, &nibbles, depth)? {
+            inv.push((*key, StateOp::SetStorage { slot: skey, value: v }));
+        }
+        return record_node_delete(node, depth, key, DeleteOp::Account);
+    }
+
+    if upd.wipe {
+        let slots = node_collect_storage(node, &nibbles, depth)?;
+        if !created {
+            inv.push((*key, StateOp::WipeStorage));
+            for (skey, v) in slots.iter() {
+                inv.push((*key, StateOp::SetStorage { slot: *skey, value: v.clone() }));
+            }
+        }
+        if !slots.is_empty() {
+            record_node_delete(node, depth, key, DeleteOp::WipeStorage)?;
+            changed = true;
+        }
+    }
+
+    if let AccountOutcome::Set { nonce, balance, code_hash } = upd.account {
+        if let Some(pf) = &prior {
+            inv.push((
+                *key,
+                StateOp::SetAccount { nonce: pf.nonce, balance: pf.balance, code_hash: pf.code_hash.0 },
+            ));
+        }
+        record_node_insert(store, cfg, node, depth, *key, LeafOp::Account { nonce, balance, code_hash })?;
+        changed = true;
+    }
+
+    for (skey, val) in &upd.slots {
+        let prior_slot = node_get_storage(store, node, &nibbles, depth, skey)?;
+        if !created {
+            match (&prior_slot, val) {
+                (Some(pv), _) => {
+                    inv.push((*key, StateOp::SetStorage { slot: *skey, value: pv.clone() }))
+                }
+                (None, Some(_)) => inv.push((*key, StateOp::DeleteStorage { slot: *skey })),
+                (None, None) => {}
+            }
+        }
+        match val {
+            Some(v) => {
+                record_node_insert(
+                    store,
+                    cfg,
+                    node,
+                    depth,
+                    *key,
+                    LeafOp::Storage { slot: *skey, value: v.clone() },
+                )?;
+                changed = true;
+            }
+            None => {
+                if !matches!(
+                    record_node_delete(node, depth, key, DeleteOp::Storage(*skey))?,
+                    NodeDelete::Absent
+                ) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    if created && changed {
+        inv.push((*key, StateOp::DeleteAccount));
+    }
+    Ok(if changed { NodeDelete::Changed } else { NodeDelete::Absent })
+}
+
+/// Build a fresh child record for an account that doesn't exist yet, applying
+/// the whole net update to an empty node. `None` if nothing was created.
+fn creation_child(
+    store: &FlatFile,
+    cfg: &Config,
+    child_prefix: Vec<u8>,
+    key: &Key,
+    upd: &NetUpdate,
+    inv: &mut Vec<(Key, StateOp)>,
+    ram: bool,
+) -> Result<Option<RamChild>> {
+    let mut node = Node::Empty;
+    apply_net_in_record(store, cfg, &mut node, child_prefix.len(), key, upd, inv)?;
+    if matches!(node, Node::Empty) {
+        return Ok(None);
+    }
+    let subtree = DiskSubtree { prefix: child_prefix, node };
+    Ok(Some(finish_child(store, cfg, subtree, ram)?))
+}
+
+/// Turn a rebuilt subtree into a frontier child: promote if over the caps,
+/// otherwise write it as one record (or a `Mem` leaf in RAM-build mode).
+fn finish_child(store: &FlatFile, cfg: &Config, subtree: DiskSubtree, ram: bool) -> Result<RamChild> {
+    if should_promote(cfg, &subtree) {
+        if ram { promote_to_mem(subtree) } else { promote_record_to_ram(store, subtree) }
+    } else if should_promote_account(cfg, &subtree) {
+        promote_account_to_ram(store, subtree)
+    } else {
+        make_leaf_child(store, ram, subtree)
+    }
+}
+
+/// Apply one account's net update through the frontier — insert and delete
+/// fused: descends like [`insert_ram`], creating structure where the update
+/// creates (splits), and collapses like [`delete_ram`] where it removes.
+fn apply_ram_group(
+    store: &FlatFile,
+    cfg: &Config,
+    node: &mut RamNode,
+    prefix: Vec<u8>,
+    key: &Key,
+    upd: &NetUpdate,
+    inv: &mut Vec<(Key, StateOp)>,
+    ram: bool,
+) -> Result<RamDelete> {
+    let nibbles = key_nibbles(key);
+    match std::mem::replace(node, RamNode::Empty) {
+        RamNode::Empty => {
+            if !upd.creates() {
+                return Ok(RamDelete::Absent);
+            }
+            let idx = nibbles[prefix.len()] as usize;
+            let mut child_prefix = prefix;
+            child_prefix.push(idx as u8);
+            let Some(child) = creation_child(store, cfg, child_prefix, key, upd, inv, ram)? else {
+                return Ok(RamDelete::Absent);
+            };
+            let mut children = empty_children();
+            children[idx] = Some(child);
+            *node = RamNode::Branch { children, hash: HashCell::new(None) };
+            Ok(RamDelete::Changed)
+        }
+        RamNode::Extension { path, mut child, hash } => {
+            let common = common_prefix(&path, &nibbles[prefix.len()..]);
+            if common < path.len() {
+                // Diverges inside the extension: only a creating update changes
+                // anything (the key is absent otherwise). Mirror insert_ram's split.
+                if !upd.creates() {
+                    *node = RamNode::Extension { path, child, hash };
+                    return Ok(RamDelete::Absent);
+                }
+                let mut children = empty_children();
+                let old_idx = path[common] as usize;
+                let old_remainder = path[common + 1..].to_vec();
+                children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
+                    child
+                } else {
+                    Box::new(RamNode::Extension {
+                        path: old_remainder,
+                        child,
+                        hash: HashCell::new(None),
+                    })
+                }));
+                let new_idx = nibbles[prefix.len() + common] as usize;
+                let mut new_prefix = prefix.clone();
+                new_prefix.extend_from_slice(&path[..common]);
+                new_prefix.push(new_idx as u8);
+                children[new_idx] = creation_child(store, cfg, new_prefix, key, upd, inv, ram)?;
+                let branch = RamNode::Branch { children, hash: HashCell::new(None) };
+                *node = if common == 0 {
+                    branch
+                } else {
+                    RamNode::Extension {
+                        path: path[..common].to_vec(),
+                        child: Box::new(branch),
+                        hash: HashCell::new(None),
+                    }
+                };
+                return Ok(RamDelete::Changed);
+            }
+            let mut next = prefix;
+            next.extend_from_slice(&path);
+            match apply_ram_group(store, cfg, &mut child, next, key, upd, inv, ram)? {
+                RamDelete::Absent => {
+                    *node = RamNode::Extension { path, child, hash };
+                    Ok(RamDelete::Absent)
+                }
+                RamDelete::Removed => Ok(RamDelete::Removed),
+                RamDelete::Collapsed { edge, survivor } => {
+                    let mut full = path;
+                    full.extend_from_slice(&edge);
+                    Ok(RamDelete::Collapsed { edge: full, survivor })
+                }
+                RamDelete::Changed => {
+                    *node = match *child {
+                        RamNode::Extension { path: cp, child: cc, .. } => {
+                            let mut p = path;
+                            p.extend_from_slice(&cp);
+                            RamNode::Extension { path: p, child: cc, hash: HashCell::new(None) }
+                        }
+                        other => RamNode::Extension {
+                            path,
+                            child: Box::new(other),
+                            hash: HashCell::new(None),
+                        },
+                    };
+                    Ok(RamDelete::Changed)
+                }
+            }
+        }
+        RamNode::Branch { mut children, hash } => {
+            let idx = nibbles[prefix.len()] as usize;
+            let mut child_prefix = prefix;
+            child_prefix.push(idx as u8);
+            let out =
+                apply_group_child(store, cfg, &mut children[idx], child_prefix, key, upd, inv, ram)?;
+            match out {
+                RamDelete::Absent => {
+                    *node = RamNode::Branch { children, hash };
+                    Ok(RamDelete::Absent)
+                }
+                RamDelete::Changed => {
+                    hash.set(None);
+                    *node = RamNode::Branch { children, hash };
+                    Ok(RamDelete::Changed)
+                }
+                RamDelete::Collapsed { .. } => {
+                    unreachable!("collapse is materialized in apply_group_child")
+                }
+                RamDelete::Removed => {
+                    let survivors = children.iter().filter(|c| c.is_some()).count();
+                    match survivors {
+                        0 => Ok(RamDelete::Removed),
+                        1 => {
+                            let j = children.iter().position(|c| c.is_some()).unwrap();
+                            let survivor = children[j].take().unwrap();
+                            match survivor {
+                                RamChild::Ram(sub) => {
+                                    *node = match *sub {
+                                        RamNode::Extension { path: cp, child: cc, .. } => {
+                                            let mut p = vec![j as u8];
+                                            p.extend_from_slice(&cp);
+                                            RamNode::Extension {
+                                                path: p,
+                                                child: cc,
+                                                hash: HashCell::new(None),
+                                            }
+                                        }
+                                        b @ RamNode::Branch { .. } => RamNode::Extension {
+                                            path: vec![j as u8],
+                                            child: Box::new(b),
+                                            hash: HashCell::new(None),
+                                        },
+                                        RamNode::Empty => {
+                                            unreachable!("empty RamNode as a branch child")
+                                        }
+                                    };
+                                    Ok(RamDelete::Changed)
+                                }
+                                other => Ok(RamDelete::Collapsed {
+                                    edge: vec![j as u8],
+                                    survivor: other,
+                                }),
+                            }
+                        }
+                        _ => {
+                            hash.set(None);
+                            *node = RamNode::Branch { children, hash };
+                            Ok(RamDelete::Changed)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply one account's net update to a frontier branch slot: parse the owning
+/// record once, run the whole update on it, write it back once (or promote /
+/// remove / demote). The fused insert+delete mirror of `insert_into_child` /
+/// `delete_in_child`.
+#[allow(clippy::too_many_arguments)]
+fn apply_group_child(
+    store: &FlatFile,
+    cfg: &Config,
+    slot: &mut Option<RamChild>,
+    child_prefix: Vec<u8>,
+    key: &Key,
+    upd: &NetUpdate,
+    inv: &mut Vec<(Key, StateOp)>,
+    ram: bool,
+) -> Result<RamDelete> {
+    match slot {
+        None => {
+            if !upd.creates() {
+                return Ok(RamDelete::Absent);
+            }
+            match creation_child(store, cfg, child_prefix, key, upd, inv, ram)? {
+                Some(child) => {
+                    *slot = Some(child);
+                    Ok(RamDelete::Changed)
+                }
+                None => Ok(RamDelete::Absent),
+            }
+        }
+        Some(RamChild::Ram(sub)) => {
+            match apply_ram_group(store, cfg, sub, child_prefix.clone(), key, upd, inv, ram)? {
+                RamDelete::Absent => Ok(RamDelete::Absent),
+                RamDelete::Changed => Ok(RamDelete::Changed),
+                RamDelete::Removed => {
+                    *slot = None;
+                    Ok(RamDelete::Removed)
+                }
+                RamDelete::Collapsed { edge, survivor } => {
+                    *slot = Some(rehome_child(store, ram, survivor, &edge, child_prefix)?);
+                    Ok(RamDelete::Changed)
+                }
+            }
+        }
+        Some(RamChild::Mem(_)) => {
+            let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
+            let bytes = m.bytes.clone();
+            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let depth = subtree.prefix.len();
+            match apply_net_in_record(store, cfg, &mut subtree.node, depth, key, upd, inv)? {
+                NodeDelete::Absent => {
+                    *slot = Some(RamChild::Mem(MemLeaf { bytes, root: m.root }));
+                    Ok(RamDelete::Absent)
+                }
+                NodeDelete::Changed => {
+                    *slot = Some(finish_child(store, cfg, subtree, true)?);
+                    Ok(RamDelete::Changed)
+                }
+                NodeDelete::Removed => Ok(RamDelete::Removed),
+            }
+        }
+        Some(RamChild::Disk { .. }) => {
+            let Some(RamChild::Disk { ptr: old_ptr, root: old_root }) = *slot else {
+                unreachable!()
+            };
+            let mut subtree = store.read_lazy(old_ptr)?;
+            match apply_net_in_record(store, cfg, &mut subtree.node, subtree.prefix.len(), key, upd, inv)? {
+                NodeDelete::Absent => {
+                    *slot = Some(RamChild::Disk { ptr: old_ptr, root: old_root });
+                    Ok(RamDelete::Absent)
+                }
+                NodeDelete::Changed => {
+                    store.free(old_ptr);
+                    *slot = Some(finish_child(store, cfg, subtree, ram)?);
+                    Ok(RamDelete::Changed)
+                }
+                NodeDelete::Removed => {
+                    store.free(old_ptr);
+                    *slot = None;
+                    Ok(RamDelete::Removed)
+                }
+            }
+        }
+        Some(RamChild::Account(_)) => {
+            let nibbles = key_nibbles(key);
+            let diverges = {
+                let Some(RamChild::Account(a)) = slot.as_ref() else { unreachable!() };
+                nibbles[child_prefix.len()..] != a.path[..]
+            };
+            if diverges {
+                if !upd.creates() {
+                    return Ok(RamDelete::Absent);
+                }
+                // A different account: split into a frontier branch (mirror of
+                // insert_into_child's promoted-account split).
+                let Some(RamChild::Account(mut a)) = slot.take() else { unreachable!() };
+                let common = common_prefix(&a.path, &nibbles[child_prefix.len()..]);
+                let mut children = empty_children();
+                let old_idx = a.path[common] as usize;
+                let split_path = a.path[..common].to_vec();
+                a.path = a.path[common + 1..].to_vec();
+                children[old_idx] = Some(RamChild::Account(a));
+                let new_idx = nibbles[child_prefix.len() + common] as usize;
+                let mut new_prefix = child_prefix.clone();
+                new_prefix.extend_from_slice(
+                    &nibbles[child_prefix.len()..child_prefix.len() + common + 1],
+                );
+                children[new_idx] = creation_child(store, cfg, new_prefix, key, upd, inv, ram)?;
+                let branch = RamNode::Branch { children, hash: HashCell::new(None) };
+                *slot = Some(if common == 0 {
+                    RamChild::Ram(Box::new(branch))
+                } else {
+                    RamChild::Ram(Box::new(RamNode::Extension {
+                        path: split_path,
+                        child: Box::new(branch),
+                        hash: HashCell::new(None),
+                    }))
+                });
+                return Ok(RamDelete::Changed);
+            }
+
+            // Same account. Handle delete / wipe / field+slot updates on the
+            // promoted form, demoting to a plain record when storage collapses.
+            if upd.account == AccountOutcome::Delete {
+                let Some(RamChild::Account(a)) = slot.take() else { unreachable!() };
+                inv.push((*key, StateOp::WipeStorage));
+                inv.push((
+                    *key,
+                    StateOp::SetAccount {
+                        nonce: a.nonce,
+                        balance: U256::from_be_bytes(a.balance),
+                        code_hash: a.code_hash,
+                    },
+                ));
+                let mut slots = Vec::new();
+                ram_collect_storage(store, &a.storage, &mut Vec::new(), &mut slots)?;
+                for (skey, v) in slots {
+                    inv.push((*key, StateOp::SetStorage { slot: skey, value: v }));
+                }
+                free_ram_records(store, &a.storage);
+                return Ok(RamDelete::Removed);
+            }
+
+            if upd.wipe {
+                // Wipe (possibly + recreate): capture all slots, drop the
+                // storage frontier, and continue in record form.
+                let Some(RamChild::Account(a)) = slot.take() else { unreachable!() };
+                inv.push((*key, StateOp::WipeStorage));
+                inv.push((
+                    *key,
+                    StateOp::SetAccount {
+                        nonce: a.nonce,
+                        balance: U256::from_be_bytes(a.balance),
+                        code_hash: a.code_hash,
+                    },
+                ));
+                let mut slots = Vec::new();
+                ram_collect_storage(store, &a.storage, &mut Vec::new(), &mut slots)?;
+                for (skey, v) in slots {
+                    inv.push((*key, StateOp::SetStorage { slot: skey, value: v }));
+                }
+                free_ram_records(store, &a.storage);
+                let mut node = account_node(
+                    a.path,
+                    a.nonce,
+                    U256::from_be_bytes(a.balance),
+                    a.code_hash,
+                    Node::Empty,
+                );
+                // Remaining parts of the update (fields + fresh slots) run on the
+                // record form; inverses were fully captured above.
+                let rest = NetUpdate { wipe: false, account: upd.account.clone(), slots: upd.slots.clone() };
+                let mut sink = Vec::new();
+                apply_net_in_record(store, cfg, &mut node, child_prefix.len(), key, &rest, &mut sink)?;
+                let subtree = DiskSubtree { prefix: child_prefix, node };
+                *slot = Some(finish_child(store, cfg, subtree, ram)?);
+                return Ok(RamDelete::Changed);
+            }
+
+            let mut changed = false;
+            if let AccountOutcome::Set { nonce, balance, code_hash } = upd.account {
+                let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
+                inv.push((
+                    *key,
+                    StateOp::SetAccount {
+                        nonce: a.nonce,
+                        balance: U256::from_be_bytes(a.balance),
+                        code_hash: a.code_hash,
+                    },
+                ));
+                a.nonce = nonce;
+                a.balance = balance.to_be_bytes::<32>();
+                a.code_hash = code_hash;
+                changed = true;
+            }
+            for (i, (skey, val)) in upd.slots.iter().enumerate() {
+                let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
+                let prior_slot = ram_get(store, &a.storage, &key_nibbles(skey), 0)?;
+                match (&prior_slot, val) {
+                    (Some(pv), _) => {
+                        inv.push((*key, StateOp::SetStorage { slot: *skey, value: pv.clone() }))
+                    }
+                    (None, Some(_)) => inv.push((*key, StateOp::DeleteStorage { slot: *skey })),
+                    (None, None) => {}
+                }
+                match val {
+                    Some(v) => {
+                        insert_ram(
+                            store,
+                            cfg,
+                            &mut a.storage,
+                            Vec::new(),
+                            *skey,
+                            LeafOp::Value(v.clone()),
+                            false,
+                        )?;
+                        changed = true;
+                    }
+                    None => {
+                        match delete_ram(
+                            store,
+                            cfg,
+                            &mut a.storage,
+                            Vec::new(),
+                            skey,
+                            DeleteOp::Value,
+                            false,
+                        )? {
+                            RamDelete::Absent => {}
+                            RamDelete::Changed => changed = true,
+                            out @ (RamDelete::Removed | RamDelete::Collapsed { .. }) => {
+                                // Storage fell below the promoted form: demote and
+                                // run the remaining slot ops on the record form.
+                                changed = true;
+                                let Some(RamChild::Account(a)) = slot.take() else {
+                                    unreachable!()
+                                };
+                                let storage_node = match out {
+                                    RamDelete::Removed => Node::Empty,
+                                    RamDelete::Collapsed { edge, survivor } => {
+                                        materialize_storage_survivor(store, survivor, &edge)?
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                let mut node = account_node(
+                                    a.path,
+                                    a.nonce,
+                                    U256::from_be_bytes(a.balance),
+                                    a.code_hash,
+                                    storage_node,
+                                );
+                                let rest = NetUpdate {
+                                    wipe: false,
+                                    account: AccountOutcome::Keep,
+                                    slots: upd.slots[i + 1..].to_vec(),
+                                };
+                                apply_net_in_record(
+                                    store,
+                                    cfg,
+                                    &mut node,
+                                    child_prefix.len(),
+                                    key,
+                                    &rest,
+                                    inv,
+                                )?;
+                                let subtree = DiskSubtree { prefix: child_prefix, node };
+                                *slot = Some(finish_child(store, cfg, subtree, ram)?);
+                                return Ok(RamDelete::Changed);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(if changed { RamDelete::Changed } else { RamDelete::Absent })
+        }
     }
 }
 
@@ -3199,6 +4034,11 @@ fn apply_op(store: &FlatFile, cfg: &Config, old: Node, path: Vec<u8>, op: LeafOp
     Ok(match (old, op) {
         // Overwrite a value leaf.
         (Node::Leaf { .. }, LeafOp::Value(value)) => leaf_node(path, value),
+        // Replace an opaque (value-leaf) account with a structured one; its
+        // unknown storage is dropped — the caller now owns the storage contents.
+        (Node::Leaf { .. }, LeafOp::Account { nonce, balance, code_hash }) => {
+            account_node(path, nonce, balance, code_hash, Node::Empty)
+        }
         // Update account fields, keeping the existing storage subtree.
         (Node::Account { storage, .. }, LeafOp::Account { nonce, balance, code_hash }) => {
             account_node(path, nonce, balance, code_hash, *storage)
@@ -3650,6 +4490,34 @@ fn gc_opp_util() -> f64 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.30)
+    })
+}
+
+/// Per-batch cap on regions the global reclaim controller may evacuate. Defaults
+/// to `GC_R_MAX`; raise via `MPT_GC_R_MAX` for high-write-amp bulk loads (e.g. a
+/// sorted mainnet reconstruction) where a batch creates more garbage than the
+/// default 1 GiB/batch cap can reclaim, so the file would otherwise grow unbounded.
+fn gc_r_max() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPT_GC_R_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GC_R_MAX)
+    })
+}
+
+/// Proportional gain for the GC rate controller. Defaults to `GC_GAIN`; raise via
+/// `MPT_GC_GAIN` to ramp the cleaning rate to its cap in fewer batches.
+fn gc_gain() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPT_GC_GAIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GC_GAIN)
     })
 }
 
@@ -6248,5 +7116,256 @@ mod tests {
         mpt.delete(k).unwrap();
         live.remove(&k);
         assert_eq!(mpt.root(), oracle(&live), "delete after reopen");
+    }
+
+    /// WP2 gate: randomized block-shaped updates (account upserts/deletes, slot
+    /// writes/clears, wipes, destroy-then-recreate) must (a) match the oracle
+    /// root after every block and (b) round-trip through the inverse diff —
+    /// applying the returned inverse restores the exact pre-block root, and
+    /// re-applying the block restores the post-block root. Small caps force a
+    /// promoted contract, so demotion/re-promotion are in the loop.
+    #[test]
+    fn apply_block_matches_oracle_and_inverts() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Default)]
+        struct MAcct {
+            nonce: u64,
+            balance: U256,
+            code_hash: Hash,
+            slots: BTreeMap<Key, Vec<u8>>,
+        }
+        type Model = BTreeMap<Key, MAcct>;
+
+        let oracle = |m: &Model| -> Hash {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = m
+                .iter()
+                .map(|(k, a)| {
+                    let storage_root = if a.slots.is_empty() {
+                        eth::EMPTY_ROOT
+                    } else {
+                        let se: Vec<(Vec<u8>, Vec<u8>)> =
+                            a.slots.iter().map(|(sk, v)| (sk.to_vec(), v.clone())).collect();
+                        eth::root(&se)
+                    };
+                    let acct = eth::Account {
+                        nonce: a.nonce,
+                        balance: a.balance,
+                        storage_root,
+                        code_hash: B256::from(a.code_hash),
+                    };
+                    (k.to_vec(), acct.rlp())
+                })
+                .collect();
+            eth::root(&entries).0
+        };
+
+        // Apply ops to the model with the same net semantics as the engine.
+        let model_apply = |m: &mut Model, ops: &[(Key, StateOp)]| {
+            for (k, op) in ops {
+                match op {
+                    StateOp::SetAccount { nonce, balance, code_hash } => {
+                        let a = m.entry(*k).or_default();
+                        a.nonce = *nonce;
+                        a.balance = *balance;
+                        a.code_hash = *code_hash;
+                    }
+                    StateOp::DeleteAccount => {
+                        m.remove(k);
+                    }
+                    StateOp::WipeStorage => {
+                        if let Some(a) = m.get_mut(k) {
+                            a.slots.clear();
+                        }
+                    }
+                    StateOp::SetStorage { slot, value } => {
+                        // A slot write on a missing account auto-creates an empty
+                        // account — with EMPTY_CODE_HASH, like the engine.
+                        let a = m.entry(*k).or_insert_with(|| MAcct {
+                            code_hash: eth::EMPTY_CODE_HASH.0,
+                            ..Default::default()
+                        });
+                        a.slots.insert(*slot, value.clone());
+                    }
+                    StateOp::DeleteStorage { slot } => {
+                        if let Some(a) = m.get_mut(k) {
+                            a.slots.remove(slot);
+                        }
+                    }
+                }
+            }
+        };
+
+        let cfg =
+            Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut mpt = db(cfg);
+        let mut rng = StdRng::seed_from_u64(0xB10C);
+        let mut model: Model = BTreeMap::new();
+
+        let rand_key = |rng: &mut StdRng| -> Key {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            k
+        };
+        let rand_val = |rng: &mut StdRng| -> Vec<u8> {
+            let len = rng.gen_range(1..=40);
+            (0..len).map(|_| rng.r#gen()).collect()
+        };
+
+        // Seed: 40 plain accounts + one big contract (promotes at these caps).
+        let mut seed_ops: Vec<(Key, StateOp)> = Vec::new();
+        let mut keys: Vec<Key> = Vec::new();
+        for i in 0..40u64 {
+            let k = rand_key(&mut rng);
+            keys.push(k);
+            seed_ops.push((
+                k,
+                StateOp::SetAccount { nonce: i, balance: U256::from(i * 7), code_hash: [0; 32] },
+            ));
+        }
+        let big = rand_key(&mut rng);
+        keys.push(big);
+        seed_ops.push((
+            big,
+            StateOp::SetAccount { nonce: 1, balance: U256::from(5u64), code_hash: [1; 32] },
+        ));
+        let mut big_slots: Vec<Key> = Vec::new();
+        for _ in 0..300 {
+            let sk = rand_key(&mut rng);
+            big_slots.push(sk);
+            seed_ops.push((big, StateOp::SetStorage { slot: sk, value: rand_val(&mut rng) }));
+        }
+        model_apply(&mut model, &seed_ops);
+        let (root, _) = mpt.apply_block(seed_ops).unwrap();
+        assert_eq!(root, oracle(&model), "seed block");
+
+        // Randomized blocks with a full inverse round-trip on each.
+        for blk in 0..12 {
+            let pre_root = mpt.root();
+            let mut ops: Vec<(Key, StateOp)> = Vec::new();
+            for _ in 0..rng.gen_range(20..60u32) {
+                match rng.gen_range(0..100u32) {
+                    // New account, sometimes with storage.
+                    0..=14 => {
+                        let k = rand_key(&mut rng);
+                        keys.push(k);
+                        ops.push((
+                            k,
+                            StateOp::SetAccount {
+                                nonce: 1,
+                                balance: U256::from(rng.r#gen::<u64>()),
+                                code_hash: [0; 32],
+                            },
+                        ));
+                        for _ in 0..rng.gen_range(0..5u32) {
+                            ops.push((
+                                k,
+                                StateOp::SetStorage {
+                                    slot: rand_key(&mut rng),
+                                    value: rand_val(&mut rng),
+                                },
+                            ));
+                        }
+                    }
+                    // Field update on an existing key.
+                    15..=39 => {
+                        let k = keys[rng.gen_range(0..keys.len())];
+                        ops.push((
+                            k,
+                            StateOp::SetAccount {
+                                nonce: rng.r#gen::<u32>() as u64,
+                                balance: U256::from(rng.r#gen::<u64>()),
+                                code_hash: [0; 32],
+                            },
+                        ));
+                    }
+                    // Slot churn on the big contract (sets + deletes).
+                    40..=69 => {
+                        if rng.gen_bool(0.6) || big_slots.is_empty() {
+                            let sk = rand_key(&mut rng);
+                            big_slots.push(sk);
+                            ops.push((
+                                big,
+                                StateOp::SetStorage { slot: sk, value: rand_val(&mut rng) },
+                            ));
+                        } else {
+                            let sk = big_slots[rng.gen_range(0..big_slots.len())];
+                            ops.push((big, StateOp::DeleteStorage { slot: sk }));
+                        }
+                    }
+                    // Slot write on a random account.
+                    70..=84 => {
+                        let k = keys[rng.gen_range(0..keys.len())];
+                        if k != big {
+                            ops.push((
+                                k,
+                                StateOp::SetStorage {
+                                    slot: rand_key(&mut rng),
+                                    value: rand_val(&mut rng),
+                                },
+                            ));
+                        }
+                    }
+                    // Wipe a contract's storage.
+                    85..=89 => {
+                        let k = keys[rng.gen_range(0..keys.len())];
+                        ops.push((k, StateOp::WipeStorage));
+                    }
+                    // Destroy-then-recreate in one block.
+                    90..=93 => {
+                        let k = keys[rng.gen_range(0..keys.len())];
+                        ops.push((k, StateOp::DeleteAccount));
+                        ops.push((
+                            k,
+                            StateOp::SetAccount {
+                                nonce: 0,
+                                balance: U256::from(1u64),
+                                code_hash: [0; 32],
+                            },
+                        ));
+                        ops.push((
+                            k,
+                            StateOp::SetStorage {
+                                slot: rand_key(&mut rng),
+                                value: rand_val(&mut rng),
+                            },
+                        ));
+                    }
+                    // Plain deletion (keep a floor of live accounts).
+                    _ => {
+                        if model.len() > 20 {
+                            let k = keys[rng.gen_range(0..keys.len())];
+                            ops.push((k, StateOp::DeleteAccount));
+                        }
+                    }
+                }
+            }
+
+            // Debug bisect: apply per-op with oracle checks (single-op blocks are
+            // sequentially equivalent to the model).
+            if std::env::var("MPT_TEST_PEROP").as_deref() == Ok("1") {
+                for (i, (k, op)) in ops.iter().enumerate() {
+                    let one = vec![(*k, op.clone())];
+                    let (r, _) = mpt.apply_block(one.clone()).unwrap();
+                    model_apply(&mut model, &one);
+                    assert_eq!(r, oracle(&model), "block {blk} op {i}: {op:?} key {}", hex(*k));
+                }
+                continue;
+            }
+            let (post_root, inverse) = mpt.apply_block(ops.clone()).unwrap();
+            model_apply(&mut model, &ops);
+            assert_eq!(post_root, oracle(&model), "block {blk} vs oracle");
+
+            // Rollback restores the pre-block root; re-apply restores post.
+            let (rolled, _) = mpt.apply_block(inverse).unwrap();
+            assert_eq!(rolled, pre_root, "block {blk} inverse");
+            let (again, _) = mpt.apply_block(ops).unwrap();
+            assert_eq!(again, post_root, "block {blk} re-apply");
+        }
+
+        // Liveness stayed consistent through the whole churn.
+        let (alloc_live, true_live) = mpt.audit_live_units();
+        assert_eq!(alloc_live, true_live, "allocator vs frontier liveness");
     }
 }
