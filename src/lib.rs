@@ -523,6 +523,14 @@ struct RegionAlloc {
     next_page: u64,
     /// Fully-dead regions, reusable as the next head.
     free_regions: Vec<u64>,
+    /// Regions (re)opened for writing since the last successful persist —
+    /// nothing the last durable manifest references lives in them, so they may
+    /// be recycled immediately when they die.
+    fresh: Vec<bool>,
+    /// Dead regions that WERE referenced by the last durable manifest: they
+    /// must not be overwritten until the next persist lands (crash safety —
+    /// the checkpoint must stay readable). Drained to `free_regions` then.
+    quarantine: Vec<u64>,
 }
 
 impl RegionAlloc {
@@ -531,6 +539,9 @@ impl RegionAlloc {
     }
 
     fn ensure_region(&mut self, r: u64) {
+        if r as usize >= self.fresh.len() {
+            self.fresh.resize(r as usize + 1, false);
+        }
         if r as usize >= self.live.len() {
             self.live.resize(r as usize + 1, 0);
             self.epoch_of.resize(r as usize + 1, 0);
@@ -553,6 +564,7 @@ impl RegionAlloc {
         self.next_page = r * REGION_PAGES;
         self.ensure_region(r);
         self.epoch_of[r as usize] = self.epoch;
+        self.fresh[r as usize] = true;
     }
 
     /// Reserve a page-aligned run of `run_pages` pages at the head (the physical
@@ -585,8 +597,25 @@ impl RegionAlloc {
         let was = self.live[r];
         self.live[r] = was.saturating_sub(units);
         if was > 0 && self.live[r] == 0 && r as u64 != self.head_region {
-            self.free_regions.push(r as u64);
+            if self.fresh.get(r).copied().unwrap_or(false) {
+                // Born after the last persist: the durable manifest cannot
+                // reference it — recycle immediately.
+                self.free_regions.push(r as u64);
+            } else {
+                // Referenced by the last checkpoint: quarantine until the next
+                // persist so a crash always reopens a fully intact checkpoint.
+                self.quarantine.push(r as u64);
+            }
         }
+    }
+
+    /// After a successful persist: everything the quarantine holds is dead per
+    /// the NEW manifest too, so it becomes reusable; and all regions written
+    /// this window are now referenced by the new manifest, so they lose their
+    /// fresh status.
+    fn on_persisted(&mut self) {
+        self.free_regions.append(&mut self.quarantine);
+        self.fresh.fill(false);
     }
 
     fn live_units(&self) -> u64 {
@@ -1430,13 +1459,21 @@ impl FlatMpt {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let meta = meta_path(path);
-        let bytes = std::fs::read(&meta)
-            .map_err(|e| anyhow!("no manifest at {}: {e}", meta.display()))?;
+        // Checksum-validated manifest; a torn/corrupt one falls back to the
+        // previous generation kept by persist().
         let Manifest {
             cfg,
             upper,
             end_page,
-        } = bincode::deserialize(&bytes)?;
+        } = match read_manifest(&meta) {
+            Ok(m) => m,
+            Err(e) => {
+                let prev = meta_prev_path(path);
+                read_manifest(&prev).map_err(|_| {
+                    anyhow!("no usable manifest at {} ({e}) or {}", meta.display(), prev.display())
+                })?
+            }
+        };
 
         // Build the store first (reads need the file), then rebuild per-region
         // liveness by walking the frontier AND descending into each record's
@@ -1500,14 +1537,34 @@ impl FlatMpt {
             upper: &self.upper,
             end_page: self.store.end_page(),
         };
-        let bytes = bincode::serialize(&manifest)?;
+        // Checksum trailer: a torn/partial manifest is detected at open (which
+        // then falls back to the previous generation).
+        let mut bytes = bincode::serialize(&manifest)?;
+        let sum = keccak(&bytes);
+        bytes.extend_from_slice(&sum);
 
         let meta = meta_path(&self.path);
         let mut tmp = meta.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, &bytes)?;
+        // Keep the previous generation as a fallback (hard link: no copy).
+        let prev = meta_prev_path(&self.path);
+        let _ = std::fs::remove_file(&prev);
+        let _ = std::fs::hard_link(&meta, &prev);
+        // write tmp -> fsync tmp -> rename -> fsync dir: the rename is the
+        // atomic commit point and survives power loss.
+        {
+            let mut f = File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &meta)?;
+        if let Some(dir) = meta.parent() {
+            File::open(dir)?.sync_all()?;
+        }
+        // Only now is the new checkpoint durable: quarantined regions become
+        // reusable, and this window's regions lose their fresh status.
+        self.store.seg.lock().unwrap().on_persisted();
         Ok(())
     }
 
@@ -2495,6 +2552,26 @@ fn node_get_storage(
 }
 
 /// Sibling path for the manifest, e.g. `db.flat` -> `db.flat.meta`.
+fn meta_prev_path(path: &Path) -> PathBuf {
+    let mut p = meta_path(path).into_os_string();
+    p.push(".prev");
+    PathBuf::from(p)
+}
+
+/// Read + validate a manifest: checksum-trailer format first, then the legacy
+/// (trailer-less) format for pre-existing checkpoints.
+fn read_manifest(meta: &Path) -> Result<Manifest> {
+    let bytes = std::fs::read(meta)?;
+    if bytes.len() > 32 {
+        let (body, trailer) = bytes.split_at(bytes.len() - 32);
+        if keccak(body)[..] == trailer[..] {
+            return Ok(bincode::deserialize(body)?);
+        }
+    }
+    // Legacy manifest (no trailer) — or corruption, which bincode will reject.
+    Ok(bincode::deserialize(&bytes)?)
+}
+
 fn meta_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".meta");
@@ -7723,6 +7800,105 @@ mod tests {
             Some(eth::storage_value_rlp(U256::from(30u64))),
             "promoted-storage slot after spill + reopen"
         );
+    }
+
+    /// Crash safety: a crash between checkpoints (simulated by dropping without
+    /// persist after heavy churn) must leave the last checkpoint fully
+    /// readable. Guards the generational-reclamation rule — a region referenced
+    /// by the last durable manifest is never recycled before the next persist.
+    #[test]
+    fn crash_between_checkpoints_keeps_checkpoint_readable() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false); // maximize disk churn → region recycling pressure
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash.flat");
+        let cfg =
+            Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut db = FlatMpt::create(&path, cfg).unwrap();
+
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xC4A5);
+        let mut keys: Vec<Key> = Vec::new();
+        let mut seed: Vec<(Key, StateOp)> = Vec::new();
+        for i in 0..4000u64 {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            keys.push(k);
+            seed.push((k, StateOp::SetAccount {
+                nonce: i,
+                balance: U256::from(i * 13),
+                code_hash: [3u8; 32],
+            }));
+        }
+        db.apply_block(seed).unwrap();
+        db.persist().unwrap();
+        let ckpt_root = db.root();
+
+        // Heavy churn with NO persist: every round rewrites every account, so
+        // the checkpoint's regions go fully dead and (without the fix) get
+        // recycled and overwritten by later rounds.
+        for round in 0..40u64 {
+            let ops: Vec<(Key, StateOp)> = keys
+                .iter()
+                .map(|k| {
+                    (*k, StateOp::SetAccount {
+                        nonce: 100_000 + round,
+                        balance: U256::from(round),
+                        code_hash: [4u8; 32],
+                    })
+                })
+                .collect();
+            db.apply_block(ops).unwrap();
+        }
+
+        // Crash: drop without persist. On-disk state = checkpoint manifest +
+        // whatever the churn did to the flat file.
+        drop(db);
+        let db = FlatMpt::open(&path).unwrap();
+        assert_eq!(db.root(), ckpt_root, "reopened root");
+        // The real gate: every account reads back its CHECKPOINT value.
+        for (i, k) in keys.iter().enumerate() {
+            let v = db
+                .get_value(k)
+                .unwrap_or_else(|e| panic!("checkpoint read failed for key {i}: {e}"))
+                .unwrap_or_else(|| panic!("checkpoint key {i} missing"));
+            let acct = eth::Account::decode(&v)
+                .unwrap_or_else(|e| panic!("checkpoint account {i} corrupt: {e}"));
+            assert_eq!(acct.nonce, i as u64, "checkpoint value for key {i}");
+        }
+    }
+
+    /// A torn manifest (crash during the checkpoint write itself) is detected
+    /// by the checksum and open() falls back to the previous generation.
+    #[test]
+    fn torn_manifest_falls_back_to_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+        for i in 0..50u64 {
+            db.insert(hashed_key(i.to_le_bytes()), vec![7u8; 40]).unwrap();
+        }
+        db.persist().unwrap();
+        let root1 = db.root();
+        db.insert(hashed_key(999u64.to_le_bytes()), vec![9u8; 40]).unwrap();
+        db.persist().unwrap(); // second generation; first is now .meta.prev
+        let root2 = db.root();
+        drop(db);
+
+        // Tear the current manifest (truncate to half).
+        let meta = meta_path(&path);
+        let len = std::fs::metadata(&meta).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&meta).unwrap();
+        f.set_len(len / 2).unwrap();
+        drop(f);
+
+        // Reopen: checksum rejects the torn manifest; .meta.prev loads. Its
+        // frontier (root1) references only bytes that generational reclamation
+        // kept intact.
+        let db = FlatMpt::open(&path).unwrap();
+        assert_eq!(db.root(), root1, "fell back to the previous checkpoint");
+        assert_ne!(root1, root2);
+        assert!(db.get_value(&hashed_key(7u64.to_le_bytes())).unwrap().is_some());
     }
 
     /// WP2 gate: randomized block-shaped updates (account upserts/deletes, slot

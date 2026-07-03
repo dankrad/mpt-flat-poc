@@ -48,17 +48,30 @@ impl CodeStore {
         let mut index = HashMap::new();
         let mut end = 0u64;
         if !truncate {
-            // Rebuild the index by scanning the log.
+            // Rebuild the index by scanning the log. A torn tail record (crash
+            // mid-append) is truncated away: the log is written before any
+            // manifest references its hashes, so dropping it is always safe.
+            let file_len = file.metadata()?.len();
             file.seek(SeekFrom::Start(0))?;
             let mut hdr = [0u8; 36];
             loop {
-                match read_exact_or_eof(&mut file, &mut hdr)? {
-                    false => break,
-                    true => {}
+                match read_exact_or_eof(&mut file, &mut hdr) {
+                    Ok(false) => break,
+                    Ok(true) => {}
+                    Err(_) => {
+                        // Partial header at the tail.
+                        file.set_len(end)?;
+                        break;
+                    }
                 }
                 let hash = B256::from_slice(&hdr[..32]);
                 let len = u32::from_le_bytes(hdr[32..36].try_into().unwrap());
                 let data_off = end + 36;
+                if data_off + len as u64 > file_len {
+                    // Header complete but code bytes torn.
+                    file.set_len(end)?;
+                    break;
+                }
                 index.insert(hash, (data_off, len));
                 end = data_off + len as u64;
                 file.seek(SeekFrom::Start(end))?;
