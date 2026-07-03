@@ -136,4 +136,12 @@ fn main() {
         hex(db.root()),
         process_footprint_bytes() as f64 / (1u64 << 30) as f64,
     );
+    // With --features profiling: wall-clock attribution across categories.
+    if mpt_flat_poc::prof::ENABLED {
+        for (name, (ns, calls)) in mpt_flat_poc::prof::CATS.iter().zip(mpt_flat_poc::prof::snapshot()) {
+            if calls > 0 {
+                println!("  prof {name}: {:.1} ms over {calls} calls", ns as f64 / 1e6);
+            }
+        }
+    }
 }
