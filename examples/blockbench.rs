@@ -115,9 +115,14 @@ fn main() {
                 }
             }
         }
+        let wb_before = mpt_flat_poc::stats::WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         let t = Instant::now();
         let (_root, _inv) = db.apply_block(ops).unwrap();
         let us = t.elapsed().as_micros() as f64;
+        if b < 6 {
+            let wb = mpt_flat_poc::stats::WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed) - wb_before;
+            eprintln!("  block {b}: wrote {:.1} MiB", wb as f64 / (1u64 << 20) as f64);
+        }
         times_us.push(us);
         if (b + 1) % 10 == 0 {
             eprintln!("  block {:>4}/{n_blocks}: {:.0} us  ({:.2} us/op)", b + 1, us, us / ops_per_block as f64);

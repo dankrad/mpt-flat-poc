@@ -1228,10 +1228,47 @@ struct PromotedAccount {
 /// feature, and a `Mem` leaf must be spilled before any manifest write anyway, so
 /// these impls deliberately error as a guard. Appending the `Mem` variant keeps
 /// bincode's existing `Ram`/`Disk` indices, so old manifests still load.
-#[derive(Debug, Clone)]
+///
+/// Construction/clone/drop maintain [`MEM_BYTES`] — the exact byte count of
+/// RAM-resident records — which drives hot-cache eviction (process-footprint
+/// metrics can't see allocator-retained memory, so they mis-trigger).
+#[derive(Debug)]
 struct MemLeaf {
     bytes: Arc<[u8]>,
     root: Hash,
+    /// Second-chance clock bit: set on every touch, cleared by a quota-spill
+    /// sweep — a leaf is evicted only if untouched since the last sweep, so
+    /// hot records survive eviction and cold ones flow through to disk.
+    touched: std::sync::atomic::AtomicBool,
+}
+
+/// Total bytes held by live `MemLeaf` instances (RAM-build leaves + the
+/// hot-record cache). Process-wide; exact by construction.
+pub static MEM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+impl MemLeaf {
+    fn new(bytes: Arc<[u8]>, root: Hash) -> Self {
+        MEM_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        MemLeaf { bytes, root, touched: std::sync::atomic::AtomicBool::new(true) }
+    }
+    fn touch(&self) {
+        self.touched.store(true, Ordering::Relaxed);
+    }
+}
+impl Clone for MemLeaf {
+    fn clone(&self) -> Self {
+        MEM_BYTES.fetch_add(self.bytes.len() as u64, Ordering::Relaxed);
+        MemLeaf {
+            bytes: self.bytes.clone(),
+            root: self.root,
+            touched: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+impl Drop for MemLeaf {
+    fn drop(&mut self) {
+        MEM_BYTES.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+    }
 }
 impl Serialize for MemLeaf {
     fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
@@ -1646,13 +1683,22 @@ impl FlatMpt {
                 }
             }
         }
-        // Hot-record cache budget: spill cached Mem records when the process
-        // footprint crosses the ceiling (persist() also spills them all).
-        if !self.ram_mode
-            && hot_records_enabled()
-            && process_footprint_bytes() >= self.hot_spill_at
-        {
-            self.spill_mem()?;
+        // Hot-record cache budget, on exact cache bytes. Writes coalesce until
+        // persist() — in a live follower the checkpoint spill lands in the
+        // ~11.9 s of slot idle time, so deferring maximizes coalescing at zero
+        // wall-clock cost. Near the ceiling (7/8 budget) a bounded clock sweep
+        // (second-chance: hot records survive) smooths eviction; the full
+        // budget is a stop-the-world backstop that should not trigger with a
+        // sane persist cadence. Per-block pacing was measured strictly worse:
+        // it puts write-back on the block critical path (mean 130 vs 81 ms).
+        if !self.ram_mode && hot_records_enabled() {
+            let cached = MEM_BYTES.load(Ordering::Relaxed);
+            let budget = hot_budget_bytes();
+            if cached >= budget {
+                self.spill_mem()?;
+            } else if cached >= budget / 8 * 7 {
+                self.spill_quota(256 << 20)?;
+            }
         }
         self.store.flush()?;
         Ok((self.root(), inv))
@@ -2099,12 +2145,19 @@ impl FlatMpt {
     /// (one dense `write_batch` each) so transient memory stays bounded; ptrs are
     /// installed by prefix after the walk (releasing the `&mut upper` borrow first).
     fn spill_mem(&mut self) -> Result<()> {
+        self.spill_quota(i64::MAX)
+    }
+
+    /// Spill up to ~`budget` bytes of `Mem` records (the whole cache for
+    /// `i64::MAX`). Quota spills amortize hot-cache eviction across blocks.
+    fn spill_quota(&mut self, budget: i64) -> Result<()> {
         self.ram_mode = false;
         const CHUNK: usize = 8192;
         let mut buf = SpillBuf {
             prefixes: Vec::new(),
             payloads: Vec::new(),
             installs: Vec::new(),
+            budget,
         };
         spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
         flush_spill_chunk(&self.store, &mut buf)?;
@@ -2293,6 +2346,7 @@ fn ram_get(store: &FlatFile, node: &RamNode, nibbles: &[u8], depth: usize) -> Re
                     node_get(store, &sub.node, nibbles, sub.prefix.len())
                 }
                 Some(RamChild::Mem(m)) => {
+                    m.touch();
                     let sub = parse_payload_lazy(m.bytes.clone())?;
                     node_get(store, &sub.node, nibbles, sub.prefix.len())
                 }
@@ -2451,13 +2505,16 @@ fn meta_path(path: &Path) -> PathBuf {
 fn make_mem_leaf(subtree: &DiskSubtree) -> Result<RamChild> {
     let root = hash_node(&subtree.node).finalize();
     let (payload, _) = serialize_subtree(subtree)?;
-    Ok(RamChild::Mem(MemLeaf { bytes: Arc::from(payload), root }))
+    Ok(RamChild::Mem(MemLeaf::new(Arc::from(payload), root)))
 }
 
-/// Build a leaf child: a RAM-resident `Mem` leaf in RAM-build mode (no I/O), or a
-/// serialized `Disk` record otherwise.
+/// Build a leaf child: a RAM-resident `Mem` leaf in RAM-build mode or under the
+/// hot-record cache (fresh records are hot by definition, and profiling shows
+/// per-creation `write_payload` — alloc lock + page-granular pwrite — is the
+/// largest single block-latency component; Mem creations batch densely at
+/// spill instead), or a serialized `Disk` record otherwise.
 fn make_leaf_child(store: &FlatFile, ram: bool, subtree: DiskSubtree) -> Result<RamChild> {
-    if ram {
+    if ram || hot_records_enabled() {
         make_mem_leaf(&subtree)
     } else {
         let root = hash_node(&subtree.node).finalize();
@@ -2470,6 +2527,7 @@ fn make_leaf_child(store: &FlatFile, ram: bool, subtree: DiskSubtree) -> Result<
 /// Parse a `Mem` leaf's bytes (lazy: children stay `Raw`, zero-copy slices of the
 /// `Arc`) — the in-RAM equivalent of [`FlatFile::read_lazy`].
 fn parse_payload_lazy(bytes: Arc<[u8]>) -> Result<DiskSubtree> {
+    let _g = prof::scope(prof::Cat::Deserialize);
     deserialize_subtree_lazy(bytes)
 }
 
@@ -2525,7 +2583,7 @@ fn promote_to_mem(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
 fn promote_oversized(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
     match &subtree.node {
         Node::Branch { .. } | Node::Extension { .. } => promote_record_to_ram(store, subtree),
-        Node::Account { .. } => promote_account_to_ram(store, subtree),
+        Node::Account { .. } => promote_account_to_ram(store, subtree, hot_records_enabled()),
         _ => bail!("oversized unsplittable record ({} B)", record_size(subtree.prefix.len(), &subtree.node)),
     }
 }
@@ -2535,7 +2593,7 @@ fn promote_oversized(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild>
 fn promote_oversized_mem(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
     match &subtree.node {
         Node::Branch { .. } | Node::Extension { .. } => promote_to_mem(store, subtree),
-        Node::Account { .. } => promote_account_to_ram(store, subtree),
+        Node::Account { .. } => promote_account_to_ram(store, subtree, hot_records_enabled()),
         _ => bail!("oversized unsplittable Mem record ({} B)", record_size(subtree.prefix.len(), &subtree.node)),
     }
 }
@@ -2559,13 +2617,13 @@ fn insert_into_child(
             // In-RAM leaf: parse its bytes, apply the key, re-serialize into a new
             // `Arc` (the old one drops here). No I/O, no shared store.
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
-            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let mut subtree = parse_payload_lazy(m.bytes.clone())?;
             let depth = subtree.prefix.len();
             record_node_insert(store, cfg, &mut subtree.node, depth, key, op)?;
             *slot = Some(if should_promote(cfg, &subtree) {
                 promote_to_mem(store, subtree)?
             } else if should_promote_account(cfg, &subtree) {
-                promote_account_to_ram(store, subtree)?
+                promote_account_to_ram(store, subtree, ram || hot_records_enabled())?
             } else {
                 make_mem_leaf(&subtree)?
             });
@@ -2577,10 +2635,14 @@ fn insert_into_child(
             record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, op)?;
             if should_promote(cfg, &subtree) {
                 store.free(old_ptr);
-                *slot = Some(promote_record_to_ram(store, subtree)?);
+                *slot = Some(if hot_records_enabled() {
+                    promote_to_mem(store, subtree)?
+                } else {
+                    promote_record_to_ram(store, subtree)?
+                });
             } else if should_promote_account(cfg, &subtree) {
                 store.free(old_ptr);
-                *slot = Some(promote_account_to_ram(store, subtree)?);
+                *slot = Some(promote_account_to_ram(store, subtree, ram || hot_records_enabled())?);
             } else if hot_records_enabled() {
                 store.free(old_ptr);
                 *slot = Some(make_mem_leaf(&subtree)?);
@@ -2924,12 +2986,12 @@ fn delete_in_child(
         Some(RamChild::Mem(_)) => {
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let bytes = m.bytes.clone();
-            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let mut subtree = parse_payload_lazy(m.bytes.clone())?;
             let depth = subtree.prefix.len();
             match record_node_delete(&mut subtree.node, depth, key, op)? {
                 NodeDelete::Absent => {
                     // Untouched: restore the original bytes (no re-serialize).
-                    *slot = Some(RamChild::Mem(MemLeaf { bytes, root: m.root }));
+                    *slot = Some(RamChild::Mem(MemLeaf::new(bytes, m.root)));
                     Ok(RamDelete::Absent)
                 }
                 NodeDelete::Changed => {
@@ -3024,7 +3086,7 @@ fn delete_in_child(
                             *slot = Some(if should_promote_account(cfg, &subtree) {
                                 // Still too big to inline: re-promote (re-splitting
                                 // the storage into records).
-                                promote_account_to_ram(store, subtree)?
+                                promote_account_to_ram(store, subtree, ram || hot_records_enabled())?
                             } else {
                                 make_leaf_child(store, ram, subtree)?
                             });
@@ -3069,7 +3131,7 @@ fn rehome_child(
             make_leaf_child(store, ram, DiskSubtree { prefix: new_prefix, node })?
         }
         RamChild::Mem(m) => {
-            let subtree = parse_payload_lazy(m.bytes)?;
+            let subtree = parse_payload_lazy(m.bytes.clone())?;
             let node = prepend_path(subtree.node, edge)?;
             make_mem_leaf(&DiskSubtree { prefix: new_prefix, node })?
         }
@@ -3097,7 +3159,7 @@ fn materialize_storage_survivor(
             Ok(node)
         }
         RamChild::Mem(m) => {
-            let subtree = parse_payload_lazy(m.bytes)?;
+            let subtree = parse_payload_lazy(m.bytes.clone())?;
             prepend_path(subtree.node, edge)
         }
         RamChild::Ram(_) | RamChild::Account(_) => {
@@ -3138,7 +3200,7 @@ fn collapse_root(store: &FlatFile, edge: Vec<u8>, survivor: RamChild) -> Result<
             node
         }
         RamChild::Mem(m) => {
-            let subtree = parse_payload_lazy(m.bytes)?;
+            let subtree = parse_payload_lazy(m.bytes.clone())?;
             prepend_path(subtree.node, &edge)?
         }
         RamChild::Account(_) => {
@@ -3528,7 +3590,7 @@ fn finish_child(store: &FlatFile, cfg: &Config, subtree: DiskSubtree, ram: bool)
     if should_promote(cfg, &subtree) {
         if ram { promote_to_mem(store, subtree) } else { promote_record_to_ram(store, subtree) }
     } else if should_promote_account(cfg, &subtree) {
-        promote_account_to_ram(store, subtree)
+        promote_account_to_ram(store, subtree, ram || hot_records_enabled())
     } else {
         make_leaf_child(store, ram, subtree)
     }
@@ -3891,11 +3953,11 @@ fn apply_group_child(
         Some(RamChild::Mem(_)) => {
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let bytes = m.bytes.clone();
-            let mut subtree = parse_payload_lazy(m.bytes)?;
+            let mut subtree = parse_payload_lazy(m.bytes.clone())?;
             let depth = subtree.prefix.len();
             match apply_net_in_record(store, cfg, &mut subtree.node, depth, key, upd, inv)? {
                 NodeDelete::Absent => {
-                    *slot = Some(RamChild::Mem(MemLeaf { bytes, root: m.root }));
+                    *slot = Some(RamChild::Mem(MemLeaf::new(bytes, m.root)));
                     Ok(RamDelete::Absent)
                 }
                 NodeDelete::Changed => {
@@ -4756,10 +4818,13 @@ fn should_promote_account(cfg: &Config, subtree: &DiskSubtree) -> bool {
 /// children are `Disk` storage records — the storage analogue of
 /// [`promote_record_to_ram`]. The pointers now live in RAM, so GC can relocate any
 /// storage record by updating a RAM pointer.
-fn promote_storage_to_ram(store: &FlatFile, storage: Node) -> Result<Box<RamNode>> {
-    match promote_record_to_ram(store, DiskSubtree { prefix: Vec::new(), node: storage })? {
-        RamChild::Ram(ram) => Ok(ram),
-        _ => unreachable!("promote_record_to_ram returns a Ram node"),
+fn promote_storage_to_ram(store: &FlatFile, storage: Node, ram: bool) -> Result<Box<RamNode>> {
+    let subtree = DiskSubtree { prefix: Vec::new(), node: storage };
+    let promoted =
+        if ram { promote_to_mem(store, subtree)? } else { promote_record_to_ram(store, subtree)? };
+    match promoted {
+        RamChild::Ram(r) => Ok(r),
+        _ => unreachable!("promotion returns a Ram node"),
     }
 }
 
@@ -4767,11 +4832,11 @@ fn promote_storage_to_ram(store: &FlatFile, storage: Node) -> Result<Box<RamNode
 /// trie is lifted into a RAM subtree (its top branch's children become `Disk`
 /// storage records), and the account fields move into the frontier node. The account
 /// leaf hashes identically (same fields + same storage root).
-fn promote_account_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
+fn promote_account_to_ram(store: &FlatFile, subtree: DiskSubtree, ram: bool) -> Result<RamChild> {
     let Node::Account { path, nonce, balance, code_hash, storage, .. } = subtree.node else {
         unreachable!("promote_account_to_ram called on a non-account record");
     };
-    let storage_ram = promote_storage_to_ram(store, *storage)?;
+    let storage_ram = promote_storage_to_ram(store, *storage, ram)?;
     Ok(RamChild::Account(Box::new(PromotedAccount {
         path,
         nonce,
@@ -5793,6 +5858,10 @@ struct SpillBuf {
     prefixes: Vec<Vec<u8>>,
     payloads: Vec<Arc<[u8]>>,
     installs: Vec<(Vec<u8>, DiskPtr)>,
+    /// Remaining spill budget in bytes; the walk unwinds when it goes negative
+    /// (quota spills evict a bounded slice of the cache per call, so eviction
+    /// cost amortizes across blocks instead of one stop-the-world flush).
+    budget: i64,
 }
 
 /// Write the pending chunk to the file (one dense `write_batch`) and queue each
@@ -5829,16 +5898,27 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                         cp.push(i as u8);
                         spill_walk(child, cp, store, buf, chunk)?;
                     }
-                    Some(RamChild::Mem(_)) => {
+                    Some(RamChild::Mem(m)) => {
+                        if buf.budget < 0 {
+                            continue;
+                        }
+                        // Quota sweeps (bounded budget) evict only cold leaves;
+                        // hot ones get their clock bit cleared and survive.
+                        if buf.budget < i64::MAX / 2
+                            && m.touched.swap(false, Ordering::Relaxed)
+                        {
+                            continue;
+                        }
                         let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
                         let mut cp = prefix.clone();
                         cp.push(i as u8);
+                        buf.budget -= m.bytes.len() as i64;
                         *slot = Some(RamChild::Disk {
                             ptr: DiskPtr { unit: 0, len: m.bytes.len() as u32 },
                             root: m.root,
                         });
                         buf.prefixes.push(cp);
-                        buf.payloads.push(m.bytes);
+                        buf.payloads.push(m.bytes.clone());
                         if buf.payloads.len() >= chunk {
                             flush_spill_chunk(store, buf)?;
                         }
@@ -6779,8 +6859,12 @@ mod tests {
     #[test]
     fn frontier_node_stays_compact() {
         use std::mem::size_of;
-        assert!(size_of::<RamChild>() <= 56, "RamChild grew to {}", size_of::<RamChild>());
-        assert!(size_of::<RamNode>() <= 936, "RamNode grew to {}", size_of::<RamNode>());
+        // 64 B since the hot-record cache: MemLeaf carries a second-chance
+        // clock bit (AtomicBool pads 48->56, +8 discriminant). Costs ~8 B per
+        // frontier slot (~24 MB at the 90M-account mainnet frontier) — the
+        // eviction quality is worth it. Do not grow further without arithmetic.
+        assert!(size_of::<RamChild>() <= 64, "RamChild grew to {}", size_of::<RamChild>());
+        assert!(size_of::<RamNode>() <= 1064, "RamNode grew to {}", size_of::<RamNode>());
         // Box the rare variants so they never set the width.
         assert_eq!(size_of::<Box<PromotedAccount>>(), 8);
     }
