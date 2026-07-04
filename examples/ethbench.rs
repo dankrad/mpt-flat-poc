@@ -82,21 +82,51 @@ fn mem_gib() -> f64 {
     process_footprint_bytes() as f64 / GIB
 }
 
+/// Total flat-file payload bytes written so far (from the engine's stats counter).
+fn write_bytes() -> u64 {
+    mpt_flat_poc::stats::WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compact per-interval usage line during the build: throughput, and how the flat
+/// file is being used — high-water vs live (utilization), reclaimable free space,
+/// and write amplification (bytes written / live bytes).
+fn progress_line(db: &FlatMpt, done: u64, total: u64, t: &Instant) {
+    let flat = db.flat_file_len();
+    let live = db.live_bytes();
+    let free = db.free_bytes();
+    let util = if flat > 0 { live as f64 / flat as f64 * 100.0 } else { 0.0 };
+    let amp = if live > 0 { write_bytes() as f64 / live as f64 } else { 0.0 };
+    eprintln!(
+        "[{:>5.0}s] {:>4}M/{}M  {:.3} us/leaf  flat {:.0} GiB  live {:.1} GiB  util {:.1}%  free {:.0} GiB  wamp {:.1}x  RSS {:.1} GiB",
+        t.elapsed().as_secs_f64(),
+        done / 1_000_000,
+        total / 1_000_000,
+        t.elapsed().as_micros() as f64 / done.max(1) as f64,
+        flat as f64 / GIB,
+        live as f64 / GIB,
+        util,
+        free as f64 / GIB,
+        amp,
+        mem_gib(),
+    );
+}
+
 fn report(db: &FlatMpt, label: &str, code_bytes: u64) {
     let flat = db.flat_file_len();
     let live = db.live_bytes();
     let free = db.free_bytes();
     let util = if flat > 0 { live as f64 / flat as f64 * 100.0 } else { 0.0 };
+    let amp = if live > 0 { write_bytes() as f64 / live as f64 } else { 0.0 };
     let ls = db.leaf_stats();
     let rr = db.ram_report();
     eprintln!(
         "  [{label}]\n\
-             flat-file:  {:.2} GiB high-water  |  live {:.2} GiB  free {:.2} GiB  util {:.1}%\n\
+             flat-file:  {:.2} GiB high-water  |  live {:.2} GiB  free {:.2} GiB  util {:.1}%  write-amp {:.1}x\n\
              leaves:     {} records, avg {} B/record\n\
              code store: {:.2} GiB\n\
              RAM index:  {:.2} GiB total (frontier {:.2} GiB, free-list {:.1} MiB)\n\
              process:    {:.2} GiB RSS",
-        flat as f64 / GIB, live as f64 / GIB, free as f64 / GIB, util,
+        flat as f64 / GIB, live as f64 / GIB, free as f64 / GIB, util, amp,
         ls.count, ls.avg_bytes(),
         code_bytes as f64 / GIB,
         rr.total_bytes() as f64 / GIB, rr.frontier_bytes as f64 / GIB, rr.free_list_bytes as f64 / MIB,
@@ -143,24 +173,33 @@ fn main() {
     let mut db = FlatMpt::create(&path, cfg).unwrap();
 
     // ---- Build phase: stream every leaf into insert_batch ----
+    let report_every: u64 = std::env::var("MPT_REPORT_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(25_000_000);
     let t = Instant::now();
     let mut buf: Vec<(Key, Vec<u8>)> = Vec::with_capacity(batch);
-    let flush = |db: &mut FlatMpt, buf: &mut Vec<(Key, Vec<u8>)>, force: bool| {
-        if buf.len() >= batch || (force && !buf.is_empty()) {
-            db.insert_batch(std::mem::take(buf)).unwrap();
-        }
-    };
+    let mut done: u64 = 0;
+    let mut next = report_every;
+    // Push one leaf; flush a full batch; emit a usage line every `report_every`.
+    macro_rules! push_leaf {
+        ($k:expr, $v:expr) => {{
+            buf.push(($k, $v));
+            done += 1;
+            if buf.len() >= batch {
+                db.insert_batch(std::mem::take(&mut buf)).unwrap();
+                if done >= next {
+                    progress_line(&db, done, total_leaves, &t);
+                    next += report_every;
+                }
+            }
+        }};
+    }
 
     // EOAs.
     for id in 0..n {
-        buf.push((account_key(id), account_value(&mut rng, false)));
-        flush(&mut db, &mut buf, false);
+        push_leaf!(account_key(id), account_value(&mut rng, false));
     }
     // Small contracts (+ code blobs to the side store).
     for j in 0..s {
-        let id = n + j;
-        buf.push((account_key(id), account_value(&mut rng, true)));
-        flush(&mut db, &mut buf, false);
+        push_leaf!(account_key(n + j), account_value(&mut rng, true));
         let code_len = rng.gen_range(1024..=20 * 1024);
         let code = rand_bytes(&mut rng, code_len);
         code_file.write_all(&code).unwrap();
@@ -169,14 +208,14 @@ fn main() {
     // Large contracts + their scattered storage slots.
     for j in 0..s {
         let id = n + s + j;
-        buf.push((account_key(id), account_value(&mut rng, true)));
-        flush(&mut db, &mut buf, false);
+        push_leaf!(account_key(id), account_value(&mut rng, true));
         for k in 0..cnt[j as usize] {
-            buf.push((slot_key(id, k), slot_value(&mut rng)));
-            flush(&mut db, &mut buf, false);
+            push_leaf!(slot_key(id, k), slot_value(&mut rng));
         }
     }
-    flush(&mut db, &mut buf, true);
+    if !buf.is_empty() {
+        db.insert_batch(std::mem::take(&mut buf)).unwrap();
+    }
     code_file.flush().unwrap();
     db.flush().unwrap();
     let build = t.elapsed();

@@ -117,14 +117,23 @@ fn main() {
             batch.reserve(batch_n);
         }
         if n_acc % 5_000_000 == 0 {
+            use std::sync::atomic::Ordering::Relaxed;
             eprintln!(
-                "[{:>5.0}s] accounts {}M  contracts {}  slots {}M  mem {:.1} GiB  flat {:.1} GiB",
+                "[{:>5.0}s] accounts {}M  contracts {}  slots {}M  mem {:.1} GiB  \
+                 flat {:.1} GiB  live {:.1} GiB  free-regions {}  gc-rate {}  \
+                 gc-passes {}  gc-victims {}  gc-reloc {}",
                 t.elapsed().as_secs_f64(),
                 n_acc / 1_000_000,
                 n_contract,
                 n_slots / 1_000_000,
                 process_footprint_bytes() as f64 / GIB,
                 db.flat_file_len() as f64 / GIB,
+                db.live_bytes() as f64 / GIB,
+                db.free_regions(),
+                db.gc_rate_current(),
+                mpt_flat_poc::stats::GC_PASSES.load(Relaxed),
+                mpt_flat_poc::stats::GC_REGIONS.load(Relaxed),
+                mpt_flat_poc::stats::GC_RELOCATED.load(Relaxed),
             );
         }
     }
@@ -156,4 +165,10 @@ fn main() {
         process_footprint_bytes() as f64 / GIB,
     );
     std::io::stdout().flush().ok();
+
+    // Persist a reopenable checkpoint (writes the frontier manifest) so the
+    // reconstructed state can be reopened later for experiments.
+    let ps = Instant::now();
+    db.persist().unwrap();
+    eprintln!("persisted reopenable checkpoint in {:.1}s", ps.elapsed().as_secs_f64());
 }
