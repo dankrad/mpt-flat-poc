@@ -1456,6 +1456,18 @@ impl FlatMpt {
     /// frontier, and rebuilds the region allocator's liveness by walking the
     /// frontier. A fresh head region is opened past the file end so appends resume
     /// cleanly (wasting at most the tail of the last region).
+    /// Like [`FlatMpt::create`], but with RAM-build mode forced on regardless of
+    /// the `MPT_RAM_BUILD` env var — for embedders doing a one-shot bulk load
+    /// (build in RAM, spill once at `persist`, reopen normally). The spill
+    /// threshold still honors `MPT_RAM_BUILD_GIB`.
+    pub fn create_ram_build(path: impl AsRef<Path>, cfg: Config) -> Result<Self> {
+        let mut db = Self::create(path, cfg)?;
+        let (_, spill_threshold) = ram_build_config();
+        db.ram_mode = true;
+        db.spill_threshold = spill_threshold;
+        Ok(db)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let meta = meta_path(path);
