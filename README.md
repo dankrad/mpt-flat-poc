@@ -1,5 +1,29 @@
 # mpt-flat-poc
 
+> **This branch (`reth-integration`): Ethereum mainnet pathway.** On top of the
+> base engine described below, this branch makes the trie Ethereum-*exact* and
+> turns it into reth's state commitment:
+>
+> - `src/eth.rs` — keccak/RLP hashing identical to mainnet (validated against
+>   ethereum/tests), values stored in leaves (no separate KV store on this path);
+> - nested account model — one unified trie, account fields + storage subtrees
+>   in-tree (`Node::Account`);
+> - `apply_block(ops) -> (root, inverse_diff)` — per-block batched state
+>   transition with reorg rollback, plus deletion with canonical collapse;
+> - bulk ingest: `insert_batch_accounts` / `FlatMpt::create_ram_build`
+>   (mainnet: 147.6M accounts + 535.4M slots reconstructed to reth's exact
+>   state root);
+> - key examples: `rethload_nested` (build a checkpoint from reth's hashed
+>   tables), `readbench` (point reads), `blockbench` / `ethbench` /
+>   `hotcontracts` (apply workloads), `replay` (diff-corpus replay).
+>
+> **To run it against a live reth mainnet node** — shadow verification or as
+> the node's sole state commitment (merkle stages removed) — follow the runbook
+> in [dankrad/flatmpt-exex](https://github.com/dankrad/flatmpt-exex), which
+> pins all versions and includes the reth patch and benchmark instructions.
+> Headline numbers there: 20.9× faster state-root updates over 200k mainnet
+> blocks; execution→Finish gap 76.5 min → 84 s.
+
 A proof-of-concept **Merkle Patricia Trie (MPT)** with a *flat* storage layout: a
 small in-RAM "frontier" of the trie sits on top of larger **subtrees packed into a
 single flat file**, while the actual key→value payloads live in an embedded
