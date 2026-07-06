@@ -1772,11 +1772,17 @@ impl FlatMpt {
             if cached >= budget {
                 // Backstop; with escalating quota sweeps below it should not fire.
                 self.spill_mem()?;
-            } else if cached >= budget / 4 * 3 {
-                // Bounded slice per apply, sized to drift back toward 3/4 —
-                // escalates past clock bits when the cache is all-hot.
-                let over = cached - budget / 4 * 3;
-                self.spill_quota((over as i64).clamp(64 << 20, 512 << 20))?;
+            } else if cached >= budget / 2 {
+                // Evict back toward the half-budget low-water mark each apply,
+                // escalating past clock bits when the cache is all-hot. The
+                // slice is sized to the full overage (not a fixed cap) so
+                // eviction outpaces the warmup fill rate (~650 MB/block on a
+                // cold 100M-slot workload) — a 512 MB cap let the cache creep
+                // to the full-budget backstop and burst once at warmup. The
+                // half-budget trigger leaves ~1.5 GiB of headroom (default
+                // 3 GiB budget) so the backstop stays unreachable.
+                let over = cached - budget / 2;
+                self.spill_quota((over as i64).clamp(64 << 20, 1 << 30))?;
             }
         }
         self.store.flush()?;
