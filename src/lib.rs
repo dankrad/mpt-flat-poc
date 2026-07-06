@@ -1541,8 +1541,14 @@ impl FlatMpt {
     /// a torn manifest.
     pub fn persist(&mut self) -> Result<()> {
         // The manifest stores disk ptrs only; spill any in-RAM leaves to the file
-        // first (they're not serializable and would be lost on reopen).
+        // first (they're not serializable and would be lost on reopen). This is
+        // also the definitive RAM-build -> disk-mode transition: mid-build
+        // threshold spills (maybe_spill) keep ram_mode so the bulk load
+        // continues accumulating and re-spilling — a spill that silently
+        // demoted the mode left the next batches on the non-spilling path and
+        // memory grew unbounded (observed: 148 GiB at the 42 GiB threshold).
         self.spill_mem()?;
+        self.ram_mode = false;
         self.store.sync()?;
         let manifest = ManifestRef {
             cfg: &self.cfg,
@@ -2233,7 +2239,6 @@ impl FlatMpt {
     /// of clock bits, so pressure always translates into bounded, incremental
     /// write-back instead of a cliff.
     fn spill_quota(&mut self, budget: i64) -> Result<()> {
-        self.ram_mode = false;
         const CHUNK: usize = 8192;
         let mut buf = SpillBuf {
             prefixes: Vec::new(),
@@ -7113,8 +7118,10 @@ mod tests {
         assert_eq!(ram.root(), root_disk, "RAM build root differs from disk build");
 
         // Spill Mem -> disk; root unchanged, leaves now reachable on disk.
+        // Mid-build spills keep ram_mode (the bulk load continues accumulating
+        // and re-spilling); only persist() demotes to disk mode.
         ram.spill_mem().unwrap();
-        assert!(!ram.ram_mode);
+        assert!(ram.ram_mode, "mid-build spill must keep the build mode");
         assert_eq!(ram.root(), root_disk, "root changed across spill");
         assert_eq!(
             ram.disk_accesses_for_key(&key(0)).unwrap(),
