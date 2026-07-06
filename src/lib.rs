@@ -1764,9 +1764,13 @@ impl FlatMpt {
             let cached = MEM_BYTES.load(Ordering::Relaxed);
             let budget = hot_budget_bytes();
             if cached >= budget {
+                // Backstop; with escalating quota sweeps below it should not fire.
                 self.spill_mem()?;
-            } else if cached >= budget / 8 * 7 {
-                self.spill_quota(256 << 20)?;
+            } else if cached >= budget / 4 * 3 {
+                // Bounded slice per apply, sized to drift back toward 3/4 —
+                // escalates past clock bits when the cache is all-hot.
+                let over = cached - budget / 4 * 3;
+                self.spill_quota((over as i64).clamp(64 << 20, 512 << 20))?;
             }
         }
         self.store.flush()?;
@@ -2219,6 +2223,15 @@ impl FlatMpt {
 
     /// Spill up to ~`budget` bytes of `Mem` records (the whole cache for
     /// `i64::MAX`). Quota spills amortize hot-cache eviction across blocks.
+    ///
+    /// Two passes: the first respects second-chance clock bits (cold leaves
+    /// spill, hot ones survive with their bit cleared). On workloads where the
+    /// entire cache is hot — every record touched every block — that pass
+    /// evicts nothing and the cache used to march to the full-budget
+    /// stop-the-world backstop (measured: 4.3 GB / 3.3 s bursts). If the first
+    /// pass leaves most of the quota unspent, a second pass evicts regardless
+    /// of clock bits, so pressure always translates into bounded, incremental
+    /// write-back instead of a cliff.
     fn spill_quota(&mut self, budget: i64) -> Result<()> {
         self.ram_mode = false;
         const CHUNK: usize = 8192;
@@ -2227,8 +2240,14 @@ impl FlatMpt {
             payloads: Vec::new(),
             installs: Vec::new(),
             budget,
+            force: false,
         };
         spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+        if buf.budget > budget / 2 && budget < i64::MAX / 2 {
+            // All-hot cache: force eviction for the remaining quota.
+            buf.force = true;
+            spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+        }
         flush_spill_chunk(&self.store, &mut buf)?;
         for (prefix, ptr) in buf.installs {
             install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr);
@@ -5951,6 +5970,8 @@ struct SpillBuf {
     /// (quota spills evict a bounded slice of the cache per call, so eviction
     /// cost amortizes across blocks instead of one stop-the-world flush).
     budget: i64,
+    /// Evict regardless of clock bits (escalation pass on an all-hot cache).
+    force: bool,
 }
 
 /// Write the pending chunk to the file (one dense `write_batch`) and queue each
@@ -5992,8 +6013,10 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                             continue;
                         }
                         // Quota sweeps (bounded budget) evict only cold leaves;
-                        // hot ones get their clock bit cleared and survive.
-                        if buf.budget < i64::MAX / 2
+                        // hot ones get their clock bit cleared and survive —
+                        // unless this is a forced pass (all-hot escalation).
+                        if !buf.force
+                            && buf.budget < i64::MAX / 2
                             && m.touched.swap(false, Ordering::Relaxed)
                         {
                             continue;
