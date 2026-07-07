@@ -852,10 +852,14 @@ pub struct TrieNodeCursor<'a> {
 }
 
 impl<'a> TrieNodeCursor<'a> {
-    /// Smallest branch with path `>=` the given nibble path.
+    /// Smallest branch with path `>=` the given nibble path. The root branch
+    /// (empty path) is never returned: reth's stored tries filter it out
+    /// (`TrieUpdates` skips empty-path nodes), and the V2 proof calculator's
+    /// invariants depend on cursors matching that.
     pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
         let mut prefix = Vec::with_capacity(64);
-        let out = ram_branch_seek(&self.mpt.store, &self.memo, &self.mpt.upper, &mut prefix, path_nibbles)?;
+        let target: &[u8] = if path_nibbles.is_empty() { &[0] } else { path_nibbles };
+        let out = ram_branch_seek(&self.mpt.store, &self.memo, &self.mpt.upper, &mut prefix, target)?;
         self.last = out.as_ref().map(|e| e.path.clone());
         Ok(out)
     }
@@ -877,14 +881,17 @@ pub struct StorageTrieNodeCursor<'a> {
 }
 
 impl<'a> StorageTrieNodeCursor<'a> {
+    /// See [`TrieNodeCursor::seek`]: the storage root branch (empty path) is
+    /// never returned, matching reth's stored-trie semantics.
     pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
+        let target: &[u8] = if path_nibbles.is_empty() { &[0] } else { path_nibbles };
         let out = self
             .mpt
             .with_account_storage(&self.account_key, |store, storage| {
                 let mut prefix = Vec::with_capacity(64);
                 match storage {
-                    StorageRef::Node(node) => node_branch_seek(store, &self.memo, node, &mut prefix, path_nibbles),
-                    StorageRef::Ram(ram) => ram_branch_seek(store, &self.memo, ram, &mut prefix, path_nibbles),
+                    StorageRef::Node(node) => node_branch_seek(store, &self.memo, node, &mut prefix, target),
+                    StorageRef::Ram(ram) => ram_branch_seek(store, &self.memo, ram, &mut prefix, target),
                 }
             })?
             .transpose()?
