@@ -574,3 +574,337 @@ mod tests {
         scan(&db);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Branch-node cursor (reth TrieCursor backing): pre-order enumeration of
+// branch positions with per-child masks and cached hashes.
+// ---------------------------------------------------------------------------
+
+/// A branch node surfaced to reth's trie cursor: absolute nibble path plus
+/// per-child classification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrieNodeEntry {
+    pub path: Vec<u8>,
+    /// Children present.
+    pub state_mask: u16,
+    /// Children whose subtrees contain further branch nodes (servable by this
+    /// cursor at a deeper path).
+    pub tree_mask: u16,
+    /// Children whose 32-byte reference hashes are in `hashes` (inline <32B
+    /// references are excluded; consumers recompute those from leaves).
+    pub hash_mask: u16,
+    /// Hashes for `hash_mask` bits, in ascending nibble order.
+    pub hashes: Vec<Hash>,
+}
+
+/// Child classification for mask construction.
+struct ChildInfo {
+    hash: Option<Hash>,
+    has_branch_below: bool,
+}
+
+fn classify_node_child(store: &FlatFile, memo: &RecordMemo, node: &Node) -> Result<ChildInfo> {
+    Ok(match node {
+        Node::Empty => ChildInfo { hash: None, has_branch_below: false },
+        Node::Leaf { nref, .. } | Node::Account { nref, .. } => ChildInfo {
+            hash: match nref {
+                NodeRef::Hash(h) => Some(*h),
+                NodeRef::Inline(_) => None,
+            },
+            has_branch_below: false,
+        },
+        Node::Extension { child, nref, .. } => {
+            let below = classify_node_child(store, memo, child)?;
+            ChildInfo {
+                hash: match nref {
+                    NodeRef::Hash(h) => Some(*h),
+                    NodeRef::Inline(_) => None,
+                },
+                has_branch_below: below.has_branch_below || matches!(**child, Node::Branch { .. }),
+            }
+        }
+        Node::Branch { nref, .. } => ChildInfo {
+            hash: match nref {
+                NodeRef::Hash(h) => Some(*h),
+                NodeRef::Inline(_) => None,
+            },
+            has_branch_below: true,
+        },
+        Node::Overflow { ptr, root } => {
+            let sub = memo.read(store, *ptr)?;
+            let below = classify_node_child(store, memo, &sub.node)?;
+            ChildInfo {
+                hash: Some(*root),
+                has_branch_below: matches!(sub.node, Node::Branch { .. }) || below.has_branch_below,
+            }
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let n = parse_node_lazy(buf, *off, *len)?;
+            classify_node_child(store, memo, &n)?
+        }
+    })
+}
+
+fn classify_ram_child(store: &FlatFile, memo: &RecordMemo, child: &RamChild) -> Result<ChildInfo> {
+    Ok(match child {
+        RamChild::Ram(sub) => ChildInfo {
+            hash: Some(hash_ram_parallel(sub)),
+            has_branch_below: matches!(**sub, RamNode::Branch { .. } | RamNode::Extension { .. }),
+        },
+        RamChild::Disk { ptr, root } => {
+            let sub = memo.read(store, *ptr)?;
+            let below = classify_node_child(store, memo, &sub.node)?;
+            ChildInfo {
+                hash: Some(*root),
+                has_branch_below: below.has_branch_below || matches!(sub.node, Node::Branch { .. }),
+            }
+        }
+        RamChild::Mem(m) => {
+            m.touch();
+            let sub = parse_payload_lazy(m.bytes.clone())?;
+            let below = classify_node_child(store, memo, &sub.node)?;
+            ChildInfo {
+                hash: Some(m.root),
+                has_branch_below: below.has_branch_below || matches!(sub.node, Node::Branch { .. }),
+            }
+        }
+        RamChild::Account(_) => ChildInfo { hash: None, has_branch_below: false },
+    })
+}
+
+/// Pre-order successor over BRANCH positions: smallest branch whose absolute
+/// path is `>= target` (lexicographic nibble order; a parent precedes its
+/// children). Returns the entry with masks/hashes built from child refs.
+fn node_branch_seek(
+    store: &FlatFile,
+    memo: &RecordMemo,
+    node: &Node,
+    prefix: &mut Vec<u8>,
+    target: &[u8],
+) -> Result<Option<TrieNodeEntry>> {
+    match node {
+        Node::Empty | Node::Leaf { .. } | Node::Account { .. } => Ok(None),
+        Node::Extension { path, child, .. } => {
+            let plen = prefix.len();
+            prefix.extend_from_slice(path);
+            // The subtree below this extension covers paths prefixed by `prefix`;
+            // skip it entirely only if even its largest path is < target.
+            let out = if prefix_range_all_less(prefix, target) {
+                None
+            } else {
+                node_branch_seek(store, memo, child, prefix, target)?
+            };
+            prefix.truncate(plen);
+            Ok(out)
+        }
+        Node::Branch { children, .. } => {
+            // Pre-order: this branch itself first (if >= target)...
+            if lex_ge(prefix, target) {
+                return build_branch_entry(store, memo, prefix, |i| {
+                    children[i].as_deref().map(|c| classify_node_child(store, memo, c))
+                })
+                .map(Some);
+            }
+            // ...then children in nibble order.
+            for i in 0..16u8 {
+                let Some(child) = &children[i as usize] else { continue };
+                prefix.push(i);
+                let out = if prefix_range_all_less(prefix, target) {
+                    None
+                } else {
+                    node_branch_seek(store, memo, child, prefix, target)?
+                };
+                prefix.pop();
+                if out.is_some() {
+                    return Ok(out);
+                }
+            }
+            Ok(None)
+        }
+        Node::Overflow { ptr, .. } => {
+            let sub = memo.read(store, *ptr)?;
+            node_branch_seek(store, memo, &sub.node, prefix, target)
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let n = parse_node_lazy(buf, *off, *len)?;
+            node_branch_seek(store, memo, &n, prefix, target)
+        }
+    }
+}
+
+/// Lexicographic `prefix >= target` for nibble paths (parent-before-child order).
+fn lex_ge(path: &[u8], target: &[u8]) -> bool {
+    let n = path.len().min(target.len());
+    match path[..n].cmp(&target[..n]) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Equal prefix: shorter-or-equal path sorts first; path >= target iff
+        // path is at least as long as target.
+        std::cmp::Ordering::Equal => path.len() >= target.len(),
+    }
+}
+
+/// True if EVERY path under `prefix` (prefix itself and its descendants) is
+/// lexicographically `< target` — the subtree can be skipped.
+fn prefix_range_all_less(prefix: &[u8], target: &[u8]) -> bool {
+    let n = prefix.len().min(target.len());
+    match prefix[..n].cmp(&target[..n]) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        // prefix is a prefix of target (or equal): descendants may reach target.
+        std::cmp::Ordering::Equal => false,
+    }
+}
+
+/// Assemble a [`TrieNodeEntry`] at `path` from per-child classification.
+fn build_branch_entry(
+    store: &FlatFile,
+    memo: &RecordMemo,
+    path: &[u8],
+    child: impl Fn(usize) -> Option<Result<ChildInfo>>,
+) -> Result<TrieNodeEntry> {
+    let _ = (store, memo);
+    let mut state_mask = 0u16;
+    let mut tree_mask = 0u16;
+    let mut hash_mask = 0u16;
+    let mut hashes = Vec::new();
+    for i in 0..16usize {
+        let Some(info) = child(i) else { continue };
+        let info = info?;
+        state_mask |= 1 << i;
+        if info.has_branch_below {
+            tree_mask |= 1 << i;
+        }
+        if let Some(h) = info.hash {
+            hash_mask |= 1 << i;
+            hashes.push(h);
+        }
+    }
+    Ok(TrieNodeEntry { path: path.to_vec(), state_mask, tree_mask, hash_mask, hashes })
+}
+
+/// Frontier-level branch-position successor (mirrors [`node_branch_seek`]).
+fn ram_branch_seek(
+    store: &FlatFile,
+    memo: &RecordMemo,
+    node: &RamNode,
+    prefix: &mut Vec<u8>,
+    target: &[u8],
+) -> Result<Option<TrieNodeEntry>> {
+    match node {
+        RamNode::Empty => Ok(None),
+        RamNode::Extension { path, child, .. } => {
+            let plen = prefix.len();
+            prefix.extend_from_slice(path);
+            let out = if prefix_range_all_less(prefix, target) {
+                None
+            } else {
+                ram_branch_seek(store, memo, child, prefix, target)?
+            };
+            prefix.truncate(plen);
+            Ok(out)
+        }
+        RamNode::Branch { children, .. } => {
+            if lex_ge(prefix, target) {
+                return build_branch_entry(store, memo, prefix, |i| {
+                    children[i].as_ref().map(|c| classify_ram_child(store, memo, c))
+                })
+                .map(Some);
+            }
+            for i in 0..16u8 {
+                let Some(child) = &children[i as usize] else { continue };
+                prefix.push(i);
+                let out = if prefix_range_all_less(prefix, target) {
+                    None
+                } else {
+                    match child {
+                        RamChild::Ram(sub) => ram_branch_seek(store, memo, sub, prefix, target)?,
+                        RamChild::Disk { ptr, .. } => {
+                            let sub = memo.read(store, *ptr)?;
+                            node_branch_seek(store, memo, &sub.node, prefix, target)?
+                        }
+                        RamChild::Mem(m) => {
+                            m.touch();
+                            let sub = parse_payload_lazy(m.bytes.clone())?;
+                            node_branch_seek(store, memo, &sub.node, prefix, target)?
+                        }
+                        // Account-trie walk stops at account leaves; their storage
+                        // has its own cursor.
+                        RamChild::Account(_) => None,
+                    }
+                };
+                prefix.pop();
+                if out.is_some() {
+                    return Ok(out);
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Ordered cursor over the account trie's BRANCH nodes (reth TrieCursor
+/// backing). `next()` continues strictly after the last returned path.
+pub struct TrieNodeCursor<'a> {
+    mpt: &'a FlatMpt,
+    memo: RecordMemo,
+    last: Option<Vec<u8>>,
+}
+
+impl<'a> TrieNodeCursor<'a> {
+    /// Smallest branch with path `>=` the given nibble path.
+    pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
+        let mut prefix = Vec::with_capacity(64);
+        let out = ram_branch_seek(&self.mpt.store, &self.memo, &self.mpt.upper, &mut prefix, path_nibbles)?;
+        self.last = out.as_ref().map(|e| e.path.clone());
+        Ok(out)
+    }
+
+    pub fn next(&mut self) -> Result<Option<TrieNodeEntry>> {
+        let Some(mut succ) = self.last.clone() else { return Ok(None) };
+        // Smallest path strictly greater than `last` in pre-order = last ++ [0].
+        succ.push(0);
+        self.seek(&succ)
+    }
+}
+
+/// Ordered cursor over one account's storage BRANCH nodes.
+pub struct StorageTrieNodeCursor<'a> {
+    mpt: &'a FlatMpt,
+    memo: RecordMemo,
+    account_key: Key,
+    last: Option<Vec<u8>>,
+}
+
+impl<'a> StorageTrieNodeCursor<'a> {
+    pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
+        let out = self
+            .mpt
+            .with_account_storage(&self.account_key, |store, storage| {
+                let mut prefix = Vec::with_capacity(64);
+                match storage {
+                    StorageRef::Node(node) => node_branch_seek(store, &self.memo, node, &mut prefix, path_nibbles),
+                    StorageRef::Ram(ram) => ram_branch_seek(store, &self.memo, ram, &mut prefix, path_nibbles),
+                }
+            })?
+            .transpose()?
+            .flatten();
+        self.last = out.as_ref().map(|e| e.path.clone());
+        Ok(out)
+    }
+
+    pub fn next(&mut self) -> Result<Option<TrieNodeEntry>> {
+        let Some(mut succ) = self.last.clone() else { return Ok(None) };
+        succ.push(0);
+        self.seek(&succ)
+    }
+}
+
+impl FlatMpt {
+    pub fn trie_node_cursor(&self) -> TrieNodeCursor<'_> {
+        TrieNodeCursor { mpt: self, memo: RecordMemo::new(), last: None }
+    }
+    pub fn storage_trie_node_cursor(&self, account_key: &Key) -> StorageTrieNodeCursor<'_> {
+        StorageTrieNodeCursor { mpt: self, memo: RecordMemo::new(), account_key: *account_key, last: None }
+    }
+}
