@@ -183,5 +183,19 @@ fn main() {
             (s1[4] - s0[4]) as f64 / 1e6,
             s1[5] - s0[5],
         );
+        // Embedder contract: GC's evacuation runs off the block critical path —
+        // an explicit gc_step between applies (a follower has ~11.9 s of slot
+        // idle). Timed separately so reclaim cost is visible but not conflated.
+        let tg = Instant::now();
+        let evacuated = db.gc_step().unwrap();
+        println!(
+            "  gc_step: {:.0}ms regions={} file={:.0}MB live={:.0}MB garbage={:.0}MB util={:.2}",
+            tg.elapsed().as_secs_f64() * 1e3,
+            evacuated,
+            db.flat_file_len() as f64 / 1e6,
+            db.live_bytes() as f64 / 1e6,
+            db.free_bytes() as f64 / 1e6,
+            db.utilization(),
+        );
     }
 }

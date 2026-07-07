@@ -1591,6 +1591,9 @@ impl FlatMpt {
         // memory grew unbounded (observed: 148 GiB at the 42 GiB threshold).
         self.spill_mem()?;
         self.ram_mode = false;
+        // Deferred-GC reclaim point: persist is always off the block critical
+        // path, so run the evacuation the apply/insert batches no longer do.
+        self.gc_step()?;
         self.store.sync()?;
         let manifest = ManifestRef {
             cfg: &self.cfg,
@@ -2076,22 +2079,15 @@ impl FlatMpt {
                     Ok::<_, anyhow::Error>(out)
                 })?
             };
-            // Inline GC: evacuate live records out of the emptiest regions, skipping
-            // the records this batch already rewrote (deduped by unit).
-            let fg_units: std::collections::HashSet<u32> =
-                groups.iter().map(|(ptr, _, _)| ptr.unit).collect();
-            let t_gc = std::time::Instant::now();
-            // GC runs every batch (including large/coalesced ones) so the file stays
-            // bounded; `MPT_GC_DISABLE=1` turns it off explicitly for one-shot bulk
-            // loads that don't care about reclaim.
-            let r = self.gc_rate();
-            let victims = self.store.seg.lock().unwrap().select_victims(r);
-            reloc = if victims.is_empty() {
-                Vec::new()
-            } else {
-                evacuate_regions(&self.store, &self.upper, &victims, &fg_units)?
-            };
-            stats::on_gc(victims.len() as u64, reloc.len() as u64, t_gc.elapsed().as_nanos() as u64);
+            // GC is deferred off the batch critical path: batches only advance the
+            // epoch (age tracking, see bump_epoch above); victim selection and
+            // evacuation — the region reads + relocation writes that used to run
+            // inline here and dominate batch latency — happen in [`gc_step`],
+            // which the embedder calls off-slot (and `persist` calls anyway).
+            // The env-gated fused paths above (`MPT_GC_OPP`, `MPT_ONE_WRITER`)
+            // remain inline by design: they piggyback evacuation on region reads
+            // the foreground already paid for.
+            reloc = Vec::new();
         }
 
         let b_ns = t_b.elapsed().as_nanos() as u64;
@@ -2312,10 +2308,10 @@ impl FlatMpt {
         Ok(())
     }
 
-    /// Proportional controller for the inline-GC cleaning rate. Nudges
-    /// `gc_regions` (victims/batch) toward holding `live / active` at
-    /// `TARGET_UTIL`: below target ⇒ too much garbage ⇒ clean more; above ⇒ ease
-    /// off. Returns the rate to use this batch (0 until the file passes the floor).
+    /// Proportional controller for the GC cleaning rate. Nudges `gc_regions`
+    /// (victims/round) toward holding `live / active` at `TARGET_UTIL`: below
+    /// target ⇒ too much garbage ⇒ clean more; above ⇒ ease off. Returns the rate
+    /// to use this `gc_step` round (0 until the file passes the floor).
     fn gc_rate(&mut self) -> usize {
         // Kill switch for A/B comparison: MPT_GC_DISABLE=1 turns off all inline
         // compaction (no victims selected, no relocation), so the flat file only
@@ -2335,6 +2331,46 @@ impl FlatMpt {
         let r = (self.gc_regions as i64 + adj).clamp(0, gc_r_max() as i64) as usize;
         self.gc_regions = r;
         r
+    }
+
+    /// Off-the-critical-path GC: select victim regions (cost-benefit, see
+    /// [`RegionAlloc::select_victims`]) and evacuate their live records, in rounds,
+    /// until the active-file utilization reaches `TARGET_UTIL` or nothing qualifies
+    /// — bounded by `MPT_GC_R_MAX` regions per call. Returns regions evacuated.
+    ///
+    /// This is the reclaim half of the split GC design: apply/insert batches only
+    /// do the cheap bookkeeping (epoch bump, per-region liveness), while the
+    /// expensive part — whole-region reads plus relocation writes, which used to
+    /// run inline in every batch and dominate its latency — happens here. The
+    /// embedder calls this between blocks (off-slot); [`persist`](Self::persist)
+    /// also runs it, so periodically-checkpointing embedders reclaim garbage with
+    /// no API change. `MPT_GC_DISABLE=1` makes it a no-op.
+    pub fn gc_step(&mut self) -> Result<usize> {
+        let cap = gc_r_max();
+        let mut evacuated = 0usize;
+        let no_fg: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        while evacuated < cap {
+            if self.utilization() >= TARGET_UTIL {
+                break;
+            }
+            let r = self.gc_rate().min(cap - evacuated);
+            if r == 0 {
+                break;
+            }
+            let victims = self.store.seg.lock().unwrap().select_victims(r);
+            if victims.is_empty() {
+                break;
+            }
+            let t_gc = std::time::Instant::now();
+            let reloc = evacuate_regions(&self.store, &self.upper, &victims, &no_fg)?;
+            let relocated = reloc.len() as u64;
+            for (prefix, new_ptr) in reloc {
+                install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
+            }
+            stats::on_gc(victims.len() as u64, relocated, t_gc.elapsed().as_nanos() as u64);
+            evacuated += victims.len();
+        }
+        Ok(evacuated)
     }
 
     /// Warm the store's read-ahead buffer with every record `apply_block(ops)`
@@ -8066,6 +8102,9 @@ mod tests {
                 .map(|i| (hashed_key(i.to_le_bytes()), vec![0u8; 16]))
                 .collect();
             db.insert_batch(batch).unwrap();
+            // GC is deferred off the batch path; the embedder contract is a
+            // gc_step between batches (off-slot).
+            db.gc_step().unwrap();
         }
         assert!(
             db.flat_file_len() > GC_MIN_PAGES * PAGE,
@@ -8101,6 +8140,8 @@ mod tests {
                     .map(|i| (hashed_key(i.to_le_bytes()), vec![v; 32]))
                     .collect();
                 db.insert_batch(batch).unwrap();
+                // Deferred GC: reclaim runs between batches, not inside them.
+                db.gc_step().unwrap();
             }
         };
         build(&mut db, 0);
@@ -8460,6 +8501,9 @@ mod tests {
                 })
                 .collect();
             db.apply_block(ops).unwrap();
+            // Off-slot GC between blocks: evacuation + region recycling is the
+            // very pressure the quarantine rule must survive.
+            db.gc_step().unwrap();
         }
 
         // Crash: drop without persist. On-disk state = checkpoint manifest +
