@@ -108,9 +108,12 @@ B/key at 1B): large subtrees live on disk behind a single pointer.
 Disk subtrees are compact-encoded `DiskSubtree` records (`[u32 len][payload]`),
 **densely packed at 256 B-aligned offsets** (a `DiskPtr { unit, len }` addresses
 one). The file is a sequence of **128 KiB regions**; a log-structured allocator
-appends records and an inline, self-tuning **garbage collector** evacuates the
-emptiest regions to reclaim space, so the file doesn't grow unboundedly under
-overwrite/split churn.
+appends records densely (exact-size writes; 4 KiB-rounded under `MPT_DIRECT_IO`)
+and a self-tuning **garbage collector** evacuates the emptiest regions to reclaim
+space, so the file doesn't grow unboundedly under overwrite/split churn.
+Evacuation runs **off the batch critical path**: `apply_block`/`insert_batch`
+only keep liveness books; the embedder calls **`gc_step()`** between blocks
+(`persist()` also runs it).
 
 ### 3. The value store (`rocksdb::DB` / `values`)
 The trie stores only a leaf hash — `keccak(key ‖ value)` — so the real value bytes
@@ -238,7 +241,7 @@ the value write and append contention off the read path.
 
 ### `src/lib.rs` component map
 
-- **`FlatMpt`** — top-level DB. `create` / `open` / `persist` / `flush` /
+- **`FlatMpt`** — top-level DB. `create` / `open` / `persist` / `flush` / `gc_step` /
   `insert` / `insert_batch` / `get_value` / `root`, plus observability helpers
   (`ram_nodes`, `flat_file_len`, `free_bytes`, `disk_accesses_for_key`).
   `process_footprint_bytes()` reports the true committed footprint (counts
