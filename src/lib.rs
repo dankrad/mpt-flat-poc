@@ -543,6 +543,15 @@ struct RegionAlloc {
     /// must not be overwritten until the next persist lands (crash safety —
     /// the checkpoint must stay readable). Drained to `free_regions` then.
     quarantine: Vec<u64>,
+    /// Regions an evacuation pass scanned and could NOT empty: their remaining
+    /// live records are unrelocatable (promoted-account storage records aren't
+    /// addressable by account-space prefix, so GC pins them in place). Scanning
+    /// them again is a pure 128 KiB read with zero reclaim — the "GC adds zero
+    /// write bytes but burns wall time in region reads" pathology — so victim
+    /// selection skips them. A pinned region re-enters circulation only when it
+    /// is reopened as a head (its dead space having been reclaimed by whole-
+    /// region death through `free`, which pinning does not block).
+    evac_pinned: Vec<bool>,
 }
 
 impl RegionAlloc {
@@ -553,6 +562,9 @@ impl RegionAlloc {
     fn ensure_region(&mut self, r: u64) {
         if r as usize >= self.fresh.len() {
             self.fresh.resize(r as usize + 1, false);
+        }
+        if r as usize >= self.evac_pinned.len() {
+            self.evac_pinned.resize(r as usize + 1, false);
         }
         if r as usize >= self.live.len() {
             self.live.resize(r as usize + 1, 0);
@@ -577,6 +589,8 @@ impl RegionAlloc {
         self.ensure_region(r);
         self.epoch_of[r as usize] = self.epoch;
         self.fresh[r as usize] = true;
+        // Fresh content: whatever pinned the region's old records is gone.
+        self.evac_pinned[r as usize] = false;
     }
 
     /// Reserve a dense run of `run_units` × 256 B at the head, crediting
@@ -662,7 +676,12 @@ impl RegionAlloc {
             .enumerate()
             .filter_map(|(r, &live)| {
                 let r = r as u64;
-                if live == 0 || live > cap_live || r == self.head_region || free.contains(&r) {
+                if live == 0
+                    || live > cap_live
+                    || r == self.head_region
+                    || free.contains(&r)
+                    || self.evac_pinned.get(r as usize).copied().unwrap_or(false)
+                {
                     return None;
                 }
                 let u = live as f64 / REGION_UNITS as f64;
@@ -2366,6 +2385,20 @@ impl FlatMpt {
             let relocated = reloc.len() as u64;
             for (prefix, new_ptr) in reloc {
                 install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
+            }
+            // A full evacuation drives a victim's live count to zero (relocating
+            // frees the old copies). A victim still live after the pass holds
+            // unrelocatable records (promoted-account storage is pinned in
+            // place): pin the region so selection stops re-reading it for zero
+            // reclaim. This is also the loop's progress guarantee.
+            {
+                let mut seg = self.store.seg.lock().unwrap();
+                for &r in &victims {
+                    if seg.live.get(r as usize).copied().unwrap_or(0) > 0 {
+                        seg.ensure_region(r);
+                        seg.evac_pinned[r as usize] = true;
+                    }
+                }
             }
             stats::on_gc(victims.len() as u64, relocated, t_gc.elapsed().as_nanos() as u64);
             evacuated += victims.len();
