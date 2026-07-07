@@ -808,6 +808,9 @@ struct FlatFile {
     /// Page cache bypassed (O_DIRECT / F_NOCACHE) ⇒ reads/writes use aligned
     /// buffers and offset/length widening.
     direct: bool,
+    /// Prefetched record payloads keyed by unit (filled by `prefetch_block`
+    /// during execution, consumed one-shot by `read_lazy` at apply time).
+    read_ahead: Mutex<std::collections::HashMap<u32, Vec<u8>>>,
 }
 
 /// Pages needed to hold a record of `record_bytes` (length prefix + payload).
@@ -822,6 +825,7 @@ impl FlatFile {
             seg: Mutex::new(RegionAlloc::default()),
             end_page: AtomicU64::new(0),
             direct,
+            read_ahead: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -829,6 +833,21 @@ impl FlatFile {
     /// is widened to [`DIO_ALIGN`] boundaries into an aligned buffer (O_DIRECT
     /// requires aligned offset+length+buffer) and the payload copied out; buffered
     /// I/O reads exactly `len` into a tight `Vec` (kept zero-copy via `Arc`).
+    /// One-shot read-ahead consume: a prefetched payload for this unit, if the
+    /// prefetcher warmed it (removed on hit; stale entries for rewritten
+    /// records are simply never hit and cleared at the end of the apply).
+    fn read_ahead_take(&self, unit: u32) -> Option<Vec<u8>> {
+        self.read_ahead.lock().unwrap().remove(&unit)
+    }
+
+    pub(crate) fn read_ahead_insert(&self, unit: u32, payload: Vec<u8>) {
+        self.read_ahead.lock().unwrap().insert(unit, payload);
+    }
+
+    pub(crate) fn read_ahead_clear(&self) {
+        self.read_ahead.lock().unwrap().clear();
+    }
+
     fn read_payload(&self, off: u64, len: usize) -> Result<Vec<u8>> {
         if self.direct {
             let lo = off & !(DIO_ALIGN - 1);
@@ -1036,7 +1055,9 @@ impl FlatFile {
     /// Lazy read: parse only the spine; child subtrees stay `Raw`. Used by the
     /// insert path, where a record is touched on one key's path per call.
     fn read_lazy(&self, ptr: DiskPtr) -> Result<DiskSubtree> {
-        let record = {
+        let record = if let Some(pre) = self.read_ahead_take(ptr.unit) {
+            pre
+        } else {
             let _g = prof::scope(prof::Cat::FileRead);
             let it = std::time::Instant::now();
             // Payload starts just past the framing header.
@@ -1504,6 +1525,7 @@ impl FlatMpt {
             }),
             end_page: AtomicU64::new(end_page),
             direct,
+            read_ahead: Mutex::new(std::collections::HashMap::new()),
         };
         {
             let mut live = vec![0u32; num_regions as usize];
@@ -2261,7 +2283,11 @@ impl FlatMpt {
         }
         flush_spill_chunk(&self.store, &mut buf)?;
         for (prefix, ptr) in buf.installs {
-            install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr);
+            // A failed install would leave the frontier pointing at the zeroed
+            // placeholder — silent corruption on the next read. Fail loudly.
+            if !install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr) {
+                bail!("spill install found no Disk slot at prefix {prefix:x?}");
+            }
         }
         Ok(())
     }
@@ -2289,6 +2315,47 @@ impl FlatMpt {
         let r = (self.gc_regions as i64 + adj).clamp(0, gc_r_max() as i64) as usize;
         self.gc_regions = r;
         r
+    }
+
+    /// Warm the store's read-ahead buffer with every record `apply_block(ops)`
+    /// would read, without mutating anything (`&self`; safe concurrently with
+    /// point reads). Meant to run during execution so the finish-path apply
+    /// finds its records in RAM: routing reuses the exact same frontier walk
+    /// as the apply, so coverage matches by construction. Records the apply
+    /// reaches only via promotion-created pointers still hit the file.
+    pub fn prefetch_block(&self, ops: &[(Key, StateOp)]) -> Result<()> {
+        let groups = normalize_block(ops.to_vec());
+        let mut ptrs: Vec<DiskPtr> = Vec::new();
+        for (key, upd) in &groups {
+            route_group_ptrs(&self.upper, 0, key, upd, &mut ptrs);
+        }
+        ptrs.sort_by_key(|p| p.unit);
+        ptrs.dedup_by_key(|p| p.unit);
+        if ptrs.is_empty() {
+            return Ok(());
+        }
+        let store = &self.store;
+        let workers = worker_count().min(ptrs.len());
+        let chunk = ptrs.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for w in ptrs.chunks(chunk) {
+                scope.spawn(move || {
+                    for p in w {
+                        if let Ok(payload) =
+                            store.read_payload(p.offset() + RECORD_HDR as u64, p.len as usize)
+                        {
+                            store.read_ahead_insert(p.unit, payload);
+                        }
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// Drop any unconsumed read-ahead entries (stale after an apply).
+    pub fn prefetch_clear(&self) {
+        self.store.read_ahead_clear();
     }
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
@@ -2400,6 +2467,39 @@ impl FlatMpt {
             free_regions,
             free_list_bytes,
         }
+    }
+
+    /// Forensic hash audit: recompute every hash bottom-up from raw bytes,
+    /// ignoring **all** cached layers — frontier `HashCell`s, `Disk{root}` /
+    /// `Mem{root}` fields, and the nrefs embedded in serialized records — and
+    /// report exactly which cached layer disagrees with the recomputation.
+    /// Read-only; `report.true_root` is the trie's actual root.
+    pub fn audit_hashes(&self) -> Result<HashAudit> {
+        let mut st = HashAudit::default();
+        st.true_root = audit_ram_node(&self.store, &self.upper, &[], &mut st, 2)?;
+        Ok(st)
+    }
+
+    /// Enumerate every account and storage slot in the trie in ascending key
+    /// order, invoking `f` for each. Accounts are emitted before their slots.
+    /// Read-only. For parallel scans, see [`scan_top`](Self::scan_top).
+    pub fn scan(&self, f: &mut dyn FnMut(ScanEntry) -> Result<()>) -> Result<()> {
+        let mut prefix = Vec::new();
+        scan_ram_node(&self.store, &self.upper, &mut prefix, None, f)
+    }
+
+    /// Like [`scan`](Self::scan) but walks only the root branch's child at
+    /// `top_nibble` — the unit of parallelism for whole-trie scans (the 16 top
+    /// subtrees are disjoint; `&self` scans are read-only and thread-safe).
+    pub fn scan_top(&self, top_nibble: u8, f: &mut dyn FnMut(ScanEntry) -> Result<()>) -> Result<()> {
+        let RamNode::Branch { children, .. } = &self.upper else {
+            bail!("scan_top requires a branch root");
+        };
+        let Some(child) = &children[top_nibble as usize] else {
+            return Ok(());
+        };
+        let mut prefix = vec![top_nibble];
+        scan_ram_child(&self.store, child, &mut prefix, None, f)
     }
 
     /// Number of flat-file records read to reach `key` (1 + the overflow-chain
@@ -6681,6 +6781,439 @@ fn ram_child_stale(child: &RamChild) -> bool {
     }
 }
 
+/// Result of [`FlatMpt::audit_hashes`]: counts per cached-hash layer, with the
+/// first mismatches sampled for forensics.
+#[derive(Default, Debug)]
+pub struct HashAudit {
+    /// The root recomputed from raw bytes, ignoring every cache.
+    pub true_root: Hash,
+    /// Frontier Branch/Extension nodes visited.
+    pub frontier_nodes: u64,
+    /// Frontier `HashCell`s that were set but disagree with the recomputation.
+    pub stale_cells: u64,
+    /// `RamChild::Disk` leaves visited (state + storage frontiers).
+    pub disk_leaves: u64,
+    /// `Disk{root}` fields that disagree with the record's recomputed root.
+    pub bad_disk_roots: u64,
+    /// `RamChild::Mem` leaves visited.
+    pub mem_leaves: u64,
+    /// `Mem` cached roots that disagree with the recomputed root of their bytes.
+    pub bad_mem_roots: u64,
+    /// Records whose stored prefix differs from their frontier position (a
+    /// misinstalled/aliased pointer).
+    pub bad_prefixes: u64,
+    /// Promoted accounts visited.
+    pub accounts: u64,
+    /// Serialized in-record nrefs (leaf/ext/branch/account/raw headers) that
+    /// disagree with the recomputation — stale hashes baked into record bytes.
+    pub bad_record_nrefs: u64,
+    /// `Node::Account::storage_root` fields that disagree with the recomputation.
+    pub bad_record_storage_roots: u64,
+    /// First few mismatches, described.
+    pub samples: Vec<String>,
+}
+
+impl HashAudit {
+    const MAX_SAMPLES: usize = 40;
+    fn sample(&mut self, s: String) {
+        if self.samples.len() < Self::MAX_SAMPLES {
+            self.samples.push(s);
+        }
+    }
+    fn merge(&mut self, o: HashAudit) {
+        self.frontier_nodes += o.frontier_nodes;
+        self.stale_cells += o.stale_cells;
+        self.disk_leaves += o.disk_leaves;
+        self.bad_disk_roots += o.bad_disk_roots;
+        self.mem_leaves += o.mem_leaves;
+        self.bad_mem_roots += o.bad_mem_roots;
+        self.bad_prefixes += o.bad_prefixes;
+        self.accounts += o.accounts;
+        self.bad_record_nrefs += o.bad_record_nrefs;
+        self.bad_record_storage_roots += o.bad_record_storage_roots;
+        for s in o.samples {
+            self.sample(s);
+        }
+    }
+    /// Whether any cached layer disagreed with the recomputation.
+    pub fn clean(&self) -> bool {
+        self.stale_cells == 0
+            && self.bad_disk_roots == 0
+            && self.bad_mem_roots == 0
+            && self.bad_prefixes == 0
+            && self.bad_record_nrefs == 0
+            && self.bad_record_storage_roots == 0
+    }
+}
+
+fn nib_hex(nibbles: &[u8]) -> String {
+    nibbles.iter().map(|n| char::from_digit(*n as u32, 16).unwrap()).collect()
+}
+
+/// Recompute a frontier node's hash from scratch, checking its `HashCell` (if
+/// set) against the recomputation. `par` levels of branch fan-out run children
+/// on scoped threads (each thread audits a disjoint subtree).
+fn audit_ram_node(
+    store: &FlatFile,
+    node: &RamNode,
+    prefix: &[u8],
+    st: &mut HashAudit,
+    par: usize,
+) -> Result<Hash> {
+    Ok(match node {
+        RamNode::Empty => empty_hash(),
+        RamNode::Extension { path, child, hash } => {
+            st.frontier_nodes += 1;
+            let mut p = prefix.to_vec();
+            p.extend_from_slice(path);
+            let ch = audit_ram_node(store, child, &p, st, par)?;
+            let computed = ext_ref(path, &NodeRef::Hash(ch)).finalize();
+            if let Some(c) = hash.get() {
+                if c != computed {
+                    st.stale_cells += 1;
+                    st.sample(format!("stale ext HashCell at [{}]", nib_hex(prefix)));
+                }
+            }
+            computed
+        }
+        RamNode::Branch { children, hash } => {
+            st.frontier_nodes += 1;
+            let child_hashes: Vec<Hash> = if par > 0 {
+                let results: Vec<(Hash, HashAudit)> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = children
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+                        .map(|(i, c)| {
+                            let mut p = prefix.to_vec();
+                            p.push(i as u8);
+                            scope.spawn(move || -> Result<(Hash, HashAudit)> {
+                                let mut sub = HashAudit::default();
+                                let h = audit_ram_child(store, c, &p, &mut sub, par - 1)?;
+                                Ok((h, sub))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("audit thread panicked"))
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                results
+                    .into_iter()
+                    .map(|(h, sub)| {
+                        st.merge(sub);
+                        h
+                    })
+                    .collect()
+            } else {
+                let mut hs = Vec::new();
+                for (i, c) in children.iter().enumerate() {
+                    if let Some(c) = c {
+                        let mut p = prefix.to_vec();
+                        p.push(i as u8);
+                        hs.push(audit_ram_child(store, c, &p, st, 0)?);
+                    }
+                }
+                hs
+            };
+            let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
+            let computed =
+                branch_ref(bitmap, child_hashes.into_iter().map(NodeRef::Hash)).finalize();
+            if let Some(c) = hash.get() {
+                if c != computed {
+                    st.stale_cells += 1;
+                    st.sample(format!("stale branch HashCell at [{}]", nib_hex(prefix)));
+                }
+            }
+            computed
+        }
+    })
+}
+
+/// Recompute a frontier child's hash from scratch, checking the cached `root`
+/// field (Disk/Mem) and the record's stored prefix against its frontier position.
+fn audit_ram_child(
+    store: &FlatFile,
+    child: &RamChild,
+    prefix: &[u8],
+    st: &mut HashAudit,
+    par: usize,
+) -> Result<Hash> {
+    Ok(match child {
+        RamChild::Ram(node) => audit_ram_node(store, node, prefix, st, par)?,
+        RamChild::Mem(m) => {
+            st.mem_leaves += 1;
+            let subtree = deserialize_subtree_lazy(m.bytes.clone())?;
+            if subtree.prefix != prefix {
+                st.bad_prefixes += 1;
+                st.sample(format!(
+                    "Mem record at [{}] carries prefix [{}]",
+                    nib_hex(prefix),
+                    nib_hex(&subtree.prefix)
+                ));
+            }
+            let computed = audit_record_ref(&subtree.node, st)?.finalize();
+            if computed != m.root {
+                st.bad_mem_roots += 1;
+                st.sample(format!(
+                    "Mem root at [{}]: cached {} recomputed {}",
+                    nib_hex(prefix),
+                    hex(m.root),
+                    hex(computed)
+                ));
+            }
+            computed
+        }
+        RamChild::Disk { ptr, root } => {
+            st.disk_leaves += 1;
+            let subtree = store.read_lazy(*ptr)?;
+            if subtree.prefix != prefix {
+                st.bad_prefixes += 1;
+                st.sample(format!(
+                    "Disk record at [{}] (unit {}) carries prefix [{}]",
+                    nib_hex(prefix),
+                    ptr.unit,
+                    nib_hex(&subtree.prefix)
+                ));
+            }
+            let computed = audit_record_ref(&subtree.node, st)?.finalize();
+            if computed != *root {
+                st.bad_disk_roots += 1;
+                st.sample(format!(
+                    "Disk root at [{}] (unit {}): cached {} recomputed {}",
+                    nib_hex(prefix),
+                    ptr.unit,
+                    hex(*root),
+                    hex(computed)
+                ));
+            }
+            computed
+        }
+        RamChild::Account(a) => {
+            st.accounts += 1;
+            // Storage records carry storage-relative prefixes.
+            let sroot = audit_ram_node(store, &a.storage, &[], st, 0)?;
+            leaf_ref(&a.path, &ram_account_rlp(a.nonce, &a.balance, &a.code_hash, sroot))
+                .finalize()
+        }
+    })
+}
+
+/// Recompute a record node's reference from scratch (expanding `Raw` children),
+/// checking every embedded nref / cached storage root along the way.
+fn audit_record_ref(node: &Node, st: &mut HashAudit) -> Result<NodeRef> {
+    Ok(match node {
+        Node::Empty => NodeRef::Hash(empty_hash()),
+        Node::Leaf { path, value, nref } => {
+            let computed = leaf_ref(path, value);
+            if computed != *nref {
+                st.bad_record_nrefs += 1;
+                st.sample("stale in-record leaf nref".to_string());
+            }
+            computed
+        }
+        Node::Extension { path, child, nref } => {
+            let cr = audit_record_ref(child, st)?;
+            let computed = ext_ref(path, &cr);
+            if computed != *nref {
+                st.bad_record_nrefs += 1;
+                st.sample("stale in-record ext nref".to_string());
+            }
+            computed
+        }
+        Node::Branch { children, nref } => {
+            let mut refs = Vec::with_capacity(16);
+            for c in children.iter().flatten() {
+                refs.push(audit_record_ref(c, st)?);
+            }
+            let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
+            let computed = branch_ref(bitmap, refs.into_iter());
+            if computed != *nref {
+                st.bad_record_nrefs += 1;
+                st.sample("stale in-record branch nref".to_string());
+            }
+            computed
+        }
+        Node::Account { path, nonce, balance, code_hash, storage, storage_root, nref } => {
+            let sr = audit_record_ref(storage, st)?.finalize();
+            if sr != *storage_root {
+                st.bad_record_storage_roots += 1;
+                st.sample(format!(
+                    "stale in-record account storage_root: cached {} recomputed {}",
+                    hex(*storage_root),
+                    hex(sr)
+                ));
+            }
+            let rlp = eth::Account {
+                nonce: *nonce,
+                balance: *balance,
+                storage_root: B256::from(sr),
+                code_hash: B256::from(*code_hash),
+            }
+            .rlp();
+            let computed = leaf_ref(path, &rlp);
+            if computed != *nref {
+                st.bad_record_nrefs += 1;
+                st.sample("stale in-record account nref".to_string());
+            }
+            computed
+        }
+        // Option B: no on-disk overflow children; trust would be unverifiable here.
+        Node::Overflow { root, .. } => NodeRef::Hash(*root),
+        Node::Raw { buf, off, len, nref } => {
+            let expanded = parse_node_lazy(buf, *off, *len)?;
+            let computed = audit_record_ref(&expanded, st)?;
+            if computed != *nref {
+                st.bad_record_nrefs += 1;
+                st.sample("stale Raw header nref".to_string());
+            }
+            computed
+        }
+    })
+}
+
+/// One entry of a [`FlatMpt::scan`] enumeration.
+#[derive(Debug)]
+pub enum ScanEntry {
+    /// A structured account leaf (fields; storage slots follow as `Slot` entries).
+    Account { key: Key, nonce: u64, balance: U256, code_hash: Hash },
+    /// An opaque account/value leaf in the state trie (pre-RLP'd payload).
+    Opaque { key: Key, value: Vec<u8> },
+    /// One storage slot of the most recently emitted account.
+    Slot { account: Key, slot: Key, value: Vec<u8> },
+}
+
+/// [`nibbles_to_key`] with a hard length check (scans must never mis-assemble).
+fn nibbles_to_key_checked(nibbles: &[u8]) -> Result<Key> {
+    if nibbles.len() != 64 {
+        bail!("leaf path sums to {} nibbles, want 64", nibbles.len());
+    }
+    Ok(nibbles_to_key(nibbles))
+}
+
+fn scan_ram_node(
+    store: &FlatFile,
+    node: &RamNode,
+    prefix: &mut Vec<u8>,
+    ctx: Option<Key>,
+    f: &mut dyn FnMut(ScanEntry) -> Result<()>,
+) -> Result<()> {
+    match node {
+        RamNode::Empty => Ok(()),
+        RamNode::Extension { path, child, .. } => {
+            let n = prefix.len();
+            prefix.extend_from_slice(path);
+            scan_ram_node(store, child, prefix, ctx, f)?;
+            prefix.truncate(n);
+            Ok(())
+        }
+        RamNode::Branch { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                if let Some(c) = c {
+                    prefix.push(i as u8);
+                    scan_ram_child(store, c, prefix, ctx, f)?;
+                    prefix.pop();
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn scan_ram_child(
+    store: &FlatFile,
+    child: &RamChild,
+    prefix: &mut Vec<u8>,
+    ctx: Option<Key>,
+    f: &mut dyn FnMut(ScanEntry) -> Result<()>,
+) -> Result<()> {
+    match child {
+        RamChild::Ram(node) => scan_ram_node(store, node, prefix, ctx, f),
+        RamChild::Mem(m) => {
+            let subtree = deserialize_subtree_lazy(m.bytes.clone())?;
+            let mut path = subtree.prefix.clone();
+            scan_record_node(store, &subtree.node, &mut path, ctx, f)
+        }
+        RamChild::Disk { ptr, .. } => {
+            let subtree = store.read_lazy(*ptr)?;
+            let mut path = subtree.prefix.clone();
+            scan_record_node(store, &subtree.node, &mut path, ctx, f)
+        }
+        RamChild::Account(a) => {
+            let mut full = prefix.clone();
+            full.extend_from_slice(&a.path);
+            let key = nibbles_to_key_checked(&full)?;
+            f(ScanEntry::Account {
+                key,
+                nonce: a.nonce,
+                balance: U256::from_be_bytes(a.balance),
+                code_hash: a.code_hash,
+            })?;
+            // Storage frontier prefixes are storage-relative.
+            let mut spath = Vec::new();
+            scan_ram_node(store, &a.storage, &mut spath, Some(key), f)
+        }
+    }
+}
+
+fn scan_record_node(
+    store: &FlatFile,
+    node: &Node,
+    path: &mut Vec<u8>,
+    ctx: Option<Key>,
+    f: &mut dyn FnMut(ScanEntry) -> Result<()>,
+) -> Result<()> {
+    match node {
+        Node::Empty => Ok(()),
+        Node::Leaf { path: lp, value, .. } => {
+            let n = path.len();
+            path.extend_from_slice(lp);
+            let key = nibbles_to_key_checked(path)?;
+            path.truncate(n);
+            match ctx {
+                Some(account) => f(ScanEntry::Slot { account, slot: key, value: value.clone() }),
+                None => f(ScanEntry::Opaque { key, value: value.clone() }),
+            }
+        }
+        Node::Account { path: lp, nonce, balance, code_hash, storage, .. } => {
+            let n = path.len();
+            path.extend_from_slice(lp);
+            let key = nibbles_to_key_checked(path)?;
+            path.truncate(n);
+            f(ScanEntry::Account { key, nonce: *nonce, balance: *balance, code_hash: *code_hash })?;
+            let mut spath = Vec::new();
+            scan_record_node(store, storage, &mut spath, Some(key), f)
+        }
+        Node::Extension { path: ep, child, .. } => {
+            let n = path.len();
+            path.extend_from_slice(ep);
+            scan_record_node(store, child, path, ctx, f)?;
+            path.truncate(n);
+            Ok(())
+        }
+        Node::Branch { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                if let Some(c) = c {
+                    path.push(i as u8);
+                    scan_record_node(store, c, path, ctx, f)?;
+                    path.pop();
+                }
+            }
+            Ok(())
+        }
+        Node::Overflow { ptr, .. } => {
+            let subtree = store.read_lazy(*ptr)?;
+            let mut sub_path = subtree.prefix.clone();
+            scan_record_node(store, &subtree.node, &mut sub_path, ctx, f)
+        }
+        Node::Raw { buf, off, len, .. } => {
+            let expanded = parse_node_lazy(buf, *off, *len)?;
+            scan_record_node(store, &expanded, path, ctx, f)
+        }
+    }
+}
+
 /// A node's *reference* as embedded in its parent: `keccak256(RLP)` when the node's
 /// RLP is ≥ 32 bytes, or the RLP inlined verbatim when it is `< 32` (Ethereum's
 /// inline rule). Small storage-slot leaves and their tiny parents are the case that
@@ -8284,5 +8817,104 @@ mod tests {
         };
         oracle2[0] = (keys[1].to_vec(), sr.rlp());
         assert_eq!(root2, eth::root(&oracle2).0, "apply_block on bulk load");
+    }
+
+    /// Mid-build spills followed by inserts into the spilled subtrees must stay
+    /// root-exact (the rethload revisit path: a bulk load crosses the RAM-build
+    /// threshold mid-stream, spills, and keeps inserting). Sorted contiguous
+    /// batches with a forced full spill between them: every later batch descends
+    /// into `Disk` leaves the earlier spill created.
+    #[test]
+    fn mid_build_spill_then_revisit_matches_oracle() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use std::collections::BTreeMap;
+
+        let cfg =
+            Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut rng = StdRng::seed_from_u64(0x5B111);
+
+        let mut entries: Vec<(Key, AccountSeed)> = Vec::new();
+        let mut oracle_accts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..2000u64 {
+            let mut k = [0u8; 32];
+            rng.fill(&mut k);
+            let n_slots = match i % 10 {
+                0 => rng.gen_range(1..8),
+                1 => rng.gen_range(50..120), // promotes at the 1 KiB cap
+                _ => 0,
+            };
+            let mut slots: Vec<(Key, Vec<u8>)> = Vec::new();
+            let mut sm: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for _ in 0..n_slots {
+                let mut sk = [0u8; 32];
+                rng.fill(&mut sk);
+                let v: Vec<u8> = (0..rng.gen_range(1..=33)).map(|_| rng.r#gen()).collect();
+                sm.insert(sk.to_vec(), v.clone());
+                slots.push((sk, v));
+            }
+            let storage_root = if sm.is_empty() {
+                eth::EMPTY_ROOT
+            } else {
+                let se: Vec<(Vec<u8>, Vec<u8>)> =
+                    sm.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+                eth::root(&se)
+            };
+            let acct = eth::Account {
+                nonce: i,
+                balance: U256::from(i * 31),
+                storage_root,
+                code_hash: B256::from([7u8; 32]),
+            };
+            oracle_accts.push((k.to_vec(), acct.rlp()));
+            entries.push((
+                k,
+                AccountSeed { nonce: i, balance: U256::from(i * 31), code_hash: [7u8; 32], slots },
+            ));
+        }
+        entries.sort_by_key(|(k, _)| *k);
+        let want = eth::root(&oracle_accts).0;
+
+        let mut mpt = db(cfg);
+        mpt.ram_mode = true;
+        for (b, chunk) in entries.chunks(250).enumerate() {
+            mpt.insert_batch_accounts(chunk.to_vec()).unwrap();
+            // Forced threshold crossing after every batch (spill_mem keeps
+            // ram_mode, exactly like maybe_spill mid-build).
+            mpt.spill_mem().unwrap();
+            let _ = b;
+        }
+        assert_eq!(hex(mpt.root()), hex(want), "spill+revisit vs oracle");
+
+        // The forensic auditor agrees: caches consistent, true root == oracle.
+        let audit = mpt.audit_hashes().unwrap();
+        assert!(audit.clean(), "audit found stale caches: {audit:?}");
+        assert_eq!(hex(audit.true_root), hex(want), "audit true root vs oracle");
+
+        // The scan enumerates exactly the inserted accounts and slots, in order.
+        let mut got_accts = 0usize;
+        let mut got_slots = 0usize;
+        let mut last_key: Option<Key> = None;
+        let by_key: std::collections::BTreeMap<Key, &AccountSeed> =
+            entries.iter().map(|(k, s)| (*k, s)).collect();
+        mpt.scan(&mut |e| {
+            match e {
+                ScanEntry::Account { key, nonce, .. } => {
+                    assert!(last_key.replace(key).is_none_or(|p| p < key), "scan out of order");
+                    assert_eq!(by_key[&key].nonce, nonce, "scanned nonce");
+                    got_accts += 1;
+                }
+                ScanEntry::Slot { account, slot, value } => {
+                    let seed = by_key[&account];
+                    let v = seed.slots.iter().find(|(k, _)| *k == slot).map(|(_, v)| v);
+                    assert_eq!(v, Some(&value), "scanned slot value");
+                    got_slots += 1;
+                }
+                ScanEntry::Opaque { key, .. } => panic!("unexpected opaque leaf {}", hex(key)),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got_accts, entries.len(), "scan account count");
+        assert_eq!(got_slots, entries.iter().map(|(_, s)| s.slots.len()).sum::<usize>(), "scan slot count");
     }
 }
