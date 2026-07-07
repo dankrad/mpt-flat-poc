@@ -833,11 +833,14 @@ impl FlatFile {
     /// is widened to [`DIO_ALIGN`] boundaries into an aligned buffer (O_DIRECT
     /// requires aligned offset+length+buffer) and the payload copied out; buffered
     /// I/O reads exactly `len` into a tight `Vec` (kept zero-copy via `Arc`).
-    /// One-shot read-ahead consume: a prefetched payload for this unit, if the
-    /// prefetcher warmed it (removed on hit; stale entries for rewritten
-    /// records are simply never hit and cleared at the end of the apply).
+    /// Read-ahead lookup: a prefetched payload for this unit, if the prefetcher
+    /// warmed it. Non-destructive (cloned, a few KB) — point reads and the
+    /// apply may both hit the same record, and a consuming read would steal
+    /// the buffer from the apply. Entries are dropped wholesale by
+    /// `read_ahead_clear` at the end of the apply; stale entries for
+    /// rewritten records are never hit (fresh ptrs get fresh units).
     fn read_ahead_take(&self, unit: u32) -> Option<Vec<u8>> {
-        self.read_ahead.lock().unwrap().remove(&unit)
+        self.read_ahead.lock().unwrap().get(&unit).cloned()
     }
 
     pub(crate) fn read_ahead_insert(&self, unit: u32, payload: Vec<u8>) {
