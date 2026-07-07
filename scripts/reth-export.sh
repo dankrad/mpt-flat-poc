@@ -31,6 +31,23 @@ dump() { # <table> <jq-filter> <outfile>
   done
 }
 
+# Record which block the hashed tables actually reflect — from the datadir's own
+# stage checkpoint — plus that block's header stateRoot. Passing an assumed block's
+# root to the loader once cost a full 400M-account load: the datadir had synced
+# past the assumed block, the export was faithfully at the newer state, and the
+# (correct) reconstructed root was compared against the older block's root.
+BLOCK=$(reth db --datadir "$DD" --log.stdout.filter error list StageCheckpoints --json 2>/dev/null \
+  | jq -r '.[] | select(.[0] == "AccountHashing") | .[1].block_number')
+ROOT=$(reth db --datadir "$DD" --log.stdout.filter error get static-file headers "$BLOCK" 2>/dev/null \
+  | jq -r '.stateRoot // empty' || true)
+if [ -z "$ROOT" ]; then
+  # Older reth prints non-JSON around the value; scrape the field.
+  ROOT=$(reth db --datadir "$DD" --log.stdout.filter error get static-file headers "$BLOCK" 2>/dev/null \
+    | grep -oE '"stateRoot": *"0x[0-9a-f]{64}"' | grep -oE '0x[0-9a-f]{64}')
+fi
+echo "hashed state is at block $BLOCK, stateRoot $ROOT" >&2
+printf '%s %s\n' "$BLOCK" "$ROOT" > "$OUT/block-$BLOCK.meta"
+
 echo "exporting accounts..." >&2
 dump HashedAccounts \
   '.[] | [.[0], (.[1].nonce|tostring), .[1].balance, (.[1].bytecode_hash // "null")] | @tsv' \

@@ -142,6 +142,16 @@ fn main() {
         if cold {
             drop_cache(&path);
         }
+        use mpt_flat_poc::stats;
+        use std::sync::atomic::Ordering::Relaxed;
+        let s0 = [
+            stats::WRITE_BYTES.load(Relaxed),
+            stats::GC_RELOC_BYTES.load(Relaxed),
+            stats::GC_EVAC_BYTES_READ.load(Relaxed),
+            stats::PROMOTE_CHILD_BYTES.load(Relaxed),
+            stats::SPLIT_LEAF_BYTES.load(Relaxed),
+            stats::WRITES.load(Relaxed),
+        ];
         prof::reset();
         let (r0, w0) = proc_io();
         let c0 = cpu_seconds();
@@ -151,13 +161,27 @@ fn main() {
         let c1 = cpu_seconds();
         let (r1, w1) = proc_io();
         let snap = prof::snapshot();
+        let s1 = [
+            stats::WRITE_BYTES.load(Relaxed),
+            stats::GC_RELOC_BYTES.load(Relaxed),
+            stats::GC_EVAC_BYTES_READ.load(Relaxed),
+            stats::PROMOTE_CHILD_BYTES.load(Relaxed),
+            stats::SPLIT_LEAF_BYTES.load(Relaxed),
+            stats::WRITES.load(Relaxed),
+        ];
         println!(
-            "{b},{:.0},{:.0},{:.1},{:.1},{}",
+            "{b},{:.0},{:.0},{:.1},{:.1},{},payload={:.0},gc_reloc={:.0},gc_read={:.0},promote={:.0},split={:.0},nwrites={}",
             wall,
             (c1 - c0) * 1e3,
             (r1 - r0) as f64 / 1e6,
             (w1 - w0) as f64 / 1e6,
             snap.map(|(n, _)| format!("{:.0}", n as f64 / 1e6)).join(","),
+            (s1[0] - s0[0]) as f64 / 1e6,
+            (s1[1] - s0[1]) as f64 / 1e6,
+            (s1[2] - s0[2]) as f64 / 1e6,
+            (s1[3] - s0[3]) as f64 / 1e6,
+            (s1[4] - s0[4]) as f64 / 1e6,
+            s1[5] - s0[5],
         );
     }
 }
