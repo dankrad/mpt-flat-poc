@@ -3816,9 +3816,18 @@ fn apply_net_in_record(
                 inv.push((*key, StateOp::SetStorage { slot: *skey, value: v.clone() }));
             }
         }
-        if !slots.is_empty() {
-            record_node_delete(node, depth, key, DeleteOp::WipeStorage)?;
-            changed = true;
+        // `slots` is empty both for empty storage AND for an opaque leaf whose
+        // (non-empty) storage root is folded into the RLP: consult the prior
+        // account's root so an opaque wipe still resets storage to empty.
+        let opaque_nonempty = slots.is_empty()
+            && prior.as_ref().is_some_and(|p| p.storage_root != eth::EMPTY_ROOT);
+        if !slots.is_empty() || opaque_nonempty {
+            if !matches!(
+                record_node_delete(node, depth, key, DeleteOp::WipeStorage)?,
+                NodeDelete::Absent
+            ) {
+                changed = true;
+            }
         }
     }
 
@@ -4788,10 +4797,28 @@ fn apply_op(store: &FlatFile, cfg: &Config, old: Node, path: Vec<u8>, op: LeafOp
     Ok(match (old, op) {
         // Overwrite a value leaf.
         (Node::Leaf { .. }, LeafOp::Value(value)) => leaf_node(path, value),
-        // Replace an opaque (value-leaf) account with a structured one; its
-        // unknown storage is dropped — the caller now owns the storage contents.
-        (Node::Leaf { .. }, LeafOp::Account { nonce, balance, code_hash }) => {
-            account_node(path, nonce, balance, code_hash, Node::Empty)
+        // An account stored as an opaque value leaf (storage root folded into the
+        // RLP, contents not materialized — e.g. a `rethload` oracle build). A
+        // field update must PRESERVE the storage root it cannot recompute:
+        // re-encode the RLP with the new fields and the prior root, staying
+        // opaque. Resetting it to EMPTY_ROOT here silently wiped the contract's
+        // storage (the tip-25474546 divergence). A leaf with an empty storage
+        // root (EOA / fresh contract) converts to the structured form so later
+        // slot writes in the same block can materialize storage.
+        (Node::Leaf { value, .. }, LeafOp::Account { nonce, balance, code_hash }) => {
+            match eth::Account::decode(&value) {
+                Ok(prior) if prior.storage_root != eth::EMPTY_ROOT => {
+                    let rlp = eth::Account {
+                        nonce,
+                        balance,
+                        storage_root: prior.storage_root,
+                        code_hash: B256::from(code_hash),
+                    }
+                    .rlp();
+                    leaf_node(path, rlp)
+                }
+                _ => account_node(path, nonce, balance, code_hash, Node::Empty),
+            }
         }
         // Update account fields, keeping the existing storage subtree.
         (Node::Account { storage, .. }, LeafOp::Account { nonce, balance, code_hash }) => {
@@ -4804,6 +4831,32 @@ fn apply_op(store: &FlatFile, cfg: &Config, old: Node, path: Vec<u8>, op: LeafOp
         ) => {
             record_node_insert(store, cfg, &mut storage, 0, slot, LeafOp::Value(value))?;
             account_node(path, nonce, balance, code_hash, *storage)
+        }
+        // A slot write on an opaque-leaf account: with an empty storage root the
+        // storage is fully known (empty) — convert to the structured form and
+        // insert. With a non-empty opaque root the contents are unknown, so the
+        // new storage root is uncomputable: fail loudly instead of silently
+        // rebuilding a storage trie that contains only this block's slots.
+        (Node::Leaf { value, .. }, LeafOp::Storage { slot, value: sval }) => {
+            match eth::Account::decode(&value) {
+                Ok(prior) if prior.storage_root == eth::EMPTY_ROOT => {
+                    let mut storage = Node::Empty;
+                    record_node_insert(store, cfg, &mut storage, 0, slot, LeafOp::Value(sval))?;
+                    account_node(
+                        path,
+                        prior.nonce,
+                        prior.balance,
+                        prior.code_hash.0,
+                        storage,
+                    )
+                }
+                Ok(_) => bail!(
+                    "storage write on an account with opaque (unmaterialized) storage — \
+                     the checkpoint was built without nested storage (rethload); \
+                     rebuild it with rethload_nested"
+                ),
+                Err(_) => bail!("leaf op does not match the existing node kind at this key"),
+            }
         }
         _ => bail!("leaf op does not match the existing node kind at this key"),
     })
@@ -4996,6 +5049,42 @@ fn apply_delete_op(old: Node, op: DeleteOp) -> Result<Applied> {
                 Applied::Absent(account_node(path, nonce, balance, code_hash, Node::Empty))
             } else {
                 Applied::Changed(account_node(path, nonce, balance, code_hash, Node::Empty))
+            }
+        }
+        // Slot delete on an opaque-leaf account: an empty storage root means the
+        // slot is definitely absent (no-op). A non-empty opaque root is
+        // uncomputable — deleting an unknown slot from unknown contents — so
+        // fail loudly (see the LeafOp::Storage arm of `apply_op`).
+        (old @ Node::Leaf { .. }, DeleteOp::Storage(_)) => {
+            let Node::Leaf { value, .. } = &old else { unreachable!() };
+            match eth::Account::decode(value) {
+                Ok(prior) if prior.storage_root == eth::EMPTY_ROOT => Applied::Absent(old),
+                Ok(_) => bail!(
+                    "storage delete on an account with opaque (unmaterialized) storage — \
+                     the checkpoint was built without nested storage (rethload); \
+                     rebuild it with rethload_nested"
+                ),
+                Err(_) => bail!("delete op does not match the existing node kind at this key"),
+            }
+        }
+        // Wipe on an opaque-leaf account IS information-complete: the post-state
+        // storage is empty regardless of the unknown prior contents. Convert to
+        // the structured form with empty storage (hashes identically) so the
+        // rest of the block's ops can materialize fresh slots.
+        (old @ Node::Leaf { .. }, DeleteOp::WipeStorage) => {
+            let Node::Leaf { path, value, .. } = old else { unreachable!() };
+            match eth::Account::decode(&value) {
+                Ok(prior) if prior.storage_root == eth::EMPTY_ROOT => {
+                    Applied::Absent(leaf_node(path, value))
+                }
+                Ok(prior) => Applied::Changed(account_node(
+                    path,
+                    prior.nonce,
+                    prior.balance,
+                    prior.code_hash.0,
+                    Node::Empty,
+                )),
+                Err(_) => bail!("delete op does not match the existing node kind at this key"),
             }
         }
         _ => bail!("delete op does not match the existing node kind at this key"),
@@ -9024,4 +9113,160 @@ mod tests {
         assert_eq!(got_accts, entries.len(), "scan account count");
         assert_eq!(got_slots, entries.iter().map(|(_, s)| s.slots.len()).sum::<usize>(), "scan slot count");
     }
+
+    /// Opaque-leaf accounts (storage root folded into the account RLP, contents
+    /// not materialized — a `rethload`-style oracle build). Regression for the
+    /// tip-25474546 divergence: a field-only `SetAccount` used to replace the
+    /// opaque leaf with a structured account whose storage was reset to
+    /// `EMPTY_ROOT`, silently wiping the contract's storage root out of the
+    /// state root; storage deletes on such leaves silently no-opped. Now:
+    /// fields update preserves the opaque root (and the inverse restores it),
+    /// slot ops on a non-empty opaque root fail loudly, a wipe (which IS
+    /// information-complete) resets it, and slot writes on an empty-root leaf
+    /// materialize structured storage.
+    #[test]
+    fn opaque_account_apply_preserves_storage_root() {
+        let cfg = Config::default();
+        let oracle = |entries: &[(Key, Vec<u8>)]| -> Hash {
+            let e: Vec<(Vec<u8>, Vec<u8>)> =
+                entries.iter().map(|(k, v)| (k.to_vec(), v.clone())).collect();
+            eth::root(&e).0
+        };
+
+        // A contract with a non-empty (oracle-computed) storage root, stored
+        // opaquely, plus an EOA-style leaf with an empty root.
+        let ck = hashed_key(1u64.to_le_bytes());
+        let ek = hashed_key(2u64.to_le_bytes());
+        let slot_a = hashed_key(100u64.to_le_bytes());
+        let slot_b = hashed_key(101u64.to_le_bytes());
+        let sval = |b: u8| eth::storage_value_rlp(U256::from(b));
+        let storage_root = eth::root(&[
+            (slot_a.to_vec(), sval(7)),
+            (slot_b.to_vec(), sval(9)),
+        ]);
+        let contract = eth::Account {
+            nonce: 7,
+            balance: U256::from(1000u64),
+            storage_root,
+            code_hash: B256::from([9u8; 32]),
+        };
+        let eoa = eth::Account {
+            nonce: 1,
+            balance: U256::from(5u64),
+            storage_root: eth::EMPTY_ROOT,
+            code_hash: eth::EMPTY_CODE_HASH,
+        };
+
+        let seed = |mpt: &mut FlatMpt| {
+            mpt.insert_batch(vec![(ck, contract.rlp()), (ek, eoa.rlp())]).unwrap()
+        };
+
+        // 1. Field-only SetAccount preserves the opaque storage root; the
+        //    inverse diff restores the exact pre-block root.
+        let mut mpt = db(cfg.clone());
+        let root0 = seed(&mut mpt);
+        assert_eq!(root0, oracle(&[(ck, contract.rlp()), (ek, eoa.rlp())]));
+        let (root1, inv) = mpt
+            .apply_block(vec![
+                (
+                    ck,
+                    StateOp::SetAccount {
+                        nonce: 8,
+                        balance: U256::from(2000u64),
+                        code_hash: [9u8; 32],
+                    },
+                ),
+                (
+                    ek,
+                    StateOp::SetAccount {
+                        nonce: 2,
+                        balance: U256::from(6u64),
+                        code_hash: eth::EMPTY_CODE_HASH.0,
+                    },
+                ),
+            ])
+            .unwrap();
+        let contract2 = eth::Account {
+            nonce: 8,
+            balance: U256::from(2000u64),
+            storage_root, // preserved!
+            code_hash: B256::from([9u8; 32]),
+        };
+        let eoa2 = eth::Account {
+            nonce: 2,
+            balance: U256::from(6u64),
+            storage_root: eth::EMPTY_ROOT,
+            code_hash: eth::EMPTY_CODE_HASH,
+        };
+        assert_eq!(
+            root1,
+            oracle(&[(ck, contract2.rlp()), (ek, eoa2.rlp())]),
+            "field update must preserve the opaque storage root"
+        );
+        let (back, _) = mpt.apply_block(inv).unwrap();
+        assert_eq!(back, root0, "inverse must restore the opaque root");
+
+        // 2. Slot ops on a non-empty opaque storage root fail loudly (their
+        //    result is uncomputable without the storage contents).
+        let mut mpt = db(cfg.clone());
+        seed(&mut mpt);
+        assert!(
+            mpt.apply_block(vec![(
+                ck,
+                StateOp::SetStorage { slot: slot_a, value: sval(1) }
+            )])
+            .is_err(),
+            "SetStorage on opaque storage must fail"
+        );
+        let mut mpt = db(cfg.clone());
+        seed(&mut mpt);
+        assert!(
+            mpt.apply_block(vec![(ck, StateOp::DeleteStorage { slot: slot_a })]).is_err(),
+            "DeleteStorage on opaque storage must fail"
+        );
+
+        // 3. WipeStorage on an opaque root is information-complete: the root
+        //    resets to empty, and fresh slots can then materialize.
+        let mut mpt = db(cfg.clone());
+        seed(&mut mpt);
+        let (root3, _) = mpt
+            .apply_block(vec![
+                (ck, StateOp::WipeStorage),
+                (ck, StateOp::SetStorage { slot: slot_a, value: sval(3) }),
+            ])
+            .unwrap();
+        let wiped_root = eth::root(&[(slot_a.to_vec(), sval(3))]);
+        let contract3 = eth::Account {
+            nonce: 7,
+            balance: U256::from(1000u64),
+            storage_root: wiped_root,
+            code_hash: B256::from([9u8; 32]),
+        };
+        assert_eq!(root3, oracle(&[(ck, contract3.rlp()), (ek, eoa.rlp())]));
+        assert_eq!(
+            mpt.get_storage(&ck, &slot_a).unwrap().as_deref(),
+            Some(sval(3).as_slice()),
+            "post-wipe slots are materialized"
+        );
+
+        // 4. A slot write on an empty-root leaf (EOA / fresh contract)
+        //    materializes structured storage.
+        let mut mpt = db(cfg);
+        seed(&mut mpt);
+        let (root4, _) = mpt
+            .apply_block(vec![(ek, StateOp::SetStorage { slot: slot_b, value: sval(4) })])
+            .unwrap();
+        let eoa4 = eth::Account {
+            nonce: 1,
+            balance: U256::from(5u64),
+            storage_root: eth::root(&[(slot_b.to_vec(), sval(4))]),
+            code_hash: eth::EMPTY_CODE_HASH,
+        };
+        assert_eq!(root4, oracle(&[(ck, contract.rlp()), (ek, eoa4.rlp())]));
+        assert_eq!(
+            mpt.get_storage(&ek, &slot_b).unwrap().as_deref(),
+            Some(sval(4).as_slice())
+        );
+    }
 }
+
