@@ -1,4 +1,5 @@
 pub mod cursor;
+pub mod reveal;
 pub mod eth;
 pub mod state;
 

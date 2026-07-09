@@ -33,13 +33,13 @@ enum LeafOut {
 }
 
 /// One-record parse memo shared by a cursor's descents.
-struct RecordMemo(RefCell<Option<(u32, Rc<DiskSubtree>)>>);
+pub(crate) struct RecordMemo(RefCell<Option<(u32, Rc<DiskSubtree>)>>);
 
 impl RecordMemo {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(RefCell::new(None))
     }
-    fn read(&self, store: &FlatFile, ptr: DiskPtr) -> Result<Rc<DiskSubtree>> {
+    pub(crate) fn read(&self, store: &FlatFile, ptr: DiskPtr) -> Result<Rc<DiskSubtree>> {
         if let Some((unit, sub)) = self.0.borrow().as_ref() {
             if *unit == ptr.unit {
                 return Ok(sub.clone());
