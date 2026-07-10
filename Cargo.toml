@@ -9,7 +9,7 @@ alloy-rlp = { version = "0.3", features = ["derive"] }
 anyhow = "1"
 bincode = "1"
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 sha3 = "0.10"
 tempfile = "3"
 

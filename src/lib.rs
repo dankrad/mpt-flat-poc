@@ -1275,7 +1275,7 @@ struct DiskSubtree {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum RamChild {
-    Ram(Box<RamNode>),
+    Ram(Arc<RamNode>),
     // `root` is the subtree's Merkle hash; the on-disk record size is recoverable
     // from `ptr.len`, so it isn't stored here.
     Disk { ptr: DiskPtr, root: Hash },
@@ -1284,7 +1284,7 @@ enum RamChild {
     /// [`PromotedAccount`]). Boxed so this rare variant doesn't inflate `RamChild`'s
     /// size — every frontier branch holds a `[Option<RamChild>; 16]`, so an unboxed
     /// ~100-byte variant would ~double the whole in-RAM frontier footprint.
-    Account(Box<PromotedAccount>),
+    Account(Arc<PromotedAccount>),
     /// RAM-build leaf: the serialized record bytes held as their *own* heap object
     /// (an `Arc<[u8]>`), with no flat-file I/O. Reads clone the `Arc` (lock-free
     /// refcount bump); a rewrite drops the old `Arc` (malloc reclaims) and installs
@@ -1302,14 +1302,14 @@ enum RamChild {
 /// `storage_root = hash_ram(storage)`; recomputed on demand (cheap) while the storage
 /// subtree memoizes its own hash. `balance`/`code_hash` are stored as bytes so the
 /// manifest (serde) needs no `U256` serde feature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PromotedAccount {
     /// Remaining `keccak(address)` nibbles from this leaf's frontier position.
     path: Vec<u8>,
     nonce: u64,
     balance: [u8; 32],
     code_hash: Hash,
-    storage: Box<RamNode>,
+    storage: Arc<RamNode>,
 }
 
 /// A `Mem` leaf's bytes (the same `[prefix-path][node]` payload a disk record
@@ -1438,12 +1438,12 @@ impl<'de> Deserialize<'de> for HashCell {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 enum RamNode {
     Empty,
     Extension {
         path: Vec<u8>,
-        child: Box<RamNode>,
+        child: Arc<RamNode>,
         hash: HashCell,
     },
     // No `value`: keys are full 64-nibble paths, so none ever terminates at a
@@ -1458,6 +1458,58 @@ impl Default for RamNode {
     fn default() -> Self {
         Self::Empty
     }
+}
+
+/// Frontier nodes cloned by the copy-on-write apply path (`Arc::make_mut` on a
+/// node shared with a live snapshot, or an explicit unshare via [`arc_take`]).
+/// Process-wide, monotonically increasing; the delta across an apply measures
+/// how many nodes COW actually copied — tests assert it stays O(touched paths).
+pub static COW_CLONES: AtomicU64 = AtomicU64::new(0);
+
+/// Cloned frontier nodes since process start (see [`COW_CLONES`]).
+pub fn cow_clone_count() -> u64 {
+    COW_CLONES.load(Ordering::Relaxed)
+}
+
+// Manual `Clone` impls so every frontier-node copy — these only happen on the
+// COW mutation path — is counted in `COW_CLONES`. A Branch clone copies the
+// 16-slot child array of `Arc` handles (refcount bumps), not the subtrees.
+impl Clone for RamNode {
+    fn clone(&self) -> Self {
+        COW_CLONES.fetch_add(1, Ordering::Relaxed);
+        match self {
+            RamNode::Empty => RamNode::Empty,
+            RamNode::Extension { path, child, hash } => RamNode::Extension {
+                path: path.clone(),
+                child: child.clone(),
+                hash: hash.clone(),
+            },
+            RamNode::Branch { children, hash } => RamNode::Branch {
+                children: children.clone(),
+                hash: hash.clone(),
+            },
+        }
+    }
+}
+
+impl Clone for PromotedAccount {
+    fn clone(&self) -> Self {
+        COW_CLONES.fetch_add(1, Ordering::Relaxed);
+        PromotedAccount {
+            path: self.path.clone(),
+            nonce: self.nonce,
+            balance: self.balance,
+            code_hash: self.code_hash,
+            storage: self.storage.clone(),
+        }
+    }
+}
+
+/// Take a node out of an `Arc` for by-value restructuring: moves when this is
+/// the only handle, clones (one node, counted in [`COW_CLONES`]) when a
+/// snapshot still shares it.
+fn arc_take<T: Clone>(a: Arc<T>) -> T {
+    Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())
 }
 
 /// Breakdown of the in-RAM index footprint (see [`FlatMpt::ram_report`]).
@@ -1483,8 +1535,8 @@ impl RamReport {
 #[derive(Debug)]
 pub struct FlatMpt {
     cfg: Config,
-    store: FlatFile,
-    upper: RamNode,
+    store: Arc<FlatFile>,
+    upper: Arc<RamNode>,
     /// Path of the flat file; the manifest is derived from it.
     path: PathBuf,
     /// Inline-GC cleaning rate: victim regions to evacuate per batch, adjusted by
@@ -1531,8 +1583,8 @@ impl FlatMpt {
         let (ram_mode, spill_threshold) = ram_build_config();
         Ok(Self {
             cfg,
-            store: FlatFile::new(file, direct),
-            upper: RamNode::Empty,
+            store: Arc::new(FlatFile::new(file, direct)),
+            upper: Arc::new(RamNode::Empty),
             path: path.to_path_buf(),
             gc_regions: 0,
             ram_mode,
@@ -1609,8 +1661,8 @@ impl FlatMpt {
 
         Ok(Self {
             cfg,
-            store,
-            upper,
+            store: Arc::new(store),
+            upper: Arc::new(upper),
             path: path.to_path_buf(),
             gc_regions: 0,
             // A reopened DB is disk-resident; RAM-build mode is for fresh creation.
@@ -1704,7 +1756,7 @@ impl FlatMpt {
     fn insert_op(&mut self, key: Key, op: LeafOp) -> Result<Hash> {
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
-        insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, op, ram)?;
+        insert_ram(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), key, op, ram)?;
         self.store.flush()?;
         Ok(self.root())
     }
@@ -1737,11 +1789,11 @@ impl FlatMpt {
     fn delete_op(&mut self, key: Key, op: DeleteOp) -> Result<Hash> {
         let cfg = self.cfg.clone();
         let ram = self.ram_mode;
-        match delete_ram(&self.store, &cfg, &mut self.upper, Vec::new(), &key, op, ram)? {
+        match delete_ram(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), &key, op, ram)? {
             RamDelete::Absent | RamDelete::Changed => {}
-            RamDelete::Removed => self.upper = RamNode::Empty,
+            RamDelete::Removed => self.upper = Arc::new(RamNode::Empty),
             RamDelete::Collapsed { edge, survivor } => {
-                self.upper = collapse_root(&self.store, edge, survivor)?;
+                self.upper = Arc::new(collapse_root(&self.store, edge, survivor)?);
             }
         }
         self.store.flush()?;
@@ -1767,7 +1819,7 @@ impl FlatMpt {
         // Fast path: fan the per-account groups across the top branch's 16
         // disjoint child subtrees (one thread each — group record reads are the
         // per-block bottleneck and they parallelize perfectly across subtrees).
-        if matches!(self.upper, RamNode::Branch { .. }) {
+        if matches!(*self.upper, RamNode::Branch { .. }) {
             let mut buckets: [Vec<(Key, NetUpdate)>; 16] = std::array::from_fn(|_| Vec::new());
             for (key, upd) in net {
                 buckets[nibble_at(&key, 0) as usize].push((key, upd));
@@ -1786,7 +1838,9 @@ impl FlatMpt {
                 prefetch_records(&self.store, ptrs);
             }
             let store = &self.store;
-            let RamNode::Branch { children, hash } = &mut self.upper else { unreachable!() };
+            let RamNode::Branch { children, hash } = Arc::make_mut(&mut self.upper) else {
+                unreachable!()
+            };
             hash.clear();
             let sinks: Vec<Vec<(Key, StateOp)>> = std::thread::scope(|scope| {
                 let cfg = &cfg;
@@ -1817,12 +1871,12 @@ impl FlatMpt {
             let survivors = children.iter().filter(|c| c.is_some()).count();
             if survivors < 2 {
                 if survivors == 0 {
-                    self.upper = RamNode::Empty;
+                    self.upper = Arc::new(RamNode::Empty);
                 } else {
                     let j = children.iter().position(|c| c.is_some()).unwrap();
                     let survivor = children[j].take().unwrap();
-                    self.upper = match survivor {
-                        RamChild::Ram(sub) => match *sub {
+                    self.upper = Arc::new(match survivor {
+                        RamChild::Ram(sub) => match arc_take(sub) {
                             RamNode::Extension { path: cp, child: cc, .. } => {
                                 let mut p = vec![j as u8];
                                 p.extend_from_slice(&cp);
@@ -1830,24 +1884,24 @@ impl FlatMpt {
                             }
                             b @ RamNode::Branch { .. } => RamNode::Extension {
                                 path: vec![j as u8],
-                                child: Box::new(b),
+                                child: Arc::new(b),
                                 hash: HashCell::new(None),
                             },
                             RamNode::Empty => unreachable!("empty RamNode as a branch child"),
                         },
                         other => collapse_root(&self.store, vec![j as u8], other)?,
-                    };
+                    });
                 }
             }
         } else {
             // Small/odd-shaped tries: the serial descent handles every case
             // (creation from Empty, extension tops, root collapse).
             for (key, upd) in net {
-                match apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut inv, ram)? {
+                match apply_ram_group(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), &key, &upd, &mut inv, ram)? {
                     RamDelete::Absent | RamDelete::Changed => {}
-                    RamDelete::Removed => self.upper = RamNode::Empty,
+                    RamDelete::Removed => self.upper = Arc::new(RamNode::Empty),
                     RamDelete::Collapsed { edge, survivor } => {
-                        self.upper = collapse_root(&self.store, edge, survivor)?;
+                        self.upper = Arc::new(collapse_root(&self.store, edge, survivor)?);
                     }
                 }
             }
@@ -2146,15 +2200,15 @@ impl FlatMpt {
         // the relocated records' pointers, then create structure for the brand-new
         // keys. Recompute the root once.
         for (rep, new_child) in results {
-            install_at_key(&mut self.upper, &rep, 0, new_child);
+            install_at_key(Arc::make_mut(&mut self.upper), &rep, 0, new_child);
         }
         for (prefix, new_ptr) in reloc {
-            install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
+            install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new_ptr);
         }
         for (key, value) in fresh {
             // Disk path (RAM mode early-returns via the fan-out below), so new
             // structure is disk-backed.
-            insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(value), false)?;
+            insert_ram(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), key, LeafOp::Value(value), false)?;
         }
         let install_ns = t_c.elapsed().as_nanos() as u64;
         let t_flush = std::time::Instant::now();
@@ -2185,17 +2239,17 @@ impl FlatMpt {
         // one yet, so the *rest* of even the first batch takes the parallel path.
         // Without this, a fresh build runs its entire first batch serially (a 100M
         // first batch = minutes on one core) just to bootstrap the top branch.
-        if !matches!(self.upper, RamNode::Branch { .. }) {
+        if !matches!(*self.upper, RamNode::Branch { .. }) {
             for b in buckets.iter_mut() {
                 if let Some((key, vh)) = b.pop() {
-                    insert_ram(&self.store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(vh), true)?;
+                    insert_ram(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), key, LeafOp::Value(vh), true)?;
                     break;
                 }
             }
         }
-        if matches!(self.upper, RamNode::Branch { .. }) {
+        if matches!(*self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
-            if let RamNode::Branch { children, hash } = &mut self.upper {
+            if let RamNode::Branch { children, hash } = Arc::make_mut(&mut self.upper) {
                 hash.clear(); // top branch re-hashed after the parallel inserts
                 std::thread::scope(|scope| -> Result<()> {
                     let cfg = &cfg;
@@ -2221,7 +2275,7 @@ impl FlatMpt {
         } else {
             let store = &self.store;
             for (key, vh) in buckets.into_iter().flatten() {
-                insert_ram(store, &cfg, &mut self.upper, Vec::new(), key, LeafOp::Value(vh), true)?;
+                insert_ram(store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), key, LeafOp::Value(vh), true)?;
             }
         }
         Ok(())
@@ -2251,18 +2305,18 @@ impl FlatMpt {
         }
         // Bootstrap the top branch (see insert_batch_ram) so the rest of even the
         // first batch takes the parallel path.
-        if !matches!(self.upper, RamNode::Branch { .. }) {
+        if !matches!(*self.upper, RamNode::Branch { .. }) {
             for b in buckets.iter_mut() {
                 if let Some((key, upd)) = b.pop() {
                     let mut sink = Vec::new();
-                    apply_ram_group(&self.store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut sink, ram)?;
+                    apply_ram_group(&self.store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), &key, &upd, &mut sink, ram)?;
                     break;
                 }
             }
         }
-        if matches!(self.upper, RamNode::Branch { .. }) {
+        if matches!(*self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
-            if let RamNode::Branch { children, hash } = &mut self.upper {
+            if let RamNode::Branch { children, hash } = Arc::make_mut(&mut self.upper) {
                 hash.clear();
                 std::thread::scope(|scope| -> Result<()> {
                     let cfg = &cfg;
@@ -2291,7 +2345,7 @@ impl FlatMpt {
             let store = &self.store;
             let mut sink = Vec::new();
             for (key, upd) in buckets.into_iter().flatten() {
-                apply_ram_group(store, &cfg, &mut self.upper, Vec::new(), &key, &upd, &mut sink, ram)?;
+                apply_ram_group(store, &cfg, Arc::make_mut(&mut self.upper), Vec::new(), &key, &upd, &mut sink, ram)?;
                 sink.clear();
             }
         }
@@ -2340,17 +2394,17 @@ impl FlatMpt {
             budget,
             force: false,
         };
-        spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+        spill_walk(Arc::make_mut(&mut self.upper), Vec::new(), &self.store, &mut buf, CHUNK)?;
         if buf.budget > budget / 2 && budget < i64::MAX / 2 {
             // All-hot cache: force eviction for the remaining quota.
             buf.force = true;
-            spill_walk(&mut self.upper, Vec::new(), &self.store, &mut buf, CHUNK)?;
+            spill_walk(Arc::make_mut(&mut self.upper), Vec::new(), &self.store, &mut buf, CHUNK)?;
         }
         flush_spill_chunk(&self.store, &mut buf)?;
         for (prefix, ptr) in buf.installs {
             // A failed install would leave the frontier pointing at the zeroed
             // placeholder — silent corruption on the next read. Fail loudly.
-            if !install_ptr_by_prefix(&mut self.upper, &prefix, 0, ptr) {
+            if !install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, ptr) {
                 bail!("spill install found no Disk slot at prefix {prefix:x?}");
             }
         }
@@ -2414,7 +2468,7 @@ impl FlatMpt {
             let reloc = evacuate_regions(&self.store, &self.upper, &victims, &no_fg)?;
             let relocated = reloc.len() as u64;
             for (prefix, new_ptr) in reloc {
-                install_ptr_by_prefix(&mut self.upper, &prefix, 0, new_ptr);
+                install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new_ptr);
             }
             // A full evacuation drives a victim's live count to zero (relocating
             // frees the old copies). A victim still live after the pass holds
@@ -2611,7 +2665,7 @@ impl FlatMpt {
     /// `top_nibble` — the unit of parallelism for whole-trie scans (the 16 top
     /// subtrees are disjoint; `&self` scans are read-only and thread-safe).
     pub fn scan_top(&self, top_nibble: u8, f: &mut dyn FnMut(ScanEntry) -> Result<()>) -> Result<()> {
-        let RamNode::Branch { children, .. } = &self.upper else {
+        let RamNode::Branch { children, .. } = self.upper.as_ref() else {
             bail!("scan_top requires a branch root");
         };
         let Some(child) = &children[top_nibble as usize] else {
@@ -2904,11 +2958,11 @@ fn promote_to_mem(store: &FlatFile, subtree: DiskSubtree) -> Result<RamChild> {
         hash: HashCell::new(None),
     };
     if ext_path.is_empty() {
-        Ok(RamChild::Ram(Box::new(branch)))
+        Ok(RamChild::Ram(Arc::new(branch)))
     } else {
-        Ok(RamChild::Ram(Box::new(RamNode::Extension {
+        Ok(RamChild::Ram(Arc::new(RamNode::Extension {
             path: ext_path,
-            child: Box::new(branch),
+            child: Arc::new(branch),
             hash: HashCell::new(None),
         })))
     }
@@ -2950,7 +3004,9 @@ fn insert_into_child(
     ram: bool,
 ) -> Result<()> {
     match slot {
-        Some(RamChild::Ram(child)) => insert_ram(store, cfg, child, child_prefix, key, op, ram),
+        Some(RamChild::Ram(child)) => {
+            insert_ram(store, cfg, Arc::make_mut(child), child_prefix, key, op, ram)
+        }
         Some(RamChild::Mem(_)) => {
             // In-RAM leaf: parse its bytes, apply the key, re-serialize into a new
             // `Arc` (the old one drops here). No I/O, no shared store.
@@ -3003,11 +3059,12 @@ fn insert_into_child(
             if common == path_len {
                 // Same account: apply the op in place (storage insert or field update).
                 let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
+                let a = Arc::make_mut(a);
                 match op {
                     LeafOp::Storage { slot: skey, value } => {
                         // Descend the account's RAM storage frontier with the slot key
                         // (storage records are Disk, so ram=false).
-                        insert_ram(store, cfg, &mut a.storage, Vec::new(), skey, LeafOp::Value(value), false)?;
+                        insert_ram(store, cfg, Arc::make_mut(&mut a.storage), Vec::new(), skey, LeafOp::Value(value), false)?;
                     }
                     LeafOp::Account { nonce: n, balance: b, code_hash: ch } => {
                         a.nonce = n;
@@ -3026,7 +3083,7 @@ fn insert_into_child(
                 let old_idx = a.path[common] as usize;
                 let rehomed_path = a.path[common + 1..].to_vec();
                 let split_path = a.path[..common].to_vec();
-                a.path = rehomed_path;
+                Arc::make_mut(&mut a).path = rehomed_path;
                 children[old_idx] = Some(RamChild::Account(a));
                 let new_idx = nibbles[child_prefix.len() + common] as usize;
                 let mut new_prefix = child_prefix.clone();
@@ -3037,11 +3094,11 @@ fn insert_into_child(
                     Some(make_leaf_child(store, ram, DiskSubtree { prefix: new_prefix, node })?);
                 let branch = RamNode::Branch { children, hash: HashCell::new(None) };
                 *slot = Some(if common == 0 {
-                    RamChild::Ram(Box::new(branch))
+                    RamChild::Ram(Arc::new(branch))
                 } else {
-                    RamChild::Ram(Box::new(RamNode::Extension {
+                    RamChild::Ram(Arc::new(RamNode::Extension {
                         path: split_path,
-                        child: Box::new(branch),
+                        child: Arc::new(branch),
                         hash: HashCell::new(None),
                     }))
                 });
@@ -3105,7 +3162,7 @@ fn insert_ram(
                 children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
                     old_child
                 } else {
-                    Box::new(RamNode::Extension {
+                    Arc::new(RamNode::Extension {
                         path: old_remainder,
                         child: old_child,
                         hash: HashCell::new(None),
@@ -3129,7 +3186,7 @@ fn insert_ram(
                 } else {
                     RamNode::Extension {
                         path: old_path[..common].to_vec(),
-                        child: Box::new(branch),
+                        child: Arc::new(branch),
                         hash: HashCell::new(None),
                     }
                 };
@@ -3137,7 +3194,7 @@ fn insert_ram(
             } else {
                 let mut next_prefix = prefix;
                 next_prefix.extend_from_slice(path);
-                insert_ram(store, cfg, child, next_prefix, key, op, ram)
+                insert_ram(store, cfg, Arc::make_mut(child), next_prefix, key, op, ram)
             }
         }
         RamNode::Branch { children, .. } => {
@@ -3193,7 +3250,7 @@ fn delete_ram(
             }
             let mut next = prefix;
             next.extend_from_slice(&path);
-            match delete_ram(store, cfg, &mut child, next, key, op, ram)? {
+            match delete_ram(store, cfg, Arc::make_mut(&mut child), next, key, op, ram)? {
                 RamDelete::Absent => {
                     *node = RamNode::Extension { path, child, hash };
                     Ok(RamDelete::Absent)
@@ -3208,7 +3265,7 @@ fn delete_ram(
                 RamDelete::Changed => {
                     // If the child branch collapsed into an extension in place,
                     // merge ext→ext for the canonical form.
-                    *node = match *child {
+                    *node = match arc_take(child) {
                         RamNode::Extension { path: cp, child: cc, .. } => {
                             let mut p = path;
                             p.extend_from_slice(&cp);
@@ -3216,7 +3273,7 @@ fn delete_ram(
                         }
                         other => RamNode::Extension {
                             path,
-                            child: Box::new(other),
+                            child: Arc::new(other),
                             hash: HashCell::new(None),
                         },
                     };
@@ -3253,7 +3310,7 @@ fn delete_ram(
                                 RamChild::Ram(sub) => {
                                     // Merge in place: the branch becomes an extension
                                     // over its lone RAM child (merging ext→ext).
-                                    *node = match *sub {
+                                    *node = match arc_take(sub) {
                                         RamNode::Extension { path: cp, child: cc, .. } => {
                                             let mut p = vec![j as u8];
                                             p.extend_from_slice(&cp);
@@ -3265,7 +3322,7 @@ fn delete_ram(
                                         }
                                         b @ RamNode::Branch { .. } => RamNode::Extension {
                                             path: vec![j as u8],
-                                            child: Box::new(b),
+                                            child: Arc::new(b),
                                             hash: HashCell::new(None),
                                         },
                                         RamNode::Empty => {
@@ -3308,7 +3365,7 @@ fn delete_in_child(
     match slot {
         None => Ok(RamDelete::Absent),
         Some(RamChild::Ram(sub)) => {
-            match delete_ram(store, cfg, sub, child_prefix.clone(), key, op, ram)? {
+            match delete_ram(store, cfg, Arc::make_mut(sub), child_prefix.clone(), key, op, ram)? {
                 RamDelete::Absent => Ok(RamDelete::Absent),
                 RamDelete::Changed => Ok(RamDelete::Changed),
                 RamDelete::Removed => {
@@ -3380,6 +3437,7 @@ fn delete_in_child(
                 DeleteOp::WipeStorage => {
                     let Some(RamChild::Account(a)) = slot.take() else { unreachable!() };
                     free_ram_records(store, &a.storage);
+                    let a = arc_take(a);
                     // No storage left: demote back to a plain account record.
                     let node = account_node(
                         a.path,
@@ -3395,7 +3453,8 @@ fn delete_in_child(
                 DeleteOp::Storage(skey) => {
                     let storage_out = {
                         let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
-                        delete_ram(store, cfg, &mut a.storage, Vec::new(), &skey, DeleteOp::Value, false)?
+                        let a = Arc::make_mut(a);
+                        delete_ram(store, cfg, Arc::make_mut(&mut a.storage), Vec::new(), &skey, DeleteOp::Value, false)?
                     };
                     match storage_out {
                         RamDelete::Absent => Ok(RamDelete::Absent),
@@ -3406,6 +3465,7 @@ fn delete_in_child(
                             let Some(RamChild::Account(a)) = slot.take() else {
                                 unreachable!()
                             };
+                            let a = arc_take(a);
                             let storage_node = match storage_out {
                                 RamDelete::Removed => Node::Empty,
                                 RamDelete::Collapsed { edge, survivor } => {
@@ -3449,7 +3509,7 @@ fn rehome_child(
     new_prefix: Vec<u8>,
 ) -> Result<RamChild> {
     Ok(match survivor {
-        RamChild::Ram(sub) => RamChild::Ram(Box::new(match *sub {
+        RamChild::Ram(sub) => RamChild::Ram(Arc::new(match arc_take(sub) {
             RamNode::Extension { path, child, .. } => {
                 let mut p = edge.to_vec();
                 p.extend_from_slice(&path);
@@ -3457,7 +3517,7 @@ fn rehome_child(
             }
             b @ RamNode::Branch { .. } => RamNode::Extension {
                 path: edge.to_vec(),
-                child: Box::new(b),
+                child: Arc::new(b),
                 hash: HashCell::new(None),
             },
             RamNode::Empty => unreachable!("empty RamNode survivor"),
@@ -3474,9 +3534,10 @@ fn rehome_child(
             make_mem_leaf(&DiskSubtree { prefix: new_prefix, node })?
         }
         RamChild::Account(mut a) => {
+            let acc = Arc::make_mut(&mut a);
             let mut p = edge.to_vec();
-            p.extend_from_slice(&a.path);
-            a.path = p;
+            p.extend_from_slice(&acc.path);
+            acc.path = p;
             RamChild::Account(a)
         }
     })
@@ -3551,7 +3612,7 @@ fn collapse_root(store: &FlatFile, edge: Vec<u8>, survivor: RamChild) -> Result<
         bail!("trie collapsed to a single leaf at the root (unsupported below 2 keys)");
     }
     match promote_record_to_ram(store, subtree)? {
-        RamChild::Ram(r) => Ok(*r),
+        RamChild::Ram(r) => Ok(arc_take(r)),
         _ => unreachable!("promote_record_to_ram returns a Ram node"),
     }
 }
@@ -4135,7 +4196,7 @@ fn apply_ram_group(
                 children[old_idx] = Some(RamChild::Ram(if old_remainder.is_empty() {
                     child
                 } else {
-                    Box::new(RamNode::Extension {
+                    Arc::new(RamNode::Extension {
                         path: old_remainder,
                         child,
                         hash: HashCell::new(None),
@@ -4152,7 +4213,7 @@ fn apply_ram_group(
                 } else {
                     RamNode::Extension {
                         path: path[..common].to_vec(),
-                        child: Box::new(branch),
+                        child: Arc::new(branch),
                         hash: HashCell::new(None),
                     }
                 };
@@ -4160,7 +4221,7 @@ fn apply_ram_group(
             }
             let mut next = prefix;
             next.extend_from_slice(&path);
-            match apply_ram_group(store, cfg, &mut child, next, key, upd, inv, ram)? {
+            match apply_ram_group(store, cfg, Arc::make_mut(&mut child), next, key, upd, inv, ram)? {
                 RamDelete::Absent => {
                     *node = RamNode::Extension { path, child, hash };
                     Ok(RamDelete::Absent)
@@ -4172,7 +4233,7 @@ fn apply_ram_group(
                     Ok(RamDelete::Collapsed { edge: full, survivor })
                 }
                 RamDelete::Changed => {
-                    *node = match *child {
+                    *node = match arc_take(child) {
                         RamNode::Extension { path: cp, child: cc, .. } => {
                             let mut p = path;
                             p.extend_from_slice(&cp);
@@ -4180,7 +4241,7 @@ fn apply_ram_group(
                         }
                         other => RamNode::Extension {
                             path,
-                            child: Box::new(other),
+                            child: Arc::new(other),
                             hash: HashCell::new(None),
                         },
                     };
@@ -4216,7 +4277,7 @@ fn apply_ram_group(
                             let survivor = children[j].take().unwrap();
                             match survivor {
                                 RamChild::Ram(sub) => {
-                                    *node = match *sub {
+                                    *node = match arc_take(sub) {
                                         RamNode::Extension { path: cp, child: cc, .. } => {
                                             let mut p = vec![j as u8];
                                             p.extend_from_slice(&cp);
@@ -4228,7 +4289,7 @@ fn apply_ram_group(
                                         }
                                         b @ RamNode::Branch { .. } => RamNode::Extension {
                                             path: vec![j as u8],
-                                            child: Box::new(b),
+                                            child: Arc::new(b),
                                             hash: HashCell::new(None),
                                         },
                                         RamNode::Empty => {
@@ -4284,7 +4345,7 @@ fn apply_group_child(
             }
         }
         Some(RamChild::Ram(sub)) => {
-            match apply_ram_group(store, cfg, sub, child_prefix.clone(), key, upd, inv, ram)? {
+            match apply_ram_group(store, cfg, Arc::make_mut(sub), child_prefix.clone(), key, upd, inv, ram)? {
                 RamDelete::Absent => Ok(RamDelete::Absent),
                 RamDelete::Changed => Ok(RamDelete::Changed),
                 RamDelete::Removed => {
@@ -4356,7 +4417,10 @@ fn apply_group_child(
                 let mut children = empty_children();
                 let old_idx = a.path[common] as usize;
                 let split_path = a.path[..common].to_vec();
-                a.path = a.path[common + 1..].to_vec();
+                {
+                    let acc = Arc::make_mut(&mut a);
+                    acc.path = acc.path[common + 1..].to_vec();
+                }
                 children[old_idx] = Some(RamChild::Account(a));
                 let new_idx = nibbles[child_prefix.len() + common] as usize;
                 let mut new_prefix = child_prefix.clone();
@@ -4366,11 +4430,11 @@ fn apply_group_child(
                 children[new_idx] = creation_child(store, cfg, new_prefix, key, upd, inv, ram)?;
                 let branch = RamNode::Branch { children, hash: HashCell::new(None) };
                 *slot = Some(if common == 0 {
-                    RamChild::Ram(Box::new(branch))
+                    RamChild::Ram(Arc::new(branch))
                 } else {
-                    RamChild::Ram(Box::new(RamNode::Extension {
+                    RamChild::Ram(Arc::new(RamNode::Extension {
                         path: split_path,
-                        child: Box::new(branch),
+                        child: Arc::new(branch),
                         hash: HashCell::new(None),
                     }))
                 });
@@ -4418,6 +4482,7 @@ fn apply_group_child(
                     inv.push((*key, StateOp::SetStorage { slot: skey, value: v }));
                 }
                 free_ram_records(store, &a.storage);
+                let a = arc_take(a);
                 let mut node = account_node(
                     a.path,
                     a.nonce,
@@ -4438,6 +4503,7 @@ fn apply_group_child(
             let mut changed = false;
             if let AccountOutcome::Set { nonce, balance, code_hash } = upd.account {
                 let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
+                let a = Arc::make_mut(a);
                 inv.push((
                     *key,
                     StateOp::SetAccount {
@@ -4466,7 +4532,7 @@ fn apply_group_child(
                         insert_ram(
                             store,
                             cfg,
-                            &mut a.storage,
+                            Arc::make_mut(&mut Arc::make_mut(a).storage),
                             Vec::new(),
                             *skey,
                             LeafOp::Value(v.clone()),
@@ -4478,7 +4544,7 @@ fn apply_group_child(
                         match delete_ram(
                             store,
                             cfg,
-                            &mut a.storage,
+                            Arc::make_mut(&mut Arc::make_mut(a).storage),
                             Vec::new(),
                             skey,
                             DeleteOp::Value,
@@ -4493,6 +4559,7 @@ fn apply_group_child(
                                 let Some(RamChild::Account(a)) = slot.take() else {
                                     unreachable!()
                                 };
+                                let a = arc_take(a);
                                 let storage_node = match out {
                                     RamDelete::Removed => Node::Empty,
                                     RamDelete::Collapsed { edge, survivor } => {
@@ -5213,11 +5280,11 @@ fn promote_record_to_ram(store: &FlatFile, subtree: DiskSubtree) -> Result<RamCh
         hash: HashCell::new(None),
     };
     if ext_path.is_empty() {
-        Ok(RamChild::Ram(Box::new(branch)))
+        Ok(RamChild::Ram(Arc::new(branch)))
     } else {
-        Ok(RamChild::Ram(Box::new(RamNode::Extension {
+        Ok(RamChild::Ram(Arc::new(RamNode::Extension {
             path: ext_path,
-            child: Box::new(branch),
+            child: Arc::new(branch),
             hash: HashCell::new(None),
         })))
     }
@@ -5245,7 +5312,7 @@ fn should_promote_account(cfg: &Config, subtree: &DiskSubtree) -> bool {
 /// children are `Disk` storage records — the storage analogue of
 /// [`promote_record_to_ram`]. The pointers now live in RAM, so GC can relocate any
 /// storage record by updating a RAM pointer.
-fn promote_storage_to_ram(store: &FlatFile, storage: Node, ram: bool) -> Result<Box<RamNode>> {
+fn promote_storage_to_ram(store: &FlatFile, storage: Node, ram: bool) -> Result<Arc<RamNode>> {
     let subtree = DiskSubtree { prefix: Vec::new(), node: storage };
     let promoted =
         if ram { promote_to_mem(store, subtree)? } else { promote_record_to_ram(store, subtree)? };
@@ -5264,7 +5331,7 @@ fn promote_account_to_ram(store: &FlatFile, subtree: DiskSubtree, ram: bool) -> 
         unreachable!("promote_account_to_ram called on a non-account record");
     };
     let storage_ram = promote_storage_to_ram(store, *storage, ram)?;
-    Ok(RamChild::Account(Box::new(PromotedAccount {
+    Ok(RamChild::Account(Arc::new(PromotedAccount {
         path,
         nonce,
         balance: balance.to_be_bytes::<32>(),
@@ -5704,7 +5771,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
     match node {
         RamNode::Empty => false,
         RamNode::Extension { path, child, hash } => {
-            let done = install_at_key(child, key, depth + path.len(), new);
+            let done = install_at_key(Arc::make_mut(child), key, depth + path.len(), new);
             if done {
                 hash.clear();
             }
@@ -5717,7 +5784,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
                     children[idx] = Some(new);
                     true
                 }
-                Some(RamChild::Ram(child)) => install_at_key(child, key, depth + 1, new),
+                Some(RamChild::Ram(child)) => install_at_key(Arc::make_mut(child), key, depth + 1, new),
                 // Promoted accounts aren't relocated as whole records (their storage
                 // records are pinned from evacuation), so none is installed here.
                 Some(RamChild::Account(_)) => false,
@@ -6317,7 +6384,7 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
         RamNode::Extension { path, child, .. } => {
             let mut next = prefix;
             next.extend_from_slice(path);
-            spill_walk(child, next, store, buf, chunk)
+            spill_walk(Arc::make_mut(child), next, store, buf, chunk)
         }
         RamNode::Branch { children, .. } => {
             for (i, slot) in children.iter_mut().enumerate() {
@@ -6325,7 +6392,7 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                     Some(RamChild::Ram(child)) => {
                         let mut cp = prefix.clone();
                         cp.push(i as u8);
-                        spill_walk(child, cp, store, buf, chunk)?;
+                        spill_walk(Arc::make_mut(child), cp, store, buf, chunk)?;
                     }
                     Some(RamChild::Mem(m)) => {
                         if buf.budget < 0 {
@@ -6363,7 +6430,8 @@ fn spill_walk(node: &mut RamNode, prefix: Vec<u8>, store: &FlatFile, buf: &mut S
                         let mut cp = prefix.clone();
                         cp.push(i as u8);
                         cp.extend_from_slice(&a.path);
-                        spill_walk(&mut a.storage, cp, store, buf, chunk)?;
+                        let acc = Arc::make_mut(a);
+                        spill_walk(Arc::make_mut(&mut acc.storage), cp, store, buf, chunk)?;
                     }
                 }
             }
@@ -6380,7 +6448,7 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
         RamNode::Empty => false,
         RamNode::Extension { path, child, .. } => {
             if prefix.get(depth..depth + path.len()) == Some(path.as_slice()) {
-                install_ptr_by_prefix(child, prefix, depth + path.len(), new_ptr)
+                install_ptr_by_prefix(Arc::make_mut(child), prefix, depth + path.len(), new_ptr)
             } else {
                 false
             }
@@ -6398,14 +6466,16 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
                 Some(RamChild::Account(a)) => {
                     // Composite prefix: 64 account nibbles ++ storage nibbles.
                     if prefix.get(depth + 1..depth + 1 + a.path.len()) == Some(a.path.as_slice()) {
-                        install_ptr_by_prefix(&mut a.storage, prefix, depth + 1 + a.path.len(), new_ptr)
+                        let plen = a.path.len();
+                        let acc = Arc::make_mut(a);
+                        install_ptr_by_prefix(Arc::make_mut(&mut acc.storage), prefix, depth + 1 + plen, new_ptr)
                     } else {
                         false
                     }
                 }
                 Some(RamChild::Mem(_)) => false,
                 Some(RamChild::Ram(child)) => {
-                    install_ptr_by_prefix(child, prefix, depth + 1, new_ptr)
+                    install_ptr_by_prefix(Arc::make_mut(child), prefix, depth + 1, new_ptr)
                 }
                 // A promoted account is not a relocatable state record; its storage
                 // records are pinned from GC evacuation, so no reloc targets one here.

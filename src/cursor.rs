@@ -412,7 +412,7 @@ impl FlatMpt {
     ) -> Result<Option<R>> {
         let nibbles = key_nibbles(account_key);
         // Frontier descent.
-        let mut node = &self.upper;
+        let mut node: &RamNode = &self.upper;
         let mut depth = 0usize;
         loop {
             match node {
