@@ -3818,6 +3818,13 @@ impl NetUpdate {
 /// wipe is kept, earlier slot writes are dropped, the account is re-set.
 fn normalize_block(ops: Vec<(Key, StateOp)>) -> Vec<(Key, NetUpdate)> {
     let mut map: BTreeMap<Key, NetUpdate> = BTreeMap::new();
+    // Last-write-wins slot dedup via an index map: the previous
+    // `slots.retain(..)` per op was a linear scan of the account's
+    // accumulated list — O(slots²) per account, ~2.6 s of a 147k-op
+    // block when one contract carries ~35k slot writes (perf: Vec::retain
+    // 26.6% of apply CPU). Repeated slots in one block are rare (bundles
+    // are net), so the index stays cheap.
+    let mut slot_idx: HashMap<(Key, Key), usize> = HashMap::new();
     for (key, op) in ops {
         let upd = map.entry(key).or_insert(NetUpdate {
             wipe: false,
@@ -3833,11 +3840,15 @@ fn normalize_block(ops: Vec<(Key, StateOp)>) -> Vec<(Key, NetUpdate)> {
             StateOp::DeleteAccount => {
                 upd.account = AccountOutcome::Delete;
                 upd.wipe = true;
-                upd.slots.clear();
+                for (k, _) in upd.slots.drain(..) {
+                    slot_idx.remove(&(key, k));
+                }
             }
             StateOp::WipeStorage => {
                 upd.wipe = true;
-                upd.slots.clear();
+                for (k, _) in upd.slots.drain(..) {
+                    slot_idx.remove(&(key, k));
+                }
             }
             StateOp::SetStorage { slot, value } => {
                 if upd.account == AccountOutcome::Delete {
@@ -3849,16 +3860,30 @@ fn normalize_block(ops: Vec<(Key, StateOp)>) -> Vec<(Key, NetUpdate)> {
                         code_hash: eth::EMPTY_CODE_HASH.0,
                     };
                 }
-                upd.slots.retain(|(k, _)| *k != slot);
-                upd.slots.push((slot, Some(value)));
+                match slot_idx.entry((key, slot)) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        upd.slots[*e.get()].1 = Some(value);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(upd.slots.len());
+                        upd.slots.push((slot, Some(value)));
+                    }
+                }
             }
             StateOp::DeleteStorage { slot } => {
                 if upd.account == AccountOutcome::Delete {
                     // Deleting a slot of a just-deleted account: nothing to do.
                     continue;
                 }
-                upd.slots.retain(|(k, _)| *k != slot);
-                upd.slots.push((slot, None));
+                match slot_idx.entry((key, slot)) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        upd.slots[*e.get()].1 = None;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(upd.slots.len());
+                        upd.slots.push((slot, None));
+                    }
+                }
             }
         }
     }
