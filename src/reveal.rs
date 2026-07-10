@@ -14,10 +14,10 @@
 //! conservative-true for overflow children, whose subtrees always root in a
 //! branch or extension).
 
-use crate::cursor::RecordMemo;
+use crate::cursor::{with_account_storage, RecordMemo};
 use crate::{
     eth, hash_ram, key_nibbles, parse_node_lazy, parse_payload_lazy, ram_child_hash, FlatFile,
-    FlatMpt, Hash, Key, Node, NodeRef, RamChild, RamNode,
+    FlatMpt, FlatSnapshot, Hash, Key, Node, NodeRef, RamChild, RamNode,
 };
 use anyhow::{bail, Result};
 
@@ -311,37 +311,69 @@ impl<'s> Emitter<'s> {
     }
 }
 
+/// Reveal-path nodes for `keys` in the account trie of the view
+/// `(store, upper)` — the walk backing both the [`FlatMpt`] and
+/// [`FlatSnapshot`] entry points.
+fn reveal_account_paths(store: &FlatFile, upper: &RamNode, keys: &[Key]) -> Result<Vec<RevealNode>> {
+    let memo = RecordMemo::new();
+    let mut e = Emitter { store, memo: &memo, out: Vec::new(), seen: Default::default() };
+    let mut prefix = Vec::with_capacity(64);
+    for k in keys {
+        prefix.clear();
+        let nibbles = key_nibbles(k);
+        e.walk_ram(upper, &mut prefix, &nibbles)?;
+    }
+    Ok(e.out)
+}
+
+/// Reveal-path nodes for `slots` within `account`'s storage trie of the view
+/// `(store, upper)`.
+fn reveal_storage_paths(
+    store: &FlatFile,
+    upper: &RamNode,
+    account: &Key,
+    slots: &[Key],
+) -> Result<Option<Vec<RevealNode>>> {
+    let memo = RecordMemo::new();
+    let out = with_account_storage(store, upper, account, |store, storage| -> Result<Vec<RevealNode>> {
+        let mut e = Emitter { store, memo: &memo, out: Vec::new(), seen: Default::default() };
+        let mut prefix = Vec::with_capacity(64);
+        for s in slots {
+            prefix.clear();
+            let nibbles = key_nibbles(s);
+            match storage {
+                crate::cursor::StorageRef::Node(node) => e.walk_node(node, &mut prefix, &nibbles)?,
+                crate::cursor::StorageRef::Ram(ram) => e.walk_ram(ram, &mut prefix, &nibbles)?,
+            }
+        }
+        Ok(e.out)
+    })?;
+    out.transpose()
+}
+
 impl FlatMpt {
     /// Reveal-path nodes for `keys` in the account trie (sorted or not).
     pub fn reveal_account_paths(&self, keys: &[Key]) -> Result<Vec<RevealNode>> {
-        let memo = RecordMemo::new();
-        let mut e = Emitter { store: &self.store, memo: &memo, out: Vec::new(), seen: Default::default() };
-        let mut prefix = Vec::with_capacity(64);
-        for k in keys {
-            prefix.clear();
-            let nibbles = key_nibbles(k);
-            e.walk_ram(&self.upper, &mut prefix, &nibbles)?;
-        }
-        Ok(e.out)
+        reveal_account_paths(&self.store, &self.upper, keys)
     }
 
     /// Reveal-path nodes for `slots` within `account`'s storage trie.
     /// `Ok(None)` when the account doesn't exist or carries opaque storage.
     pub fn reveal_storage_paths(&self, account: &Key, slots: &[Key]) -> Result<Option<Vec<RevealNode>>> {
-        let memo = RecordMemo::new();
-        let out = self.with_account_storage(account, |store, storage| -> Result<Vec<RevealNode>> {
-            let mut e = Emitter { store, memo: &memo, out: Vec::new(), seen: Default::default() };
-            let mut prefix = Vec::with_capacity(64);
-            for s in slots {
-                prefix.clear();
-                let nibbles = key_nibbles(s);
-                match storage {
-                    crate::cursor::StorageRef::Node(node) => e.walk_node(node, &mut prefix, &nibbles)?,
-                    crate::cursor::StorageRef::Ram(ram) => e.walk_ram(ram, &mut prefix, &nibbles)?,
-                }
-            }
-            Ok(e.out)
-        })?;
-        out.transpose()
+        reveal_storage_paths(&self.store, &self.upper, account, slots)
+    }
+}
+
+impl FlatSnapshot {
+    /// Reveal-path nodes for `keys` in the account trie, at snapshot time.
+    pub fn reveal_account_paths(&self, keys: &[Key]) -> Result<Vec<RevealNode>> {
+        reveal_account_paths(&self.store, &self.root, keys)
+    }
+
+    /// Reveal-path nodes for `slots` within `account`'s storage trie, at
+    /// snapshot time. `Ok(None)` when the account doesn't exist or carries
+    /// opaque storage.
+    pub fn reveal_storage_paths(&self, account: &Key, slots: &[Key]) -> Result<Option<Vec<RevealNode>>> {
+        reveal_storage_paths(&self.store, &self.root, account, slots)
     }
 }

@@ -9,7 +9,9 @@
 //! record), and the intended consumer (root walks over changed prefixes,
 //! sparse-trie boundary fetches) seeks in key order.
 //!
-//! All walks take `&FlatMpt` — read-only and safe alongside other readers.
+//! All walks are read-only over a `(store, frontier)` view — either borrowed
+//! from a live `&FlatMpt` (externally synchronized) or from a `FlatSnapshot`
+//! (lock-free; stable while the writer applies blocks).
 
 use crate::*;
 use std::cell::RefCell;
@@ -282,9 +284,12 @@ fn ram_child_seek(
 // Public cursors
 // ---------------------------------------------------------------------------
 
-/// Ordered cursor over the account trie's leaves.
+/// Ordered cursor over the account trie's leaves. Borrows a read view — either
+/// a live [`FlatMpt`] (`&self`, externally synchronized) or a [`FlatSnapshot`]
+/// (lock-free, stable under concurrent applies).
 pub struct AccountCursor<'a> {
-    mpt: &'a FlatMpt,
+    store: &'a FlatFile,
+    upper: &'a RamNode,
     memo: RecordMemo,
     last: Option<Key>,
 }
@@ -293,7 +298,7 @@ impl<'a> AccountCursor<'a> {
     pub fn seek(&mut self, key: &Key) -> Result<Option<AccountEntry>> {
         let target = key_nibbles(key);
         let mut prefix = Vec::with_capacity(64);
-        let hit = ram_seek(&self.mpt.store, &self.memo, &self.mpt.upper, &mut prefix, &target, false)?;
+        let hit = ram_seek(self.store, &self.memo, self.upper, &mut prefix, &target, false)?;
         Ok(match hit {
             Some((nibbles, LeafOut::Account { nonce, balance, code_hash, storage_root })) => {
                 let k = nibbles_to_key(&nibbles);
@@ -335,7 +340,8 @@ impl<'a> AccountCursor<'a> {
 /// Ordered cursor over one account's storage-slot leaves. Values are the
 /// stored `RLP(U256)` slot encodings.
 pub struct StorageCursor<'a> {
-    mpt: &'a FlatMpt,
+    store: &'a FlatFile,
+    upper: &'a RamNode,
     memo: RecordMemo,
     account_key: Key,
     last: Option<Key>,
@@ -344,9 +350,7 @@ pub struct StorageCursor<'a> {
 impl<'a> StorageCursor<'a> {
     pub fn seek(&mut self, slot_key: &Key) -> Result<Option<(Key, Vec<u8>)>> {
         let target = key_nibbles(slot_key);
-        let hit = self
-            .mpt
-            .with_account_storage(&self.account_key, |store, storage| match storage {
+        let hit = with_account_storage(self.store, self.upper, &self.account_key, |store, storage| match storage {
                 StorageRef::Node(node) => {
                     let mut prefix = Vec::with_capacity(64);
                     node_seek(store, &self.memo, node, &mut prefix, &target, false)
@@ -393,12 +397,52 @@ pub(crate) enum StorageRef<'n> {
 impl FlatMpt {
     /// Ordered cursor over account leaves.
     pub fn account_cursor(&self) -> AccountCursor<'_> {
-        AccountCursor { mpt: self, memo: RecordMemo::new(), last: None }
+        AccountCursor { store: &self.store, upper: &self.upper, memo: RecordMemo::new(), last: None }
     }
 
     /// Ordered cursor over `account_key`'s storage leaves.
     pub fn storage_cursor(&self, account_key: &Key) -> StorageCursor<'_> {
-        StorageCursor { mpt: self, memo: RecordMemo::new(), account_key: *account_key, last: None }
+        StorageCursor {
+            store: &self.store,
+            upper: &self.upper,
+            memo: RecordMemo::new(),
+            account_key: *account_key,
+            last: None,
+        }
+    }
+}
+
+impl FlatSnapshot {
+    /// Ordered cursor over account leaves, at snapshot time.
+    pub fn account_cursor(&self) -> AccountCursor<'_> {
+        AccountCursor { store: &self.store, upper: &self.root, memo: RecordMemo::new(), last: None }
+    }
+
+    /// Ordered cursor over `account_key`'s storage leaves, at snapshot time.
+    pub fn storage_cursor(&self, account_key: &Key) -> StorageCursor<'_> {
+        StorageCursor {
+            store: &self.store,
+            upper: &self.root,
+            memo: RecordMemo::new(),
+            account_key: *account_key,
+            last: None,
+        }
+    }
+
+    /// Ordered cursor over the account trie's branch nodes, at snapshot time.
+    pub fn trie_node_cursor(&self) -> TrieNodeCursor<'_> {
+        TrieNodeCursor { store: &self.store, upper: &self.root, memo: RecordMemo::new(), last: None }
+    }
+
+    /// Ordered cursor over one account's storage branch nodes, at snapshot time.
+    pub fn storage_trie_node_cursor(&self, account_key: &Key) -> StorageTrieNodeCursor<'_> {
+        StorageTrieNodeCursor {
+            store: &self.store,
+            upper: &self.root,
+            memo: RecordMemo::new(),
+            account_key: *account_key,
+            last: None,
+        }
     }
 }
 
@@ -410,40 +454,53 @@ impl FlatMpt {
         account_key: &Key,
         f: impl FnOnce(&FlatFile, StorageRef<'_>) -> R,
     ) -> Result<Option<R>> {
-        let nibbles = key_nibbles(account_key);
-        // Frontier descent.
-        let mut node: &RamNode = &self.upper;
-        let mut depth = 0usize;
-        loop {
-            match node {
-                RamNode::Empty => return Ok(None),
-                RamNode::Extension { path, child, .. } => {
-                    if !nibbles[depth..].starts_with(path) {
-                        return Ok(None);
-                    }
-                    depth += path.len();
-                    node = child;
+        with_account_storage(&self.store, &self.upper, account_key, f)
+    }
+}
+
+/// Descend `upper` to `account_key`'s leaf and run `f` over its storage
+/// subtree — the view-independent walk backing [`FlatMpt::with_account_storage`]
+/// and the snapshot cursors. `Ok(None)` if the account doesn't exist (or is a
+/// plain-value leaf).
+pub(crate) fn with_account_storage<R>(
+    store: &FlatFile,
+    upper: &RamNode,
+    account_key: &Key,
+    f: impl FnOnce(&FlatFile, StorageRef<'_>) -> R,
+) -> Result<Option<R>> {
+    let nibbles = key_nibbles(account_key);
+    // Frontier descent.
+    let mut node: &RamNode = upper;
+    let mut depth = 0usize;
+    loop {
+        match node {
+            RamNode::Empty => return Ok(None),
+            RamNode::Extension { path, child, .. } => {
+                if !nibbles[depth..].starts_with(path) {
+                    return Ok(None);
                 }
-                RamNode::Branch { children, .. } => {
-                    match &children[nibbles[depth] as usize] {
-                        None => return Ok(None),
-                        Some(RamChild::Ram(sub)) => {
-                            depth += 1;
-                            node = sub;
-                        }
-                        Some(RamChild::Account(a)) => {
-                            return Ok((nibbles[depth + 1..] == a.path[..])
-                                .then(|| f(&self.store, StorageRef::Ram(&a.storage))));
-                        }
-                        Some(RamChild::Disk { ptr, .. }) => {
-                            let sub = self.store.read_lazy(*ptr)?;
-                            return record_account_storage(&self.store, &sub.node, &nibbles, sub.prefix.len(), f);
-                        }
-                        Some(RamChild::Mem(m)) => {
-                            m.touch();
-                            let sub = parse_payload_lazy(m.bytes.clone())?;
-                            return record_account_storage(&self.store, &sub.node, &nibbles, sub.prefix.len(), f);
-                        }
+                depth += path.len();
+                node = child;
+            }
+            RamNode::Branch { children, .. } => {
+                match &children[nibbles[depth] as usize] {
+                    None => return Ok(None),
+                    Some(RamChild::Ram(sub)) => {
+                        depth += 1;
+                        node = sub;
+                    }
+                    Some(RamChild::Account(a)) => {
+                        return Ok((nibbles[depth + 1..] == a.path[..])
+                            .then(|| f(store, StorageRef::Ram(&a.storage))));
+                    }
+                    Some(RamChild::Disk { ptr, .. }) => {
+                        let sub = store.read_lazy(*ptr)?;
+                        return record_account_storage(store, &sub.node, &nibbles, sub.prefix.len(), f);
+                    }
+                    Some(RamChild::Mem(m)) => {
+                        m.touch();
+                        let sub = parse_payload_lazy(m.bytes.clone())?;
+                        return record_account_storage(store, &sub.node, &nibbles, sub.prefix.len(), f);
                     }
                 }
             }
@@ -846,7 +903,8 @@ fn ram_branch_seek(
 /// Ordered cursor over the account trie's BRANCH nodes (reth TrieCursor
 /// backing). `next()` continues strictly after the last returned path.
 pub struct TrieNodeCursor<'a> {
-    mpt: &'a FlatMpt,
+    store: &'a FlatFile,
+    upper: &'a RamNode,
     memo: RecordMemo,
     last: Option<Vec<u8>>,
 }
@@ -859,7 +917,7 @@ impl<'a> TrieNodeCursor<'a> {
     pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
         let mut prefix = Vec::with_capacity(64);
         let target: &[u8] = if path_nibbles.is_empty() { &[0] } else { path_nibbles };
-        let out = ram_branch_seek(&self.mpt.store, &self.memo, &self.mpt.upper, &mut prefix, target)?;
+        let out = ram_branch_seek(self.store, &self.memo, self.upper, &mut prefix, target)?;
         self.last = out.as_ref().map(|e| e.path.clone());
         Ok(out)
     }
@@ -874,7 +932,8 @@ impl<'a> TrieNodeCursor<'a> {
 
 /// Ordered cursor over one account's storage BRANCH nodes.
 pub struct StorageTrieNodeCursor<'a> {
-    mpt: &'a FlatMpt,
+    store: &'a FlatFile,
+    upper: &'a RamNode,
     memo: RecordMemo,
     account_key: Key,
     last: Option<Vec<u8>>,
@@ -885,9 +944,7 @@ impl<'a> StorageTrieNodeCursor<'a> {
     /// never returned, matching reth's stored-trie semantics.
     pub fn seek(&mut self, path_nibbles: &[u8]) -> Result<Option<TrieNodeEntry>> {
         let target: &[u8] = if path_nibbles.is_empty() { &[0] } else { path_nibbles };
-        let out = self
-            .mpt
-            .with_account_storage(&self.account_key, |store, storage| {
+        let out = with_account_storage(self.store, self.upper, &self.account_key, |store, storage| {
                 let mut prefix = Vec::with_capacity(64);
                 match storage {
                     StorageRef::Node(node) => node_branch_seek(store, &self.memo, node, &mut prefix, target),
@@ -909,9 +966,15 @@ impl<'a> StorageTrieNodeCursor<'a> {
 
 impl FlatMpt {
     pub fn trie_node_cursor(&self) -> TrieNodeCursor<'_> {
-        TrieNodeCursor { mpt: self, memo: RecordMemo::new(), last: None }
+        TrieNodeCursor { store: &self.store, upper: &self.upper, memo: RecordMemo::new(), last: None }
     }
     pub fn storage_trie_node_cursor(&self, account_key: &Key) -> StorageTrieNodeCursor<'_> {
-        StorageTrieNodeCursor { mpt: self, memo: RecordMemo::new(), account_key: *account_key, last: None }
+        StorageTrieNodeCursor {
+            store: &self.store,
+            upper: &self.upper,
+            memo: RecordMemo::new(),
+            account_key: *account_key,
+            last: None,
+        }
     }
 }

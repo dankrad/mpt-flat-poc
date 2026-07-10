@@ -552,6 +552,16 @@ struct RegionAlloc {
     /// is reopened as a head (its dead space having been reclaimed by whole-
     /// region death through `free`, which pinning does not block).
     evac_pinned: Vec<bool>,
+    /// Live [`FlatSnapshot`] guards. While > 0, records that were readable at
+    /// any snapshot's creation must stay readable: a snapshot's (older)
+    /// frontier may still reference records the current frontier has since
+    /// freed, so a fully-dead region must not be reopened for writing. Dead
+    /// regions are parked in `snap_hold` instead, and `gc_step` no-ops.
+    snap_pins: usize,
+    /// Regions that went fully dead while snapshots were live. Routed to
+    /// `free_regions`/`quarantine` (by fresh status — the same rules `free`
+    /// applies) once the last snapshot drops.
+    snap_hold: Vec<u64>,
 }
 
 impl RegionAlloc {
@@ -627,7 +637,11 @@ impl RegionAlloc {
         let was = self.live[r];
         self.live[r] = was.saturating_sub(units);
         if was > 0 && self.live[r] == 0 && r as u64 != self.head_region {
-            if self.fresh.get(r).copied().unwrap_or(false) {
+            if self.snap_pins > 0 {
+                // A live snapshot's frontier may still read this region's old
+                // records: park it until the last snapshot drops.
+                self.snap_hold.push(r as u64);
+            } else if self.fresh.get(r).copied().unwrap_or(false) {
                 // Born after the last persist: the durable manifest cannot
                 // reference it — recycle immediately.
                 self.free_regions.push(r as u64);
@@ -644,8 +658,30 @@ impl RegionAlloc {
     /// this window are now referenced by the new manifest, so they lose their
     /// fresh status.
     fn on_persisted(&mut self) {
-        self.free_regions.append(&mut self.quarantine);
+        if self.snap_pins > 0 {
+            // Quarantined regions are dead per BOTH checkpoints, but a live
+            // snapshot may predate the frees that killed them — keep them
+            // unwritable until the last snapshot drops.
+            self.snap_hold.append(&mut self.quarantine);
+        } else {
+            self.free_regions.append(&mut self.quarantine);
+        }
         self.fresh.fill(false);
+    }
+
+    /// Route the parked dead regions (`snap_hold`) into circulation after the
+    /// last snapshot drops: fresh regions become reusable immediately, regions
+    /// the last durable checkpoint might reference go to quarantine (released
+    /// by the next persist — the same crash-safety rule as `free`).
+    fn release_snap_hold(&mut self) {
+        debug_assert_eq!(self.snap_pins, 0);
+        for r in std::mem::take(&mut self.snap_hold) {
+            if self.fresh.get(r as usize).copied().unwrap_or(false) {
+                self.free_regions.push(r);
+            } else {
+                self.quarantine.push(r);
+            }
+        }
     }
 
     fn live_units(&self) -> u64 {
@@ -1131,6 +1167,28 @@ impl FlatFile {
         let lt = std::time::Instant::now();
         self.seg.lock().unwrap().free(ptr.unit as u64, ptr.units());
         stats::on_alloc_lock(lt.elapsed().as_nanos() as u64);
+    }
+
+    /// Register a live snapshot: while any is registered, fully-dead regions
+    /// are parked instead of reopened for writing (see `RegionAlloc::snap_hold`)
+    /// and `gc_step` no-ops, so every record a snapshot can reach stays
+    /// readable at its recorded location.
+    fn pin_snapshot(&self) {
+        self.seg.lock().unwrap().snap_pins += 1;
+    }
+
+    /// Drop a snapshot registration; the last one releases the parked regions.
+    fn unpin_snapshot(&self) {
+        let mut seg = self.seg.lock().unwrap();
+        seg.snap_pins -= 1;
+        if seg.snap_pins == 0 {
+            seg.release_snap_hold();
+        }
+    }
+
+    /// Whether any snapshot guard is currently live.
+    fn snapshots_pinned(&self) -> bool {
+        self.seg.lock().unwrap().snap_pins > 0
     }
 
     fn end_page(&self) -> u64 {
@@ -2449,6 +2507,16 @@ impl FlatMpt {
     /// also runs it, so periodically-checkpointing embedders reclaim garbage with
     /// no API change. `MPT_GC_DISABLE=1` makes it a no-op.
     pub fn gc_step(&mut self) -> Result<usize> {
+        // Snapshot pin: evacuation rewrites records and frees their old copies,
+        // and (worse) relocation retargets frontier pointers — both would pull
+        // the rug out from under a live snapshot's (older) frontier. GC is
+        // simply deferred while any snapshot exists: snapshots live for about
+        // one block build, and gc_step runs off the critical path anyway, so
+        // the next unpinned call catches up. Region *reuse* is separately
+        // blocked by the allocator while pinned (see RegionAlloc::snap_hold).
+        if self.store.snapshots_pinned() {
+            return Ok(0);
+        }
         let cap = gc_r_max();
         let mut evacuated = 0usize;
         let no_fg: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -2529,6 +2597,26 @@ impl FlatMpt {
     /// Drop any unconsumed read-ahead entries (stale after an apply).
     pub fn prefetch_clear(&self) {
         self.store.read_ahead_clear();
+    }
+
+    /// A frozen, lock-free read view of the current state. O(1): an `Arc`
+    /// clone of the frontier root plus a store handle — no frontier copy.
+    ///
+    /// Readers run every read API ([`FlatSnapshot::get_value`], cursors,
+    /// reveal walks) against the snapshot with **no lock** and unaffected by a
+    /// concurrent `apply_block` on the owning [`FlatMpt`]: the apply path is
+    /// copy-on-write (it clones the frontier nodes on each touched path before
+    /// mutating them), so the snapshot's tree is immutable.
+    ///
+    /// Durability of disk records: the snapshot holds a guard that (a) makes
+    /// [`gc_step`](Self::gc_step) a no-op and (b) parks fully-dead regions
+    /// instead of reopening them for writes, so every record the snapshot can
+    /// reach stays readable at its recorded location. Guards are released on
+    /// drop. Keep snapshots short-lived (about one block build): each one
+    /// holds pre-apply subtrees and dead file regions alive.
+    pub fn snapshot(&self) -> FlatSnapshot {
+        self.store.pin_snapshot();
+        FlatSnapshot { root: Arc::clone(&self.upper), store: Arc::clone(&self.store) }
     }
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
@@ -2694,6 +2782,56 @@ impl FlatMpt {
         }
     }
 }
+
+/// A frozen, lock-free read view of a [`FlatMpt`] (see [`FlatMpt::snapshot`]).
+///
+/// Owns an `Arc` of the frontier root as of snapshot time plus a store handle,
+/// so it is independent of the `FlatMpt`'s borrow — send it to another thread
+/// and read while the writer applies blocks. Dropping the snapshot releases
+/// the GC/region-reuse guard.
+pub struct FlatSnapshot {
+    root: Arc<RamNode>,
+    store: Arc<FlatFile>,
+}
+
+impl FlatSnapshot {
+    /// Point-read a value (account RLP for account keys) — snapshot-time state.
+    pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
+        let nibbles = key_nibbles(key);
+        ram_get(&self.store, &self.root, &nibbles, 0)
+    }
+
+    /// Read one storage slot of the account at `account_key` — snapshot-time state.
+    pub fn get_storage(&self, account_key: &Key, slot_key: &Key) -> Result<Option<Vec<u8>>> {
+        let nibbles = key_nibbles(account_key);
+        ram_get_storage(&self.store, &self.root, &nibbles, 0, slot_key)
+    }
+
+    /// The state root at snapshot time.
+    pub fn root(&self) -> Hash {
+        hash_ram_parallel(&self.root)
+    }
+}
+
+impl Clone for FlatSnapshot {
+    fn clone(&self) -> Self {
+        self.store.pin_snapshot();
+        FlatSnapshot { root: Arc::clone(&self.root), store: Arc::clone(&self.store) }
+    }
+}
+
+impl Drop for FlatSnapshot {
+    fn drop(&mut self) {
+        self.store.unpin_snapshot();
+    }
+}
+
+// A snapshot is meant to be handed to reader threads while the writer applies:
+// everything it can reach is either immutable or interior-thread-safe.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FlatSnapshot>();
+};
 
 /// Point-read the value for `key` by walking the RAM frontier down to the record
 /// that owns it, then descending that record's node tree. Returns `None` if the
@@ -9368,5 +9506,314 @@ mod tests {
             Some(sval(4).as_slice())
         );
     }
-}
+    // --- FlatSnapshot (Arc-COW) tests -------------------------------------
 
+    /// `COW_CLONES` is process-global, so tests that create snapshots (the only
+    /// way frontier nodes become shared and hence clonable) serialize on this
+    /// lock — the clone-count test's deltas must not include another test's
+    /// COW copies.
+    static SNAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn acct(nonce: u64) -> StateOp {
+        StateOp::SetAccount {
+            nonce,
+            balance: U256::from(nonce + 1),
+            code_hash: eth::EMPTY_CODE_HASH.0,
+        }
+    }
+
+    /// `n` accounts, every 4th with a couple of storage slots.
+    fn seed_ops(n: u64) -> Vec<(Key, StateOp)> {
+        let mut ops = Vec::new();
+        for a in 0..n {
+            let key = hashed_key(a.to_be_bytes());
+            ops.push((key, acct(a)));
+            if a % 4 == 0 {
+                for sidx in 0..2u64 {
+                    let slot = hashed_key((a * 1000 + sidx).to_be_bytes());
+                    ops.push((key, StateOp::SetStorage {
+                        slot,
+                        value: eth::storage_value_rlp(U256::from(sidx + 1)),
+                    }));
+                }
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn snapshot_isolation_across_apply() {
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = db(Config::default());
+        db.apply_block(seed_ops(2000)).unwrap();
+
+        let snap = db.snapshot();
+        let root0 = db.root();
+        assert_eq!(snap.root(), root0);
+
+        let k7 = hashed_key(7u64.to_be_bytes());
+        let k8 = hashed_key(8u64.to_be_bytes());
+        let k12 = hashed_key(12u64.to_be_bytes());
+        let s12 = hashed_key((12u64 * 1000).to_be_bytes());
+        let knew = hashed_key(99_999u64.to_be_bytes());
+        let old7 = snap.get_value(&k7).unwrap().unwrap();
+        let old8 = snap.get_value(&k8).unwrap().unwrap();
+        let old12slot = snap.get_storage(&k12, &s12).unwrap().unwrap();
+
+        // Mutate: update 7, delete 8, create 99_999, overwrite a slot of 12.
+        db.apply_block(vec![
+            (k7, acct(777_777)),
+            (k8, StateOp::DeleteAccount),
+            (knew, acct(1)),
+            (k12, StateOp::SetStorage {
+                slot: s12,
+                value: eth::storage_value_rlp(U256::from(4242)),
+            }),
+        ])
+        .unwrap();
+
+        // The snapshot is frozen at pre-apply state...
+        assert_eq!(snap.root(), root0, "snapshot root drifted");
+        assert_eq!(snap.get_value(&k7).unwrap().unwrap(), old7);
+        assert_eq!(snap.get_value(&k8).unwrap().unwrap(), old8);
+        assert_eq!(snap.get_value(&knew).unwrap(), None);
+        assert_eq!(snap.get_storage(&k12, &s12).unwrap().unwrap(), old12slot);
+        // ...while the live trie sees the new state.
+        assert_ne!(db.root(), root0);
+        assert_ne!(db.get_value(&k7).unwrap().unwrap(), old7);
+        assert_eq!(db.get_value(&k8).unwrap(), None);
+        assert!(db.get_value(&knew).unwrap().is_some());
+        assert_eq!(
+            db.get_storage(&k12, &s12).unwrap().unwrap(),
+            eth::storage_value_rlp(U256::from(4242))
+        );
+
+        // Cursors and reveal walks on the snapshot serve the old state too.
+        let e = snap.account_cursor().seek(&k8).unwrap().unwrap();
+        assert_eq!(e.key, k8, "deleted account must still be visible to the snapshot");
+        let (sk, sv) = snap.storage_cursor(&k12).seek(&s12).unwrap().unwrap();
+        assert_eq!((sk, sv), (s12, old12slot));
+        let paths = snap.reveal_account_paths(&[k7, k8]).unwrap();
+        assert!(
+            paths.iter().any(|n| matches!(n, crate::reveal::RevealNode::Leaf { .. })),
+            "reveal on snapshot returned no leaves"
+        );
+        assert!(snap.reveal_storage_paths(&k12, &[s12]).unwrap().is_some());
+        // Branch cursors resolve hashes against the frozen tree.
+        assert!(snap.trie_node_cursor().seek(&[0]).unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_with_live_snapshot_copies_only_touched_paths() {
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        // Small leaves => a deep, many-node frontier so "O(touched paths)" is
+        // distinguishable from a full-frontier clone.
+        let cfg = Config {
+            target_leaf_bytes: 512,
+            max_leaf_bytes: 768,
+            min_promote_bytes: 192,
+        };
+        let mut db = db(cfg);
+        let n: u64 = 30_000;
+        db.apply_block(seed_ops(n)).unwrap();
+        db.root();
+        let total_nodes = db.ram_nodes() as u64;
+        let touched: Vec<(Key, StateOp)> =
+            (0..100u64).map(|a| (hashed_key(a.to_be_bytes()), acct(a + 1_000_000))).collect();
+
+        // Without a live snapshot nothing is shared: applies mutate in place.
+        let before = cow_clone_count();
+        db.apply_block(touched.clone()).unwrap();
+        assert_eq!(
+            cow_clone_count() - before,
+            0,
+            "apply without snapshots must not copy frontier nodes"
+        );
+
+        // With a live snapshot, exactly the touched paths are copied.
+        let snap = db.snapshot();
+        let root0 = snap.root();
+        let old0 = snap.get_value(&touched[0].0).unwrap().unwrap();
+        let before = cow_clone_count();
+        let touched2: Vec<(Key, StateOp)> =
+            (0..100u64).map(|a| (hashed_key(a.to_be_bytes()), acct(a + 2_000_000))).collect();
+        db.apply_block(touched2).unwrap();
+        let copied = cow_clone_count() - before;
+        eprintln!(
+            "COW: {copied} nodes copied for 100 touched accounts (frontier: {total_nodes} nodes)"
+        );
+        assert!(copied > 0, "a shared frontier must be copied on write");
+        assert!(
+            copied <= 100 * 16,
+            "copied {copied} nodes for 100 touched paths — not O(touched)"
+        );
+        assert!(
+            copied < total_nodes / 4,
+            "copied {copied} of {total_nodes} frontier nodes — looks like a deep clone"
+        );
+        // And the copies actually isolated the snapshot.
+        assert_eq!(snap.root(), root0);
+        assert_eq!(snap.get_value(&touched[0].0).unwrap().unwrap(), old0);
+    }
+
+    #[test]
+    fn snapshot_walks_run_lock_free_during_apply() {
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = db(Config::default());
+        let n: u64 = 3000;
+        db.apply_block(seed_ops(n)).unwrap();
+
+        // Reference model at snapshot time.
+        let mut model: BTreeMap<Key, u64> = BTreeMap::new();
+        for a in 0..n {
+            model.insert(hashed_key(a.to_be_bytes()), a);
+        }
+        let snap = db.snapshot();
+        let root0 = snap.root();
+        let sample_acct = hashed_key(4u64.to_be_bytes());
+        let sample_slot = hashed_key(4000u64.to_be_bytes());
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                // Many small blocks so reader passes overlap real mutation.
+                for round in 1..=40u64 {
+                    let ops: Vec<(Key, StateOp)> = (0..n)
+                        .step_by(3)
+                        .map(|a| (hashed_key(a.to_be_bytes()), acct(a + round * 10_000)))
+                        .collect();
+                    db.apply_block(ops).unwrap();
+                }
+                &db
+            });
+
+            // Reader: full ordered scans + point reads + reveal walks on the
+            // snapshot, concurrent with the applies, no lock anywhere.
+            for _pass in 0..6 {
+                let mut cur = snap.account_cursor();
+                let mut seen = 0u64;
+                let mut entry = cur.seek(&[0u8; 32]).unwrap();
+                while let Some(e) = entry {
+                    let want = *model.get(&e.key).expect("cursor surfaced an unknown key");
+                    assert_eq!(e.nonce, want, "snapshot cursor saw a post-apply nonce");
+                    seen += 1;
+                    entry = cur.next().unwrap();
+                }
+                assert_eq!(seen, n, "snapshot scan lost or gained accounts");
+                assert_eq!(snap.root(), root0);
+                assert_eq!(
+                    snap.get_storage(&sample_acct, &sample_slot).unwrap().unwrap(),
+                    eth::storage_value_rlp(U256::from(1))
+                );
+                let paths = snap.reveal_account_paths(&[sample_acct]).unwrap();
+                assert!(!paths.is_empty());
+            }
+
+            let db = writer.join().expect("writer panicked");
+            // Writer saw every update; snapshot still serves the old state.
+            let e = db.account_cursor().seek(&hashed_key(0u64.to_be_bytes())).unwrap().unwrap();
+            assert_eq!(e.nonce, 400_000);
+        });
+        assert_eq!(snap.root(), root0);
+    }
+
+    #[test]
+    fn gc_and_region_reuse_pin_while_snapshot_lives() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+
+        // Build past the GC floor, then snapshot, then overwrite 80% of the
+        // keys: the old records are freed while the snapshot still points at
+        // them, and their regions drop to <= 30% live (evacuation-eligible).
+        let n: u64 = 150_000;
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![1u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+        assert!(db.flat_file_len() > GC_MIN_PAGES * PAGE, "build below the GC floor — raise n");
+
+        let snap = db.snapshot();
+        let sample: Vec<(u64, Key)> =
+            (0..n).step_by(7_001).map(|i| (i, hashed_key(i.to_le_bytes()))).collect();
+
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .filter(|i| i % 5 != 0)
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![2u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+
+        // Pinned: gc_step is a no-op regardless of how much garbage there is.
+        assert_eq!(db.gc_step().unwrap(), 0, "gc_step must no-op while a snapshot lives");
+        // A checkpoint is allowed while pinned (quarantine is parked, not freed).
+        db.persist().unwrap();
+        // The snapshot still reads every pre-overwrite record.
+        for (_, k) in &sample {
+            assert_eq!(snap.get_value(k).unwrap().unwrap(), vec![1u8; 32], "snapshot lost a record");
+        }
+        for (i, k) in &sample {
+            let expect = if i % 5 != 0 { 2u8 } else { 1u8 };
+            assert_eq!(db.get_value(k).unwrap().unwrap(), vec![expect; 32]);
+        }
+
+        // Unpinned: the same call reclaims.
+        drop(snap);
+        assert!(db.gc_step().unwrap() > 0, "gc_step reclaimed nothing after unpin");
+        for (i, k) in &sample {
+            let expect = if i % 5 != 0 { 2u8 } else { 1u8 };
+            assert_eq!(db.get_value(k).unwrap().unwrap(), vec![expect; 32]);
+        }
+        let _ = db.root();
+    }
+
+    #[test]
+    fn region_frees_park_in_snap_hold_while_pinned() {
+        let mut ra = RegionAlloc::default();
+        let end = AtomicU64::new(0);
+        let ru = REGION_UNITS as u32;
+        let u_a = ra.alloc(ru, ru, &end); // fills region A (head)
+        let u_b = ra.alloc(ru, ru, &end); // opens region B; A is no longer head
+        let _u_c = ra.alloc(ru, ru, &end); // opens region C; B is no longer head
+        let region_a = RegionAlloc::region_of_unit(u_a);
+        let region_b = RegionAlloc::region_of_unit(u_b);
+
+        // Pinned + fresh: a fully-dead region parks instead of recycling.
+        ra.snap_pins = 1;
+        ra.free(u_a, ru);
+        assert!(ra.free_regions.is_empty() && ra.quarantine.is_empty());
+        assert_eq!(ra.snap_hold, vec![region_a]);
+        // Unpin: a fresh region becomes immediately reusable.
+        ra.snap_pins = 0;
+        ra.release_snap_hold();
+        assert_eq!(ra.free_regions, vec![region_a]);
+        assert!(ra.snap_hold.is_empty());
+
+        // Non-fresh (checkpoint-referenced) regions release into quarantine.
+        ra.on_persisted(); // clears fresh flags
+        ra.snap_pins = 1;
+        ra.free(u_b, ru);
+        assert_eq!(ra.snap_hold, vec![region_b]);
+        ra.snap_pins = 0;
+        ra.release_snap_hold();
+        assert_eq!(ra.quarantine, vec![region_b]);
+
+        // on_persisted while pinned parks the quarantine instead of freeing it.
+        ra.snap_pins = 1;
+        ra.on_persisted();
+        assert_eq!(ra.snap_hold, vec![region_b]);
+        assert!(!ra.free_regions.contains(&region_b));
+        // Release routes it back through quarantine (conservative: fresh flags
+        // were cleared by the persist), and the NEXT unpinned persist frees it.
+        ra.snap_pins = 0;
+        ra.release_snap_hold();
+        assert_eq!(ra.quarantine, vec![region_b]);
+        ra.on_persisted();
+        assert!(ra.free_regions.contains(&region_b));
+    }
+}
