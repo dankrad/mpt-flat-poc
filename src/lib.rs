@@ -8,7 +8,6 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
-    cell::Cell,
     collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     io::Write,
@@ -1384,28 +1383,58 @@ impl<'de> Deserialize<'de> for MemLeaf {
 // Children are an inline 16-slot array: frontier branches are dense in practice
 // (a near-complete 16-ary tree over the disk leaves), so a sparse representation
 // would only add per-branch heap allocations without shrinking anything.
-/// A frontier node's cached hash. It's a plain `Cell` (no atomic overhead on the
-/// hot serial path), but declared `Sync` so the root re-hash can run across
-/// threads: the frontier is a tree of uniquely-owned (`Box`) nodes, so when we
-/// split it into disjoint subtrees each node's cache is touched by exactly one
-/// thread — there is never concurrent access to the same cell.
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
-struct HashCell(Cell<Option<Hash>>);
-
-// SAFETY: the only multi-threaded reader is `hash_ram_parallel`, which hands each
-// thread a disjoint subtree of the uniquely-owned frontier; no two threads ever
-// reach the same `HashCell`.
-unsafe impl Sync for HashCell {}
+/// A frontier node's cached hash — a fill-once cell (`OnceLock`) that is safe to
+/// read and fill from many threads at once. Snapshots ([`FlatMpt::snapshot`])
+/// share frontier nodes with the writer via `Arc`, and both sides memoize hashes
+/// while walking (`hash_ram`, cursor/reveal walks), so a cell on a *shared* node
+/// can be filled concurrently. All fillers of a shared node compute the same
+/// value (shared nodes are immutable under the COW discipline — the apply path
+/// clones a node before mutating it), so first-write-wins is correct.
+/// *Invalidation* needs `&mut` ([`HashCell::clear`]): it only ever happens on a
+/// node the writer owns exclusively, so a reader never observes a cell being
+/// cleared.
+#[derive(Default, Debug)]
+struct HashCell(std::sync::OnceLock<Hash>);
 
 impl HashCell {
     fn new(v: Option<Hash>) -> Self {
-        HashCell(Cell::new(v))
+        let cell = std::sync::OnceLock::new();
+        if let Some(h) = v {
+            let _ = cell.set(h);
+        }
+        HashCell(cell)
     }
     fn get(&self) -> Option<Hash> {
-        self.0.get()
+        self.0.get().copied()
     }
-    fn set(&self, v: Option<Hash>) {
-        self.0.set(v)
+    /// Memoize a computed hash. First writer wins; a lost race is dropped (the
+    /// values are identical by construction, see the type-level comment).
+    fn fill(&self, v: Hash) {
+        let _ = self.0.set(v);
+    }
+    /// Drop the cached value. Exclusive access required — see the type-level
+    /// comment for why this is only reachable on writer-owned nodes.
+    fn clear(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Clone for HashCell {
+    fn clone(&self) -> Self {
+        HashCell::new(self.get())
+    }
+}
+
+// Same wire format as the historical `Cell<Option<Hash>>` (an `Option<Hash>`),
+// so existing manifests load unchanged.
+impl Serialize for HashCell {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.get().serialize(s)
+    }
+}
+impl<'de> Deserialize<'de> for HashCell {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(HashCell::new(Option::<Hash>::deserialize(d)?))
     }
 }
 
@@ -1758,7 +1787,7 @@ impl FlatMpt {
             }
             let store = &self.store;
             let RamNode::Branch { children, hash } = &mut self.upper else { unreachable!() };
-            hash.set(None);
+            hash.clear();
             let sinks: Vec<Vec<(Key, StateOp)>> = std::thread::scope(|scope| {
                 let cfg = &cfg;
                 let mut handles = Vec::new();
@@ -2167,7 +2196,7 @@ impl FlatMpt {
         if matches!(self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
             if let RamNode::Branch { children, hash } = &mut self.upper {
-                hash.set(None); // top branch re-hashed after the parallel inserts
+                hash.clear(); // top branch re-hashed after the parallel inserts
                 std::thread::scope(|scope| -> Result<()> {
                     let cfg = &cfg;
                     let mut handles = Vec::new();
@@ -2234,7 +2263,7 @@ impl FlatMpt {
         if matches!(self.upper, RamNode::Branch { .. }) {
             let store = &self.store;
             if let RamNode::Branch { children, hash } = &mut self.upper {
-                hash.set(None);
+                hash.clear();
                 std::thread::scope(|scope| -> Result<()> {
                     let cfg = &cfg;
                     let mut handles = Vec::new();
@@ -3195,7 +3224,7 @@ fn delete_ram(
                 }
             }
         }
-        RamNode::Branch { mut children, hash } => {
+        RamNode::Branch { mut children, mut hash } => {
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
@@ -3206,7 +3235,7 @@ fn delete_ram(
                     Ok(RamDelete::Absent)
                 }
                 RamDelete::Changed => {
-                    hash.set(None);
+                    hash.clear();
                     *node = RamNode::Branch { children, hash };
                     Ok(RamDelete::Changed)
                 }
@@ -3252,7 +3281,7 @@ fn delete_ram(
                             }
                         }
                         _ => {
-                            hash.set(None);
+                            hash.clear();
                             *node = RamNode::Branch { children, hash };
                             Ok(RamDelete::Changed)
                         }
@@ -4159,7 +4188,7 @@ fn apply_ram_group(
                 }
             }
         }
-        RamNode::Branch { mut children, hash } => {
+        RamNode::Branch { mut children, mut hash } => {
             let idx = nibbles[prefix.len()] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
@@ -4171,7 +4200,7 @@ fn apply_ram_group(
                     Ok(RamDelete::Absent)
                 }
                 RamDelete::Changed => {
-                    hash.set(None);
+                    hash.clear();
                     *node = RamNode::Branch { children, hash };
                     Ok(RamDelete::Changed)
                 }
@@ -4215,7 +4244,7 @@ fn apply_ram_group(
                             }
                         }
                         _ => {
-                            hash.set(None);
+                            hash.clear();
                             *node = RamNode::Branch { children, hash };
                             Ok(RamDelete::Changed)
                         }
@@ -5677,7 +5706,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
         RamNode::Extension { path, child, hash } => {
             let done = install_at_key(child, key, depth + path.len(), new);
             if done {
-                hash.set(None);
+                hash.clear();
             }
             done
         }
@@ -5695,7 +5724,7 @@ fn install_at_key(node: &mut RamNode, key: &Key, depth: usize, new: RamChild) ->
                 None => false,
             };
             if done {
-                hash.set(None);
+                hash.clear();
             }
             done
         }
@@ -6843,9 +6872,9 @@ fn find_disk_ptr_key(node: &RamNode, key: &Key, depth: usize) -> Option<DiskPtr>
 
 /// Drop the cached hash of `node` (if any). Called as the insert descends, so
 /// exactly the nodes on the touched path are invalidated and later recomputed.
-fn invalidate_ram(node: &RamNode) {
+fn invalidate_ram(node: &mut RamNode) {
     match node {
-        RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.set(None),
+        RamNode::Extension { hash, .. } | RamNode::Branch { hash, .. } => hash.clear(),
         RamNode::Empty => {}
     }
 }
@@ -6864,7 +6893,7 @@ fn hash_ram(node: &RamNode) -> Hash {
             // bytes (their children are whole records), so the ref finalizes to a
             // plain hash — inlining only happens inside records.
             let computed = ext_ref(path, &NodeRef::Hash(hash_ram(child))).finalize();
-            hash.set(Some(computed));
+            hash.fill(computed);
             computed
         }
         RamNode::Branch { children, hash } => {
@@ -6880,7 +6909,7 @@ fn hash_ram(node: &RamNode) -> Hash {
                 children.iter().flatten().map(|child| NodeRef::Hash(ram_child_hash(child))),
             )
             .finalize();
-            hash.set(Some(computed));
+            hash.fill(computed);
             computed
         }
     }
@@ -6901,7 +6930,7 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
             }
             // One child: parallelism is at the branch below, so recurse parallel.
             let computed = ext_ref(path, &NodeRef::Hash(hash_ram_parallel(child))).finalize();
-            hash.set(Some(computed));
+            hash.fill(computed);
             computed
         }
         RamNode::Branch { children, hash } => {
@@ -6933,7 +6962,7 @@ fn hash_ram_parallel(node: &RamNode) -> Hash {
             let bitmap = branch_bitmap(children.iter().map(|c| c.is_some()));
             let computed =
                 branch_ref(bitmap, child_hashes.into_iter().map(NodeRef::Hash)).finalize();
-            hash.set(Some(computed));
+            hash.fill(computed);
             computed
         }
     }
