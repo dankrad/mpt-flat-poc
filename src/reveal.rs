@@ -490,3 +490,101 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+    use crate::stats;
+    use sha3::{Digest, Keccak256};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// Point-read cost probe: on the flat at `FLAT_PROBE`, sample existing
+    /// storage slots uniformly (cursor-seek to random keys) and count device
+    /// record reads + wall latency per `get_storage`. Run against a SCRATCH
+    /// COPY with dropped caches for the cold numbers:
+    ///   FLAT_PROBE=/mnt2/probe-1b.flat cargo test --release probe_point_read_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_point_read_cost() {
+        let path = std::env::var("FLAT_PROBE").expect("set FLAT_PROBE");
+        let n: usize = std::env::var("FLAT_PROBE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+        let db = FlatMpt::open(&path).expect("open probe flat");
+        let snap = db.snapshot();
+
+        // Accounts that own storage: scan the account cursor, keep those whose
+        // storage cursor yields an entry.
+        let mut owners: Vec<Key> = Vec::new();
+        let mut c = snap.account_cursor();
+        let mut k = [0u8; 32];
+        for _ in 0..5000 {
+            let Some(e) = c.seek(&k).unwrap() else { break };
+            if snap.storage_cursor(&e.key).seek(&[0u8; 32]).unwrap().is_some() {
+                owners.push(e.key);
+                if owners.len() >= 64 { break; }
+            }
+            k = e.key;
+            let mut carry = 1u16;
+            for b in k.iter_mut().rev() {
+                let v = *b as u16 + carry; *b = v as u8; carry = v >> 8;
+                if carry == 0 { break; }
+            }
+        }
+        assert!(!owners.is_empty(), "no storage-owning accounts found");
+        eprintln!("storage-owning accounts sampled: {}", owners.len());
+
+        // Uniform existing slots: seek the storage cursor to hash-derived keys.
+        let mut lookups: Vec<(Key, Key)> = Vec::new();
+        'outer: for i in 0..n * 2 {
+            let owner = owners[i % owners.len()];
+            let probe = {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&Keccak256::digest(format!("probe-{i}")));
+                out
+            };
+            if let Some((slot, _)) = snap.storage_cursor(&owner).seek(&probe).unwrap() {
+                lookups.push((owner, slot));
+                if lookups.len() >= n { break 'outer; }
+            }
+        }
+        eprintln!("lookups prepared: {} (cursor warm-up reads not counted)", lookups.len());
+
+        // Cold measurement: the sampling seeks above warmed these records.
+        let _ = std::process::Command::new("sudo")
+            .args(["-n", "sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches"])
+            .status();
+        let mut per_reads: Vec<u64> = Vec::with_capacity(lookups.len());
+        let mut per_ns: Vec<u64> = Vec::with_capacity(lookups.len());
+        let mut per_bytes: Vec<u64> = Vec::with_capacity(lookups.len());
+        for (owner, slot) in &lookups {
+            let r0 = stats::B_READ_IOS.load(Relaxed);
+            let b0 = stats::B_READ_BYTES.load(Relaxed);
+            let t = std::time::Instant::now();
+            let v = snap.get_storage(owner, slot).unwrap();
+            per_ns.push(t.elapsed().as_nanos() as u64);
+            per_reads.push(stats::B_READ_IOS.load(Relaxed) - r0);
+            per_bytes.push(stats::B_READ_BYTES.load(Relaxed) - b0);
+            assert!(v.is_some(), "sampled slot must exist");
+        }
+        per_bytes.sort_unstable();
+        per_reads.sort_unstable();
+        per_ns.sort_unstable();
+        let pct = |v: &Vec<u64>, p: usize| v[v.len() * p / 100];
+        let mut hist = std::collections::BTreeMap::new();
+        for r in &per_reads { *hist.entry(*r).or_insert(0u64) += 1; }
+        eprintln!("record reads per get_storage: histogram {hist:?}");
+        eprintln!(
+            "reads p50/p90/p99/max: {}/{}/{}/{}",
+            pct(&per_reads, 50), pct(&per_reads, 90), pct(&per_reads, 99), per_reads.last().unwrap()
+        );
+        eprintln!(
+            "latency µs p50/p90/p99/max: {}/{}/{}/{}",
+            pct(&per_ns, 50) / 1000, pct(&per_ns, 90) / 1000,
+            pct(&per_ns, 99) / 1000, per_ns.last().unwrap() / 1000
+        );
+        eprintln!(
+            "record bytes/read p50/p90/p99/max: {}/{}/{}/{}",
+            pct(&per_bytes, 50), pct(&per_bytes, 90), pct(&per_bytes, 99),
+            per_bytes.last().unwrap()
+        );
+    }
+}

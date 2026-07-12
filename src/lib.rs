@@ -133,8 +133,14 @@ pub mod stats {
     /// threads — exposes how much of "read" is the SSD vs CPU at scale.
     pub static B_READ_IO_NS: AtomicU64 = AtomicU64::new(0);
     pub static B_READ_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Count of device record reads (`read_lazy` cache misses) — with
+    /// `B_READ_IO_NS`, gives reads-per-lookup and per-IO latency.
+    pub static B_READ_IOS: AtomicU64 = AtomicU64::new(0);
+    /// Bytes fetched by those reads (record payload sizes).
+    pub static B_READ_BYTES: AtomicU64 = AtomicU64::new(0);
     pub fn on_read_io(ns: u64) {
         B_READ_IO_NS.fetch_add(ns, Relaxed);
+        B_READ_IOS.fetch_add(1, Relaxed);
     }
     pub fn on_read_parse(ns: u64) {
         B_READ_PARSE_NS.fetch_add(ns, Relaxed);
@@ -1138,6 +1144,7 @@ impl FlatFile {
             // Payload starts just past the framing header.
             let r = self.read_payload(ptr.offset() + RECORD_HDR as u64, ptr.len as usize)?;
             stats::on_read_io(it.elapsed().as_nanos() as u64);
+            stats::B_READ_BYTES.fetch_add(ptr.len as u64, std::sync::atomic::Ordering::Relaxed);
             r
         };
         let _g = prof::scope(prof::Cat::Deserialize);
