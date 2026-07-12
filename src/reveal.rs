@@ -376,4 +376,117 @@ impl FlatSnapshot {
     pub fn reveal_storage_paths(&self, account: &Key, slots: &[Key]) -> Result<Option<Vec<RevealNode>>> {
         reveal_storage_paths(&self.store, &self.root, account, slots)
     }
+
+    /// Point-read + reveal in one walk: `get_value` semantics for the value,
+    /// plus the reveal-path nodes the walk visited anyway. Lets an executor's
+    /// state read double as the commitment trie's reveal — one record fetch
+    /// serves both consumers.
+    pub fn get_value_reveal(&self, key: &Key) -> Result<(Option<Vec<u8>>, Vec<RevealNode>)> {
+        let nodes = reveal_account_paths(&self.store, &self.root, std::slice::from_ref(key))?;
+        Ok((extract_exact(&nodes, key), nodes))
+    }
+
+    /// Storage-slot analog of [`Self::get_value_reveal`]. `None` nodes when
+    /// the account is absent or carries opaque storage — the value then comes
+    /// from the plain read path so `get_storage` semantics are preserved.
+    pub fn get_storage_reveal(
+        &self,
+        account: &Key,
+        slot: &Key,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<RevealNode>>)> {
+        match reveal_storage_paths(&self.store, &self.root, account, std::slice::from_ref(slot))? {
+            Some(nodes) => Ok((extract_exact(&nodes, slot), Some(nodes))),
+            None => Ok((self.get_storage(account, slot)?, None)),
+        }
+    }
+}
+
+/// The exact-match leaf value for `key` among revealed path nodes: a leaf
+/// whose `path ++ key` spans the full 64 nibbles of the target. Divergent
+/// leaves (exclusion proofs) don't match — same `None` as the plain getters.
+fn extract_exact(nodes: &[RevealNode], key: &Key) -> Option<Vec<u8>> {
+    let target = key_nibbles(key);
+    for n in nodes {
+        if let RevealNode::Leaf { path, key: rest, value } = n {
+            if path.len() + rest.len() == target.len()
+                && target[..path.len()] == path[..]
+                && target[path.len()..] == rest[..]
+            {
+                return Some(value.clone());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, StateOp, U256};
+    use sha3::{Digest, Keccak256};
+
+    fn h(data: &[u8]) -> Key {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Keccak256::digest(data));
+        out
+    }
+
+    /// get_value_reveal / get_storage_reveal must be byte-equivalent to the
+    /// plain getters (the EVM consumes these values) and emit the same nodes
+    /// as the reveal-only walk, for present keys, absent keys, and storage
+    /// shapes from empty to split/promoted records.
+    #[test]
+    fn read_with_reveal_matches_plain_getters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rwr.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+
+        let mut ops: Vec<(Key, StateOp)> = Vec::new();
+        let mut acct_keys = Vec::new();
+        for a in 0..400u64 {
+            let key = h(&a.to_be_bytes());
+            acct_keys.push(key);
+            ops.push((key, StateOp::SetAccount {
+                nonce: a + 1,
+                balance: U256::from(a * 7 + 1),
+                code_hash: h(&[a as u8; 4]),
+            }));
+            // storage sizes: none, small, large (record split / promote)
+            let n_slots = match a % 5 { 0 => 0, 1 => 3, 2 => 40, 3 => 400, _ => 1 };
+            for s in 0..n_slots {
+                let slot = h(&(a * 100_000 + s).to_be_bytes());
+                ops.push((key, StateOp::SetStorage {
+                    slot,
+                    value: eth::storage_value_rlp(U256::from(s + 1)),
+                }));
+            }
+        }
+        db.apply_block(ops.clone()).unwrap();
+        let snap = db.snapshot();
+
+        for (i, key) in acct_keys.iter().enumerate() {
+            let (v, nodes) = snap.get_value_reveal(key).unwrap();
+            assert_eq!(v, snap.get_value(key).unwrap(), "account value {i}");
+            assert!(v.is_some(), "account {i} must exist");
+            let only = snap.reveal_account_paths(std::slice::from_ref(key)).unwrap();
+            assert_eq!(format!("{nodes:?}"), format!("{only:?}"), "account nodes {i}");
+        }
+        // absent account keys (exclusion paths)
+        for a in 0..50u64 {
+            let key = h(&(1_000_000 + a).to_be_bytes());
+            let (v, _) = snap.get_value_reveal(&key).unwrap();
+            assert_eq!(v, snap.get_value(&key).unwrap());
+            assert!(v.is_none());
+        }
+        // storage: present + absent slots across the shape spectrum
+        for (i, key) in acct_keys.iter().enumerate() {
+            let a = i as u64;
+            let present = h(&(a * 100_000).to_be_bytes());
+            let absent = h(&(a * 100_000 + 99_999).to_be_bytes());
+            for slot in [present, absent] {
+                let (v, _) = snap.get_storage_reveal(key, &slot).unwrap();
+                assert_eq!(v, snap.get_storage(key, &slot).unwrap(), "slot of account {i}");
+            }
+        }
+    }
 }
