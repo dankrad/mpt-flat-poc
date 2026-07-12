@@ -888,6 +888,10 @@ struct FlatFile {
     /// Prefetched record payloads keyed by unit (filled by `prefetch_block`
     /// during execution, consumed one-shot by `read_lazy` at apply time).
     read_ahead: Mutex<std::collections::HashMap<u32, Vec<u8>>>,
+    /// Entry count mirror: lets `read_ahead_take` skip the lock entirely when
+    /// the buffer is empty — which is always, outside an in-flight apply.
+    /// Point reads from snapshot readers otherwise serialize on this mutex.
+    read_ahead_len: std::sync::atomic::AtomicUsize,
 }
 
 impl FlatFile {
@@ -911,6 +915,7 @@ impl FlatFile {
             end_page: AtomicU64::new(0),
             direct,
             read_ahead: Mutex::new(std::collections::HashMap::new()),
+            read_ahead_len: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -925,15 +930,22 @@ impl FlatFile {
     /// `read_ahead_clear` at the end of the apply; stale entries for
     /// rewritten records are never hit (fresh ptrs get fresh units).
     fn read_ahead_take(&self, unit: u32) -> Option<Vec<u8>> {
+        if self.read_ahead_len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
         self.read_ahead.lock().unwrap().get(&unit).cloned()
     }
 
     pub(crate) fn read_ahead_insert(&self, unit: u32, payload: Vec<u8>) {
-        self.read_ahead.lock().unwrap().insert(unit, payload);
+        let mut g = self.read_ahead.lock().unwrap();
+        g.insert(unit, payload);
+        self.read_ahead_len.store(g.len(), std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn read_ahead_clear(&self) {
-        self.read_ahead.lock().unwrap().clear();
+        let mut g = self.read_ahead.lock().unwrap();
+        g.clear();
+        self.read_ahead_len.store(0, std::sync::atomic::Ordering::Release);
     }
 
     fn read_payload(&self, off: u64, len: usize) -> Result<Vec<u8>> {
@@ -1712,6 +1724,7 @@ impl FlatMpt {
             end_page: AtomicU64::new(end_page),
             direct,
             read_ahead: Mutex::new(std::collections::HashMap::new()),
+            read_ahead_len: std::sync::atomic::AtomicUsize::new(0),
         };
         {
             let mut live = vec![0u32; num_regions as usize];
