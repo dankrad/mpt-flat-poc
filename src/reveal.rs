@@ -346,6 +346,12 @@ fn reveal_storage_paths(
                 crate::cursor::StorageRef::Ram(ram) => e.walk_ram(ram, &mut prefix, &nibbles)?,
             }
         }
+        // Empty storage emits nothing from the record-tree walker (the RAM
+        // walker emits EmptyRoot) — normalize: an empty proof cannot reveal a
+        // blind trie, but "this trie is empty" can and is what it means.
+        if e.out.is_empty() {
+            e.out.push(RevealNode::EmptyRoot);
+        }
         Ok(e.out)
     })?;
     out.transpose()
@@ -478,6 +484,16 @@ mod tests {
             assert_eq!(v, snap.get_value(&key).unwrap());
             assert!(v.is_none());
         }
+        // an account with NO storage must reveal as an explicit EmptyRoot,
+        // never an empty node list (an empty proof cannot un-blind a trie)
+        let bare = h(&999_999u64.to_be_bytes());
+        // (bare accounts: every 5th account has no slots — reuse index 0)
+        let no_storage = acct_keys[0];
+        let nodes = snap.reveal_storage_paths(&no_storage, &[bare]).unwrap();
+        if let Some(nodes) = nodes {
+            assert!(!nodes.is_empty(), "empty-storage reveal must emit EmptyRoot");
+        }
+
         // storage: present + absent slots across the shape spectrum
         for (i, key) in acct_keys.iter().enumerate() {
             let a = i as u64;
