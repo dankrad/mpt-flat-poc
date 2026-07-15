@@ -558,16 +558,23 @@ struct RegionAlloc {
     /// is reopened as a head (its dead space having been reclaimed by whole-
     /// region death through `free`, which pinning does not block).
     evac_pinned: Vec<bool>,
-    /// Live [`FlatSnapshot`] guards. While > 0, records that were readable at
-    /// any snapshot's creation must stay readable: a snapshot's (older)
-    /// frontier may still reference records the current frontier has since
-    /// freed, so a fully-dead region must not be reopened for writing. Dead
-    /// regions are parked in `snap_hold` instead, and `gc_step` no-ops.
-    snap_pins: usize,
-    /// Regions that went fully dead while snapshots were live. Routed to
-    /// `free_regions`/`quarantine` (by fresh status — the same rules `free`
-    /// applies) once the last snapshot drops.
-    snap_hold: Vec<u64>,
+    /// Monotonic id source for [`FlatSnapshot`] pin generations.
+    pin_gen: u64,
+    /// Live [`FlatSnapshot`] guards by pin generation. While a pin is live,
+    /// records that were readable at its creation must stay readable: its
+    /// (older) frontier may still reference records the current frontier has
+    /// since freed, so regions that die must not be reopened for writing
+    /// until every pin that could reference them has dropped. Generation-
+    /// aware: a region freed at generation G is unreadable only by pins with
+    /// generation <= G, so it re-enters circulation as soon as the OLDEST
+    /// live pin is newer than G — long-lived pins of the newest state (the
+    /// published read snapshot) no longer freeze reclamation.
+    live_pins: std::collections::BTreeMap<u64, u32>,
+    /// Regions that went fully dead while pins were live, tagged with the
+    /// pin generation current at death. Routed to `free_regions`/`quarantine`
+    /// (by fresh status — the same rules `free` applies) once the oldest live
+    /// pin generation exceeds the tag.
+    snap_hold: Vec<(u64, u64)>,
 }
 
 impl RegionAlloc {
@@ -643,10 +650,11 @@ impl RegionAlloc {
         let was = self.live[r];
         self.live[r] = was.saturating_sub(units);
         if was > 0 && self.live[r] == 0 && r as u64 != self.head_region {
-            if self.snap_pins > 0 {
+            if !self.live_pins.is_empty() {
                 // A live snapshot's frontier may still read this region's old
-                // records: park it until the last snapshot drops.
-                self.snap_hold.push(r as u64);
+                // records: park it until every pin at or before the current
+                // generation drops.
+                self.snap_hold.push((r as u64, self.pin_gen));
             } else if self.fresh.get(r).copied().unwrap_or(false) {
                 // Born after the last persist: the durable manifest cannot
                 // reference it — recycle immediately.
@@ -664,30 +672,62 @@ impl RegionAlloc {
     /// this window are now referenced by the new manifest, so they lose their
     /// fresh status.
     fn on_persisted(&mut self) {
-        if self.snap_pins > 0 {
+        if !self.live_pins.is_empty() {
             // Quarantined regions are dead per BOTH checkpoints, but a live
             // snapshot may predate the frees that killed them — keep them
-            // unwritable until the last snapshot drops.
-            self.snap_hold.append(&mut self.quarantine);
+            // unwritable until every current pin drops.
+            let tag = self.pin_gen;
+            self.snap_hold.extend(std::mem::take(&mut self.quarantine).into_iter().map(|r| (r, tag)));
         } else {
             self.free_regions.append(&mut self.quarantine);
         }
         self.fresh.fill(false);
     }
 
-    /// Route the parked dead regions (`snap_hold`) into circulation after the
-    /// last snapshot drops: fresh regions become reusable immediately, regions
-    /// the last durable checkpoint might reference go to quarantine (released
-    /// by the next persist — the same crash-safety rule as `free`).
+    /// Route eligible parked dead regions (`snap_hold`) into circulation:
+    /// a region tagged with generation G is eligible once no live pin has
+    /// generation <= G (pins created after the free cannot reference its old
+    /// records). Fresh regions become reusable immediately, regions the last
+    /// durable checkpoint might reference go to quarantine (released by the
+    /// next persist — the same crash-safety rule as `free`).
     fn release_snap_hold(&mut self) {
-        debug_assert_eq!(self.snap_pins, 0);
-        for r in std::mem::take(&mut self.snap_hold) {
-            if self.fresh.get(r as usize).copied().unwrap_or(false) {
+        let oldest = self.live_pins.keys().next().copied();
+        let mut kept = Vec::new();
+        for (r, tag) in std::mem::take(&mut self.snap_hold) {
+            if oldest.is_some_and(|o| o <= tag) {
+                kept.push((r, tag));
+            } else if self.fresh.get(r as usize).copied().unwrap_or(false) {
                 self.free_regions.push(r);
             } else {
                 self.quarantine.push(r);
             }
         }
+        self.snap_hold = kept;
+    }
+
+    /// Register a new snapshot pin at a fresh generation.
+    fn pin(&mut self) -> u64 {
+        self.pin_gen += 1;
+        *self.live_pins.entry(self.pin_gen).or_insert(0) += 1;
+        self.pin_gen
+    }
+
+    /// Register an additional pin at an existing generation (snapshot clone:
+    /// the clone reads the same frozen frontier, so it shares the original's
+    /// visibility horizon).
+    fn pin_at(&mut self, pin_gen: u64) {
+        *self.live_pins.entry(pin_gen).or_insert(0) += 1;
+    }
+
+    /// Drop a pin; release any parked regions that became eligible.
+    fn unpin(&mut self, pin_gen: u64) {
+        if let Some(c) = self.live_pins.get_mut(&pin_gen) {
+            *c -= 1;
+            if *c == 0 {
+                self.live_pins.remove(&pin_gen);
+            }
+        }
+        self.release_snap_hold();
     }
 
     fn live_units(&self) -> u64 {
@@ -1192,22 +1232,19 @@ impl FlatFile {
     /// are parked instead of reopened for writing (see `RegionAlloc::snap_hold`)
     /// and `gc_step` no-ops, so every record a snapshot can reach stays
     /// readable at its recorded location.
-    fn pin_snapshot(&self) {
-        self.seg.lock().unwrap().snap_pins += 1;
+    fn pin_snapshot(&self) -> u64 {
+        self.seg.lock().unwrap().pin()
     }
 
-    /// Drop a snapshot registration; the last one releases the parked regions.
-    fn unpin_snapshot(&self) {
-        let mut seg = self.seg.lock().unwrap();
-        seg.snap_pins -= 1;
-        if seg.snap_pins == 0 {
-            seg.release_snap_hold();
-        }
+    /// Register an additional pin at an existing generation (snapshot clone).
+    fn pin_snapshot_at(&self, pin_gen: u64) {
+        self.seg.lock().unwrap().pin_at(pin_gen)
     }
 
-    /// Whether any snapshot guard is currently live.
-    fn snapshots_pinned(&self) -> bool {
-        self.seg.lock().unwrap().snap_pins > 0
+    /// Drop a snapshot registration; releases any parked regions whose tag is
+    /// now older than every live pin.
+    fn unpin_snapshot(&self, pin_gen: u64) {
+        self.seg.lock().unwrap().unpin(pin_gen);
     }
 
     fn end_page(&self) -> u64 {
@@ -2527,16 +2564,15 @@ impl FlatMpt {
     /// also runs it, so periodically-checkpointing embedders reclaim garbage with
     /// no API change. `MPT_GC_DISABLE=1` makes it a no-op.
     pub fn gc_step(&mut self) -> Result<usize> {
-        // Snapshot pin: evacuation rewrites records and frees their old copies,
-        // and (worse) relocation retargets frontier pointers — both would pull
-        // the rug out from under a live snapshot's (older) frontier. GC is
-        // simply deferred while any snapshot exists: snapshots live for about
-        // one block build, and gc_step runs off the critical path anyway, so
-        // the next unpinned call catches up. Region *reuse* is separately
-        // blocked by the allocator while pinned (see RegionAlloc::snap_hold).
-        if self.store.snapshots_pinned() {
-            return Ok(0);
-        }
+        // Snapshot pins do NOT defer GC. Evacuation rewrites live records to
+        // the head and frees their old copies, and relocation retargets
+        // pointers in the CURRENT frontier only — a pinned snapshot's own
+        // (older, immutable) frontier still points at the old locations, and
+        // those stay readable because freed regions park in the allocator's
+        // generation-tagged snap_hold until every pin that could reference
+        // them has dropped. (The previous blanket defer starved reclamation
+        // whenever a long-lived snapshot existed — e.g. the node's published
+        // read snapshot — ballooning the file and degrading applies.)
         let cap = gc_r_max();
         let mut evacuated = 0usize;
         let no_fg: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -2635,8 +2671,8 @@ impl FlatMpt {
     /// drop. Keep snapshots short-lived (about one block build): each one
     /// holds pre-apply subtrees and dead file regions alive.
     pub fn snapshot(&self) -> FlatSnapshot {
-        self.store.pin_snapshot();
-        FlatSnapshot { root: Arc::clone(&self.upper), store: Arc::clone(&self.store) }
+        let pin_gen = self.store.pin_snapshot();
+        FlatSnapshot { root: Arc::clone(&self.upper), store: Arc::clone(&self.store), pin_gen }
     }
 
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
@@ -2812,6 +2848,9 @@ impl FlatMpt {
 pub struct FlatSnapshot {
     root: Arc<RamNode>,
     store: Arc<FlatFile>,
+    /// Pin generation registered with the store (dropped on drop; clones
+    /// share it — same frozen frontier, same visibility horizon).
+    pin_gen: u64,
 }
 
 impl FlatSnapshot {
@@ -2835,14 +2874,18 @@ impl FlatSnapshot {
 
 impl Clone for FlatSnapshot {
     fn clone(&self) -> Self {
-        self.store.pin_snapshot();
-        FlatSnapshot { root: Arc::clone(&self.root), store: Arc::clone(&self.store) }
+        self.store.pin_snapshot_at(self.pin_gen);
+        FlatSnapshot {
+            root: Arc::clone(&self.root),
+            store: Arc::clone(&self.store),
+            pin_gen: self.pin_gen,
+        }
     }
 }
 
 impl Drop for FlatSnapshot {
     fn drop(&mut self) {
-        self.store.unpin_snapshot();
+        self.store.unpin_snapshot(self.pin_gen);
     }
 }
 
@@ -9794,8 +9837,10 @@ mod tests {
             db.insert_batch(batch).unwrap();
         }
 
-        // Pinned: gc_step is a no-op regardless of how much garbage there is.
-        assert_eq!(db.gc_step().unwrap(), 0, "gc_step must no-op while a snapshot lives");
+        // Pinned: gc_step MAY reclaim (generation-aware holds keep every
+        // record the snapshot can reach readable at its old location — freed
+        // source regions park until the pin drops instead of being reused).
+        let reclaimed_pinned = db.gc_step().unwrap();
         // A checkpoint is allowed while pinned (quarantine is parked, not freed).
         db.persist().unwrap();
         // The snapshot still reads every pre-overwrite record.
@@ -9807,14 +9852,61 @@ mod tests {
             assert_eq!(db.get_value(k).unwrap().unwrap(), vec![expect; 32]);
         }
 
-        // Unpinned: the same call reclaims.
+        // Unpinned: parked regions release; between the pinned pass and this
+        // one, all the garbage must get reclaimed.
         drop(snap);
-        assert!(db.gc_step().unwrap() > 0, "gc_step reclaimed nothing after unpin");
+        let reclaimed_unpinned = db.gc_step().unwrap();
+        assert!(
+            reclaimed_pinned + reclaimed_unpinned > 0,
+            "gc reclaimed nothing across pinned+unpinned passes"
+        );
         for (i, k) in &sample {
             let expect = if i % 5 != 0 { 2u8 } else { 1u8 };
             assert_eq!(db.get_value(k).unwrap().unwrap(), vec![expect; 32]);
         }
         let _ = db.root();
+    }
+
+    /// The live node keeps one published read snapshot pinned at ALL times
+    /// (republished per block: the new pin is taken before the old drops, so
+    /// the pin count never touches zero). Reclamation must still work — the
+    /// old blanket "defer while pinned" ballooned the file without bound.
+    #[test]
+    fn rolling_pin_does_not_starve_reclamation() {
+        fn run(dir: &tempfile::TempDir, rolling_pin: bool) -> (u64, Hash) {
+            let path = dir.path().join(if rolling_pin { "pin.flat" } else { "nopin.flat" });
+            let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+            let n = 60_000u64;
+            let batch: Vec<(Key, Vec<u8>)> =
+                (0..n).map(|i| (hashed_key(i.to_le_bytes()), vec![1u8; 32])).collect();
+            db.insert_batch(batch).unwrap();
+
+            let mut held = rolling_pin.then(|| db.snapshot());
+            for round in 0..30u8 {
+                let batch: Vec<(Key, Vec<u8>)> = (0..n)
+                    .map(|i| (hashed_key(i.to_le_bytes()), vec![round.wrapping_add(2); 32]))
+                    .collect();
+                db.insert_batch(batch).unwrap();
+                if rolling_pin {
+                    // Republish: pin the new state BEFORE dropping the old pin.
+                    let next = db.snapshot();
+                    held = Some(next);
+                }
+                db.gc_step().unwrap();
+            }
+            drop(held);
+            let root = db.root();
+            (db.flat_file_len(), root)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (len_pinned, root_pinned) = run(&dir, true);
+        let (len_free, root_free) = run(&dir, false);
+        assert_eq!(root_pinned, root_free, "rolling pin changed the state root");
+        assert!(
+            len_pinned <= len_free * 2,
+            "rolling pin starved reclamation: {len_pinned} vs {len_free} bytes"
+        );
     }
 
     #[test]
@@ -9829,34 +9921,34 @@ mod tests {
         let region_b = RegionAlloc::region_of_unit(u_b);
 
         // Pinned + fresh: a fully-dead region parks instead of recycling.
-        ra.snap_pins = 1;
+        let g1 = ra.pin();
         ra.free(u_a, ru);
         assert!(ra.free_regions.is_empty() && ra.quarantine.is_empty());
-        assert_eq!(ra.snap_hold, vec![region_a]);
-        // Unpin: a fresh region becomes immediately reusable.
-        ra.snap_pins = 0;
-        ra.release_snap_hold();
-        assert_eq!(ra.free_regions, vec![region_a]);
+        assert_eq!(ra.snap_hold, vec![(region_a, g1)]);
+        // A pin taken AFTER the free does not keep the region parked once the
+        // older pin drops (generation-aware release).
+        let g2 = ra.pin();
+        ra.unpin(g1);
+        assert_eq!(ra.free_regions, vec![region_a], "newer pin must not hold older frees");
         assert!(ra.snap_hold.is_empty());
+        ra.unpin(g2);
 
         // Non-fresh (checkpoint-referenced) regions release into quarantine.
         ra.on_persisted(); // clears fresh flags
-        ra.snap_pins = 1;
+        let g3 = ra.pin();
         ra.free(u_b, ru);
-        assert_eq!(ra.snap_hold, vec![region_b]);
-        ra.snap_pins = 0;
-        ra.release_snap_hold();
+        assert_eq!(ra.snap_hold, vec![(region_b, g3)]);
+        ra.unpin(g3);
         assert_eq!(ra.quarantine, vec![region_b]);
 
         // on_persisted while pinned parks the quarantine instead of freeing it.
-        ra.snap_pins = 1;
+        let g4 = ra.pin();
         ra.on_persisted();
-        assert_eq!(ra.snap_hold, vec![region_b]);
+        assert_eq!(ra.snap_hold, vec![(region_b, g4)]);
         assert!(!ra.free_regions.contains(&region_b));
         // Release routes it back through quarantine (conservative: fresh flags
         // were cleared by the persist), and the NEXT unpinned persist frees it.
-        ra.snap_pins = 0;
-        ra.release_snap_hold();
+        ra.unpin(g4);
         assert_eq!(ra.quarantine, vec![region_b]);
         ra.on_persisted();
         assert!(ra.free_regions.contains(&region_b));
