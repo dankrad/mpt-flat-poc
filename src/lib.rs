@@ -2591,8 +2591,24 @@ impl FlatMpt {
             let t_gc = std::time::Instant::now();
             let reloc = evacuate_regions(&self.store, &self.upper, &victims, &no_fg)?;
             let relocated = reloc.len() as u64;
+            let mut failed_installs = 0u64;
             for (prefix, new_ptr) in reloc {
-                install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new_ptr);
+                if !install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new_ptr) {
+                    failed_installs += 1;
+                    if std::env::var("MPT_GC_LOG").is_ok() {
+                        eprintln!(
+                            "GC INSTALL FAILED: prefix_len={} prefix={} new_ptr={:?}",
+                            prefix.len(),
+                            prefix.iter().map(|n| format!("{n:x}")).collect::<String>(),
+                            new_ptr
+                        );
+                    }
+                }
+            }
+            if failed_installs > 0 {
+                eprintln!(
+                    "GC: {failed_installs} failed installs this pass — frontier now references freed space"
+                );
             }
             // A full evacuation drives a victim's live count to zero (relocating
             // frees the old copies). A victim still live after the pass holds
@@ -2830,7 +2846,7 @@ impl FlatMpt {
         loop {
             let subtree = self.store.read(ptr)?;
             reads += 1;
-            match follow_key(&subtree.node, subtree.prefix.len(), key) {
+            match follow_key(&subtree.node, local_depth(&subtree.prefix), key) {
                 PathEnd::Overflow(next) => ptr = next,
                 PathEnd::Inline(true) => return Ok(reads),
                 PathEnd::Inline(false) => bail!("key not found in addressed disk subtree"),
@@ -2916,12 +2932,12 @@ fn ram_get(store: &FlatFile, node: &RamNode, nibbles: &[u8], depth: usize) -> Re
                 Some(RamChild::Ram(child)) => ram_get(store, child, nibbles, depth + 1),
                 Some(RamChild::Disk { ptr, .. }) => {
                     let sub = store.read_lazy(*ptr)?;
-                    node_get(store, &sub.node, nibbles, sub.prefix.len())
+                    node_get(store, &sub.node, nibbles, local_depth(&sub.prefix))
                 }
                 Some(RamChild::Mem(m)) => {
                     m.touch();
                     let sub = parse_payload_lazy(m.bytes.clone())?;
-                    node_get(store, &sub.node, nibbles, sub.prefix.len())
+                    node_get(store, &sub.node, nibbles, local_depth(&sub.prefix))
                 }
                 // A generic value read of a promoted account returns its account RLP.
                 // The child sits one nibble below this branch (like the Ram/Disk arms).
@@ -2975,7 +2991,7 @@ fn node_get(store: &FlatFile, node: &Node, nibbles: &[u8], depth: usize) -> Resu
         }
         Node::Overflow { ptr, .. } => {
             let sub = store.read_lazy(*ptr)?;
-            node_get(store, &sub.node, nibbles, sub.prefix.len())
+            node_get(store, &sub.node, nibbles, local_depth(&sub.prefix))
         }
         Node::Raw { buf, off, len, .. } => {
             let n = parse_node_lazy(buf, *off, *len)?;
@@ -3007,11 +3023,11 @@ fn ram_get_storage(
             Some(RamChild::Ram(child)) => ram_get_storage(store, child, nibbles, depth + 1, slot_key),
             Some(RamChild::Disk { ptr, .. }) => {
                 let sub = store.read_lazy(*ptr)?;
-                node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+                node_get_storage(store, &sub.node, nibbles, local_depth(&sub.prefix), slot_key)
             }
             Some(RamChild::Mem(m)) => {
                 let sub = parse_payload_lazy(m.bytes.clone())?;
-                node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+                node_get_storage(store, &sub.node, nibbles, local_depth(&sub.prefix), slot_key)
             }
             // Promoted account (one nibble below this branch): descend its RAM
             // storage frontier with the slot key.
@@ -3058,7 +3074,7 @@ fn node_get_storage(
         },
         Node::Overflow { ptr, .. } => {
             let sub = store.read_lazy(*ptr)?;
-            node_get_storage(store, &sub.node, nibbles, sub.prefix.len(), slot_key)
+            node_get_storage(store, &sub.node, nibbles, local_depth(&sub.prefix), slot_key)
         }
         Node::Raw { buf, off, len, .. } => {
             let n = parse_node_lazy(buf, *off, *len)?;
@@ -3213,7 +3229,7 @@ fn insert_into_child(
             // `Arc` (the old one drops here). No I/O, no shared store.
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let mut subtree = parse_payload_lazy(m.bytes.clone())?;
-            let depth = subtree.prefix.len();
+            let depth = local_depth(&subtree.prefix);
             record_node_insert(store, cfg, &mut subtree.node, depth, key, op)?;
             *slot = Some(if should_promote(cfg, &subtree) {
                 promote_to_mem(store, subtree)?
@@ -3227,7 +3243,7 @@ fn insert_into_child(
         Some(RamChild::Disk { ptr, root }) => {
             let mut subtree = store.read_lazy(*ptr)?;
             let old_ptr = *ptr;
-            record_node_insert(store, cfg, &mut subtree.node, subtree.prefix.len(), key, op)?;
+            record_node_insert(store, cfg, &mut subtree.node, local_depth(&subtree.prefix), key, op)?;
             if should_promote(cfg, &subtree) {
                 store.free(old_ptr);
                 *slot = Some(if hot_records_enabled() {
@@ -3583,7 +3599,7 @@ fn delete_in_child(
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let bytes = m.bytes.clone();
             let mut subtree = parse_payload_lazy(m.bytes.clone())?;
-            let depth = subtree.prefix.len();
+            let depth = local_depth(&subtree.prefix);
             match record_node_delete(&mut subtree.node, depth, key, op)? {
                 NodeDelete::Absent => {
                     // Untouched: restore the original bytes (no re-serialize).
@@ -3600,7 +3616,7 @@ fn delete_in_child(
         Some(RamChild::Disk { ptr, root }) => {
             let old_ptr = *ptr;
             let mut subtree = store.read_lazy(old_ptr)?;
-            match record_node_delete(&mut subtree.node, subtree.prefix.len(), key, op)? {
+            match record_node_delete(&mut subtree.node, local_depth(&subtree.prefix), key, op)? {
                 NodeDelete::Absent => Ok(RamDelete::Absent),
                 NodeDelete::Changed => {
                     store.free(old_ptr);
@@ -4588,7 +4604,7 @@ fn apply_group_child(
             let Some(RamChild::Mem(m)) = slot.take() else { unreachable!() };
             let bytes = m.bytes.clone();
             let mut subtree = parse_payload_lazy(m.bytes.clone())?;
-            let depth = subtree.prefix.len();
+            let depth = local_depth(&subtree.prefix);
             match apply_net_in_record(store, cfg, &mut subtree.node, depth, key, upd, inv)? {
                 NodeDelete::Absent => {
                     *slot = Some(RamChild::Mem(MemLeaf::new(bytes, m.root)));
@@ -5538,8 +5554,21 @@ fn should_promote_account(cfg: &Config, subtree: &DiskSubtree) -> bool {
 /// children are `Disk` storage records — the storage analogue of
 /// [`promote_record_to_ram`]. The pointers now live in RAM, so GC can relocate any
 /// storage record by updating a RAM pointer.
-fn promote_storage_to_ram(store: &FlatFile, storage: Node, ram: bool) -> Result<Arc<RamNode>> {
-    let subtree = DiskSubtree { prefix: Vec::new(), node: storage };
+///
+/// `acct_prefix` is the owning account's FULL frontier path (64 nibbles:
+/// frontier prefix ++ leaf path). Every record written under the promotion
+/// carries the composite prefix `acct_prefix ++ storage nibbles`, so its
+/// stored nibble path is the complete information needed to find its owning
+/// pointer from the tree root — GC liveness checks and pointer installs work
+/// uniformly. (Records used to be written with storage-only prefixes, making
+/// them unaddressable from the root: unreclaimable at best.)
+fn promote_storage_to_ram(
+    store: &FlatFile,
+    storage: Node,
+    ram: bool,
+    acct_prefix: Vec<u8>,
+) -> Result<Arc<RamNode>> {
+    let subtree = DiskSubtree { prefix: acct_prefix, node: storage };
     let promoted =
         if ram { promote_to_mem(store, subtree)? } else { promote_record_to_ram(store, subtree)? };
     match promoted {
@@ -5556,7 +5585,11 @@ fn promote_account_to_ram(store: &FlatFile, subtree: DiskSubtree, ram: bool) -> 
     let Node::Account { path, nonce, balance, code_hash, storage, .. } = subtree.node else {
         unreachable!("promote_account_to_ram called on a non-account record");
     };
-    let storage_ram = promote_storage_to_ram(store, *storage, ram)?;
+    // Composite prefix seed: frontier path to this record ++ the account
+    // leaf's remaining path = the account's full 64 key nibbles.
+    let mut acct_prefix = subtree.prefix.clone();
+    acct_prefix.extend_from_slice(&path);
+    let storage_ram = promote_storage_to_ram(store, *storage, ram, acct_prefix)?;
     Ok(RamChild::Account(Arc::new(PromotedAccount {
         path,
         nonce,
@@ -6386,7 +6419,8 @@ impl LazyReader {
     }
     fn nibble_path(&mut self) -> Result<Vec<u8>> {
         let len = self.u8()? as usize;
-        if len > 64 {
+        // Composite prefixes (promoted-storage records) reach 128 nibbles.
+        if len > 128 {
             bail!("compact subtree nibble path too long");
         }
         let mut path = Vec::with_capacity(len);
@@ -6703,9 +6737,6 @@ fn install_ptr_by_prefix(node: &mut RamNode, prefix: &[u8], depth: usize, new_pt
                 Some(RamChild::Ram(child)) => {
                     install_ptr_by_prefix(Arc::make_mut(child), prefix, depth + 1, new_ptr)
                 }
-                // A promoted account is not a relocatable state record; its storage
-                // records are pinned from GC evacuation, so no reloc targets one here.
-                Some(RamChild::Account(_)) => false,
                 None => false,
             }
         }
@@ -7117,6 +7148,18 @@ fn process_fold_gc(
     )
 }
 
+
+/// Local descent depth encoded by a record's stored nibble path. Promoted-
+/// storage records carry composite prefixes (64 account nibbles ++ storage
+/// nibbles); within their storage subtree only the storage part positions the
+/// node. Account-space record prefixes never exceed 64 nibbles (a full key),
+/// and composite prefixes are always >= 65 (the 64-nibble account seed is
+/// never serialized itself — promotion writes its children, each adding at
+/// least one storage nibble) — so length disambiguates.
+fn local_depth(prefix: &[u8]) -> usize {
+    if prefix.len() > 64 { prefix.len() - 64 } else { prefix.len() }
+}
+
 fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr> {
     match node {
         RamNode::Empty => None,
@@ -7132,7 +7175,19 @@ fn find_disk_ptr(node: &RamNode, nibbles: &[u8], depth: usize) -> Option<DiskPtr
             match children[idx].as_ref()? {
                 RamChild::Ram(child) => find_disk_ptr(child, nibbles, depth + 1),
                 RamChild::Disk { ptr, .. } => Some(*ptr),
-                RamChild::Mem(_) | RamChild::Account(_) => None,
+                // Composite prefix: 64 account nibbles ++ storage nibbles.
+                // Mirrors install_ptr_by_prefix so GC's liveness check and
+                // pointer install agree about promoted-storage records.
+                RamChild::Account(a) => {
+                    if nibbles.get(depth + 1..depth + 1 + a.path.len())
+                        == Some(a.path.as_slice())
+                    {
+                        find_disk_ptr(&a.storage, nibbles, depth + 1 + a.path.len())
+                    } else {
+                        None
+                    }
+                }
+                RamChild::Mem(_) => None,
             }
         }
     }
@@ -7506,8 +7561,11 @@ fn audit_ram_child(
         }
         RamChild::Account(a) => {
             st.accounts += 1;
-            // Storage records carry storage-relative prefixes.
-            let sroot = audit_ram_node(store, &a.storage, &[], st, 0)?;
+            // Storage records carry composite prefixes: the account's full 64
+            // key nibbles ++ storage nibbles.
+            let mut seed = prefix.to_vec();
+            seed.extend_from_slice(&a.path);
+            let sroot = audit_ram_node(store, &a.storage, &seed, st, 0)?;
             leaf_ref(&a.path, &ram_account_rlp(a.nonce, &a.balance, &a.code_hash, sroot))
                 .finalize()
         }
@@ -7646,12 +7704,16 @@ fn scan_ram_child(
         RamChild::Ram(node) => scan_ram_node(store, node, prefix, ctx, f),
         RamChild::Mem(m) => {
             let subtree = deserialize_subtree_lazy(m.bytes.clone())?;
-            let mut path = subtree.prefix.clone();
+            let skip = subtree.prefix.len() - local_depth(&subtree.prefix);
+            let mut path = subtree.prefix[skip..].to_vec();
             scan_record_node(store, &subtree.node, &mut path, ctx, f)
         }
         RamChild::Disk { ptr, .. } => {
             let subtree = store.read_lazy(*ptr)?;
-            let mut path = subtree.prefix.clone();
+            // Composite prefixes (promoted storage) position the node by
+            // their storage part only.
+            let skip = subtree.prefix.len() - local_depth(&subtree.prefix);
+            let mut path = subtree.prefix[skip..].to_vec();
             scan_record_node(store, &subtree.node, &mut path, ctx, f)
         }
         RamChild::Account(a) => {
