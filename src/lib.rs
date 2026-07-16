@@ -2593,6 +2593,23 @@ impl FlatMpt {
             let relocated = reloc.len() as u64;
             let mut failed_installs = 0u64;
             for (prefix, new_ptr) in reloc {
+                // Forensic guard: the slot this prefix resolves to must still
+                // hold a pointer into a victim region (the old location).
+                // A miss or a foreign pointer means the walk found the WRONG
+                // slot — installing would corrupt an unrelated subtree.
+                if std::env::var("MPT_GC_VERIFY").is_ok() {
+                    match find_disk_ptr(&self.upper, &prefix, 0) {
+                        Some(cur) if victims.contains(&RegionAlloc::region_of_unit(cur.unit as u64)) => {}
+                        other => {
+                            panic!(
+                                "GC WRONG-SLOT INSTALL: prefix_len={} prefix={} slot_holds={:?} new={:?} victims={:?}",
+                                prefix.len(),
+                                prefix.iter().map(|n| format!("{n:x}")).collect::<String>(),
+                                other, new_ptr, victims
+                            );
+                        }
+                    }
+                }
                 if !install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new_ptr) {
                     failed_installs += 1;
                     if std::env::var("MPT_GC_LOG").is_ok() {
