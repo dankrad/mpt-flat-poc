@@ -517,6 +517,11 @@ const GC_MIN_PAGES: u64 = 64 * REGION_PAGES;
 /// Never evacuate a region fuller than this (relocation cost not worth the space).
 const EVAC_MAX_UTIL: f64 = 0.30;
 
+/// Victim utilization cap for the background collect/install GC: higher than
+/// the inline cap — relocation IO runs off the write lock, so regions up to
+/// just under `TARGET_UTIL` are still worth compacting.
+const BG_EVAC_MAX_UTIL: f64 = 0.55;
+
 /// Log-structured page allocator over fixed regions. New records append to a
 /// moving head region (sequential, coalesced writes); per-region live-page counts
 /// let space be reclaimed a whole region at a time. A region whose live count
@@ -746,11 +751,11 @@ impl RegionAlloc {
     /// as their leaves migrate to the head and get reclaimed for free. Excludes the
     /// head, already-free, full, and too-full (`> EVAC_MAX_UTIL`) regions. Simple
     /// O(regions) scan; bucket in a later pass if it shows up.
-    fn select_victims(&self, max: usize) -> Vec<u64> {
+    fn select_victims(&self, max: usize, max_util: f64) -> Vec<u64> {
         if max == 0 {
             return Vec::new();
         }
-        let cap_live = (REGION_UNITS as f64 * EVAC_MAX_UTIL) as u32;
+        let cap_live = (REGION_UNITS as f64 * max_util) as u32;
         let free: std::collections::HashSet<u64> = self.free_regions.iter().copied().collect();
         let mut cands: Vec<(f64, u64)> = self
             .live
@@ -2584,7 +2589,7 @@ impl FlatMpt {
             if r == 0 {
                 break;
             }
-            let victims = self.store.seg.lock().unwrap().select_victims(r);
+            let victims = self.store.seg.lock().unwrap().select_victims(r, EVAC_MAX_UTIL);
             if victims.is_empty() {
                 break;
             }
@@ -2645,6 +2650,55 @@ impl FlatMpt {
             evacuated += victims.len();
         }
         Ok(evacuated)
+    }
+
+    /// Install phase of the split background GC (see [`FlatSnapshot::gc_collect`]):
+    /// under the writer, re-verify each relocation against the LIVE frontier and
+    /// swap the pointer; relocations whose record died or moved since collect are
+    /// discarded (their fresh copy freed — wasted write, never wrong data). The
+    /// batch's snapshot pin (held by `GcBatch`, dropped here) kept every old copy's
+    /// region out of circulation during the collect→install window, so a matching
+    /// old pointer is guaranteed to still be the collected record.
+    ///
+    /// Returns `(installed, discarded)`.
+    pub fn gc_install(&mut self, batch: GcBatch) -> Result<(usize, usize)> {
+        let GcBatch { snap: _snap, items, victims } = batch;
+        let mut installed = 0usize;
+        let mut discarded = 0usize;
+        for (prefix, old, new) in items {
+            if find_disk_ptr(&self.upper, &prefix, 0) == Some(old) {
+                if install_ptr_by_prefix(Arc::make_mut(&mut self.upper), &prefix, 0, new) {
+                    self.store.free(old);
+                    installed += 1;
+                } else {
+                    // find matched but install found no Disk slot: the walk
+                    // shapes disagree — surface loudly, keep the old record.
+                    eprintln!(
+                        "GC INSTALL FAILED: prefix_len={} new_ptr={new:?}",
+                        prefix.len()
+                    );
+                    self.store.free(new);
+                    discarded += 1;
+                }
+            } else {
+                self.store.free(new);
+                discarded += 1;
+            }
+        }
+        // Victims still live after the install hold unrelocatable or
+        // just-rewritten records: pin them out of selection (same progress
+        // rule as gc_step).
+        {
+            let mut seg = self.store.seg.lock().unwrap();
+            for &r in &victims {
+                if seg.live.get(r as usize).copied().unwrap_or(0) > 0 {
+                    seg.ensure_region(r);
+                    seg.evac_pinned[r as usize] = true;
+                }
+            }
+        }
+        stats::on_gc(victims.len() as u64, installed as u64, 0);
+        Ok((installed, discarded))
     }
 
     /// Warm the store's read-ahead buffer with every record `apply_block(ops)`
@@ -2772,6 +2826,7 @@ impl FlatMpt {
         self.store.live_and_free_units().0 * ADDR_UNIT
     }
 
+
     /// Active-file utilization: `live / (end − reclaimed free regions)`. The
     /// inline-GC controller drives this toward `TARGET_UTIL`.
     pub fn utilization(&self) -> f64 {
@@ -2886,7 +2941,145 @@ pub struct FlatSnapshot {
     pin_gen: u64,
 }
 
+/// A background-collected GC relocation batch: victim regions were read and
+/// their live records rewritten to the head WITHOUT the write lock; the swap
+/// happens in [`FlatMpt::gc_install`]. Holds the collecting snapshot so its
+/// pin keeps every old copy's region parked until the install completes —
+/// that pin is what makes "current frontier still points at `old`" a
+/// sufficient install-time check.
+pub struct GcBatch {
+    snap: FlatSnapshot,
+    /// (frontier prefix, old ptr, relocated ptr)
+    items: Vec<(Vec<u8>, DiskPtr, DiskPtr)>,
+    victims: Vec<u64>,
+}
+
+impl GcBatch {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.victims.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub fn regions(&self) -> usize {
+        self.victims.len()
+    }
+}
+
 impl FlatSnapshot {
+    /// Collect phase of the split background GC: select up to `max_regions`
+    /// victim regions, read them on parallel workers, keep the records this
+    /// snapshot's frontier still references, and rewrite those to the head.
+    /// Pure reads plus head-appends — no write lock, safe concurrently with
+    /// applies. Returns an empty batch once active-file utilization is at
+    /// target or no region qualifies.
+    ///
+    /// Protocol: one batch in flight at a time — collect, then
+    /// [`FlatMpt::gc_install`], then collect again. Victim regions' live
+    /// counts only drop at install, so overlapping collects would reselect
+    /// and re-copy the same victims.
+    pub fn gc_collect(self, max_regions: usize) -> Result<GcBatch> {
+        let empty = |snap: FlatSnapshot| GcBatch { snap, items: Vec::new(), victims: Vec::new() };
+        if self.store.end_page() < GC_MIN_PAGES || self.utilization() >= TARGET_UTIL {
+            return Ok(empty(self));
+        }
+        // Background collection is off the hot path, so it can afford the
+        // 30-60% band the inline cap skips — without it, uniform churn
+        // strands most garbage in regions the selector never touches and
+        // utilization plateaus far below target.
+        let victims =
+            self.store.seg.lock().unwrap().select_victims(max_regions, BG_EVAC_MAX_UTIL);
+        if victims.is_empty() {
+            return Ok(empty(self));
+        }
+        // Parallel region reads + liveness filter (IO-latency-bound preads;
+        // same oversubscription rationale as prefetch_block).
+        let store = &*self.store;
+        let root = &self.root;
+        let workers = worker_count().min(victims.len());
+        let chunk = victims.len().div_ceil(workers);
+        let per_worker: Vec<Result<Vec<(Vec<u8>, Vec<u8>, DiskPtr)>>> =
+            std::thread::scope(|scope| {
+                victims
+                    .chunks(chunk)
+                    .map(|regions| {
+                        scope.spawn(move || {
+                            let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+                            for &region in regions {
+                                let buf = store.read_region(region)?;
+                                let base_unit = region * REGION_UNITS;
+                                let mut p = 0usize;
+                                while p + 4 <= buf.len() {
+                                    let len =
+                                        u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+                                    if len == 0 {
+                                        let next =
+                                            (p / ADDR_UNIT as usize + 1) * ADDR_UNIT as usize;
+                                        if next <= p {
+                                            break;
+                                        }
+                                        p = next;
+                                        continue;
+                                    }
+                                    let rec_units = units_for(RECORD_HDR + len) as usize;
+                                    let end = p + 4 + len as usize;
+                                    if end > buf.len() {
+                                        break;
+                                    }
+                                    let unit =
+                                        (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
+                                    let payload = &buf[p + 4..end];
+                                    if let Ok(prefix) = parse_prefix(payload) {
+                                        if find_disk_ptr(root, &prefix, 0)
+                                            == Some(DiskPtr { unit, len })
+                                        {
+                                            live.push((
+                                                prefix,
+                                                payload.to_vec(),
+                                                DiskPtr { unit, len },
+                                            ));
+                                        }
+                                    }
+                                    p += rec_units * ADDR_UNIT as usize;
+                                }
+                            }
+                            Ok(live)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("gc collect worker panicked"))
+                    .collect()
+            });
+        let mut live: Vec<(Vec<u8>, Vec<u8>, DiskPtr)> = Vec::new();
+        for w in per_worker {
+            live.extend(w?);
+        }
+        if live.is_empty() {
+            return Ok(GcBatch { snap: self, items: Vec::new(), victims });
+        }
+        let payloads: Vec<&[u8]> = live.iter().map(|(_, pl, _)| pl.as_slice()).collect();
+        let new_ptrs = self.store.write_batch_parallel(&payloads)?;
+        let items = live
+            .into_iter()
+            .zip(new_ptrs)
+            .map(|((prefix, _, old), new)| (prefix, old, new))
+            .collect();
+        Ok(GcBatch { snap: self, items, victims })
+    }
+
+    /// Active-file utilization as seen through this snapshot's store handle
+    /// (same formula as [`FlatMpt::utilization`]).
+    pub fn utilization(&self) -> f64 {
+        let (live_units, free_units) = self.store.live_and_free_units();
+        let active = (self.store.end_page() * UNITS_PER_PAGE).saturating_sub(free_units);
+        if active == 0 {
+            0.0
+        } else {
+            live_units as f64 / active as f64
+        }
+    }
+
     /// Point-read a value (account RLP for account keys) — snapshot-time state.
     pub fn get_value(&self, key: &Key) -> Result<Option<Vec<u8>>> {
         let nibbles = key_nibbles(key);
@@ -9943,6 +10136,102 @@ mod tests {
             let expect = if i % 5 != 0 { 2u8 } else { 1u8 };
             assert_eq!(db.get_value(k).unwrap().unwrap(), vec![expect; 32]);
         }
+        let _ = db.root();
+    }
+
+    /// Split background GC: collect off the write lock, mutate state in the
+    /// collect→install window (so some relocations go stale), then install.
+    /// Stale relocations must be discarded (never installed over the newer
+    /// record), everything stays readable, and repeated cycles reclaim.
+    #[test]
+    fn gc_collect_install_survives_concurrent_overwrites() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+
+        let n: u64 = 150_000;
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![1u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+        // Overwrite 80% so plenty of regions drop under the victim threshold.
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .filter(|i| i % 5 != 0)
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![2u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+
+        let mut total_installed = 0usize;
+        let mut total_discarded = 0usize;
+        let mut raced: std::collections::HashMap<u64, u8> = Default::default();
+        let free_before = db.free_regions();
+        for round in 0..8 {
+            let batch = db.snapshot().gc_collect(4096).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            // Race: overwrite a few keys between collect and install — their
+            // containing subtree records get rewritten, so any collected
+            // relocation for those records is now stale. Kept small: disk
+            // records are multi-key subtrees, and at this test's size a
+            // large racing batch would rewrite nearly every record (live
+            // blocks touch ~1% of records; this ~races a similar fraction).
+            let batch_keys: Vec<(Key, Vec<u8>)> = (0..40u64)
+                .map(|j| {
+                    let i = j * 3_701 + round;
+                    raced.insert(i, 100 + round as u8);
+                    (hashed_key(i.to_le_bytes()), vec![100 + round as u8; 32])
+                })
+                .collect();
+            db.insert_batch(batch_keys).unwrap();
+            let (installed, discarded) = db.gc_install(batch).unwrap();
+            total_installed += installed;
+            total_discarded += discarded;
+        }
+        assert!(total_installed > 0, "collect/install cycles installed nothing");
+        assert!(total_discarded > 0, "race window produced no stale relocations — test lost its teeth");
+        assert!(
+            total_installed > total_discarded,
+            "discards dominate ({total_discarded} vs {total_installed}) — stale-window too hot"
+        );
+        // Drain the rest with no interleaved writes.
+        loop {
+            let batch = db.snapshot().gc_collect(4096).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            db.gc_install(batch).unwrap();
+        }
+
+        // Every key reads back its latest value.
+        for i in (0..n).step_by(997).chain(raced.keys().copied()) {
+            let k = hashed_key(i.to_le_bytes());
+            let expect = if let Some(&v) = raced.get(&i) {
+                vec![v; 32]
+            } else if i % 5 != 0 {
+                vec![2u8; 32]
+            } else {
+                vec![1u8; 32]
+            };
+            assert_eq!(db.get_value(&k).unwrap().unwrap(), expect, "key {i}");
+        }
+        // Reclaim happened: reusable free-region bytes grew materially (file
+        // length and absolute utilization are poor oracles at this size —
+        // truncation timing and unit/alignment padding dominate ~100 B
+        // records).
+        let freed = db.free_regions().saturating_sub(free_before);
+        assert!(
+            freed > 8,
+            "no reclaim: freed {freed} regions, util={:.3}",
+            db.utilization()
+        );
         let _ = db.root();
     }
 
