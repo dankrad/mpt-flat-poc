@@ -6487,7 +6487,9 @@ impl<'a> CompactReader<'a> {
 
     fn read_nibble_path(&mut self) -> Result<Vec<u8>> {
         let len = self.read_u8()? as usize;
-        if len > 64 {
+        // Composite prefixes (promoted-contract storage records) run to
+        // 64 account + 64 storage nibbles.
+        if len > 128 {
             bail!("compact subtree nibble path too long");
         }
         let mut path = Vec::with_capacity(len);
@@ -6505,7 +6507,8 @@ impl<'a> CompactReader<'a> {
     /// (e.g. [`extract_hash`]) that only need the trailing hash, not the path.
     fn skip_nibble_path(&mut self) -> Result<()> {
         let len = self.read_u8()? as usize;
-        if len > 64 {
+        // See read_nibble_path: composite prefixes run to 128 nibbles.
+        if len > 128 {
             bail!("compact subtree nibble path too long");
         }
         self.read_bytes(len.div_ceil(2))?;
@@ -10232,6 +10235,93 @@ mod tests {
             "no reclaim: freed {freed} regions, util={:.3}",
             db.utilization()
         );
+        let _ = db.root();
+    }
+
+    /// The 1B workload's records are almost entirely promoted-contract
+    /// storage. Background GC must be able to relocate those records — the
+    /// r152 leg pinned 1.48M victim regions while relocating 15 records
+    /// total, because the collect walk could not resolve their prefixes.
+    #[test]
+    fn bg_gc_relocates_promoted_storage_records() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let cfg = Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut db = FlatMpt::create(&path, cfg).unwrap();
+
+        // One big contract: storage promotes into the frontier.
+        let acct_key = hashed_key(1u64.to_le_bytes());
+        let n: u64 = 60_000;
+        // Filler EOAs so the trie has more than one account at the root.
+        let mut ops: Vec<(Key, StateOp)> = (0..200u64)
+            .map(|i| {
+                (
+                    hashed_key((1000 + i).to_le_bytes()),
+                    StateOp::SetAccount {
+                        nonce: i,
+                        balance: U256::from(i),
+                        code_hash: [7u8; 32],
+                    },
+                )
+            })
+            .collect();
+        ops.push((
+            acct_key,
+            StateOp::SetAccount { nonce: 1, balance: U256::from(1u64), code_hash: [7u8; 32] },
+        ));
+        for i in 0..n {
+            ops.push((
+                acct_key,
+                StateOp::SetStorage { slot: hashed_key((i + 10).to_le_bytes()), value: vec![1u8; 32] },
+            ));
+        }
+        db.apply_block(ops).unwrap();
+
+        // Churn: rewrite all slots repeatedly so earlier regions decay under
+        // the victim threshold.
+        for round in 0..5u8 {
+            let ops: Vec<(Key, StateOp)> = (0..n)
+                .map(|i| {
+                    (
+                        acct_key,
+                        StateOp::SetStorage {
+                            slot: hashed_key((i + 10).to_le_bytes()),
+                            value: vec![2 + round; 32],
+                        },
+                    )
+                })
+                .collect();
+            db.apply_block(ops).unwrap();
+        }
+        assert!(db.flat_file_len() > GC_MIN_PAGES * PAGE, "below GC floor — raise n");
+
+        let free_before = db.free_regions();
+        let mut total_installed = 0usize;
+        loop {
+            let batch = db.snapshot().gc_collect(4096).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            let (installed, _) = db.gc_install(batch).unwrap();
+            total_installed += installed;
+        }
+        assert!(
+            total_installed > 1_000,
+            "promoted-storage records not relocatable: installed {total_installed}"
+        );
+        let freed = db.free_regions().saturating_sub(free_before);
+        assert!(freed > 8, "no reclaim on promoted-storage churn: freed {freed} regions");
+        // Reads survive relocation.
+        for i in (0..n).step_by(631) {
+            let v = db
+                .get_storage(&acct_key, &hashed_key((i + 10).to_le_bytes()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(v, vec![6u8; 32], "slot {i}");
+        }
         let _ = db.root();
     }
 
