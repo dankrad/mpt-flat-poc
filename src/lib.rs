@@ -575,6 +575,14 @@ struct RegionAlloc {
     /// live pin is newer than G — long-lived pins of the newest state (the
     /// published read snapshot) no longer freeze reclamation.
     live_pins: std::collections::BTreeMap<u64, u32>,
+    /// Fully-dead regions awaiting the next read-ahead boundary. A region
+    /// must NOT re-enter `free_regions` while any read-ahead entry could
+    /// still alias its units: prefetch fills the cache between applies, and
+    /// a region freed and REUSED within the next apply would serve the old
+    /// record's bytes to the new pointer's read (the r142/r147/r153 live
+    /// flat divergences). Drained by `read_ahead_clear` (apply boundary) or
+    /// whenever the cache is provably empty.
+    staged_free: Vec<u64>,
     /// Regions that went fully dead while pins were live, tagged with the
     /// pin generation current at death. Routed to `free_regions`/`quarantine`
     /// (by fresh status — the same rules `free` applies) once the oldest live
@@ -662,8 +670,8 @@ impl RegionAlloc {
                 self.snap_hold.push((r as u64, self.pin_gen));
             } else if self.fresh.get(r).copied().unwrap_or(false) {
                 // Born after the last persist: the durable manifest cannot
-                // reference it — recycle immediately.
-                self.free_regions.push(r as u64);
+                // reference it — recyclable at the next read-ahead boundary.
+                self.staged_free.push(r as u64);
             } else {
                 // Referenced by the last checkpoint: quarantine until the next
                 // persist so a crash always reopens a fully intact checkpoint.
@@ -684,7 +692,7 @@ impl RegionAlloc {
             let tag = self.pin_gen;
             self.snap_hold.extend(std::mem::take(&mut self.quarantine).into_iter().map(|r| (r, tag)));
         } else {
-            self.free_regions.append(&mut self.quarantine);
+            self.staged_free.append(&mut self.quarantine);
         }
         self.fresh.fill(false);
     }
@@ -702,7 +710,7 @@ impl RegionAlloc {
             if oldest.is_some_and(|o| o <= tag) {
                 kept.push((r, tag));
             } else if self.fresh.get(r as usize).copied().unwrap_or(false) {
-                self.free_regions.push(r);
+                self.staged_free.push(r);
             } else {
                 self.quarantine.push(r);
             }
@@ -733,6 +741,12 @@ impl RegionAlloc {
             }
         }
         self.release_snap_hold();
+    }
+
+    /// Move staged dead regions into circulation. Callers guarantee no
+    /// read-ahead entry can alias them (cache just cleared, or empty).
+    fn drain_staged(&mut self) {
+        self.free_regions.append(&mut self.staged_free);
     }
 
     fn live_units(&self) -> u64 {
@@ -991,6 +1005,18 @@ impl FlatFile {
         let mut g = self.read_ahead.lock().unwrap();
         g.clear();
         self.read_ahead_len.store(0, std::sync::atomic::Ordering::Release);
+        // Read-ahead boundary: staged dead regions can no longer alias any
+        // cached entry — release them for reuse.
+        self.seg.lock().unwrap().drain_staged();
+    }
+
+    /// Release staged dead regions iff the read-ahead cache is empty (then
+    /// nothing can alias a reused unit). Called before allocation passes so
+    /// non-prefetching embedders still recycle.
+    fn drain_staged_if_unaliased(&self) {
+        if self.read_ahead_len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            self.seg.lock().unwrap().drain_staged();
+        }
     }
 
     fn read_payload(&self, off: u64, len: usize) -> Result<Vec<u8>> {
@@ -1048,6 +1074,7 @@ impl FlatFile {
     /// placed densely right after the previous allocation (4 KiB-rounded under
     /// direct I/O). Returns a `DiskPtr` per payload.
     fn write_batch(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        self.drain_staged_if_unaliased();
         if let Some(p) = payloads.iter().find(|p| p.len() > MAX_RECORD_BYTES) {
             bail!("record payload {} B exceeds the region capacity", p.len());
         }
@@ -1106,6 +1133,7 @@ impl FlatFile {
     /// offsets hit the device's multi-thread write rate (~6-10 GB/s) instead of the
     /// single-stream ~3.5. No tail contention since every run is a different region.
     fn write_batch_parallel(&self, payloads: &[&[u8]]) -> Result<Vec<DiskPtr>> {
+        self.drain_staged_if_unaliased();
         if let Some(p) = payloads.iter().find(|p| p.len() > MAX_RECORD_BYTES) {
             bail!("record payload {} B exceeds the region capacity", p.len());
         }
@@ -2735,6 +2763,11 @@ impl FlatMpt {
             }
         });
         Ok(())
+    }
+
+    /// Read-ahead entry count (diagnostics/tests).
+    pub fn prefetch_entries(&self) -> usize {
+        self.store.read_ahead_len.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Drop any unconsumed read-ahead entries (stale after an apply).
@@ -10198,6 +10231,7 @@ mod tests {
             total_installed += installed;
             total_discarded += discarded;
         }
+        db.prefetch_clear(); // release staged regions before measuring reclaim
         assert!(total_installed > 0, "collect/install cycles installed nothing");
         assert!(total_discarded > 0, "race window produced no stale relocations — test lost its teeth");
         assert!(
@@ -10312,6 +10346,7 @@ mod tests {
             total_installed > 1_000,
             "promoted-storage records not relocatable: installed {total_installed}"
         );
+        db.prefetch_clear(); // release staged regions before measuring reclaim
         let freed = db.free_regions().saturating_sub(free_before);
         assert!(freed > 8, "no reclaim on promoted-storage churn: freed {freed} regions");
         // Reads survive relocation.
@@ -10322,6 +10357,68 @@ mod tests {
                 .unwrap();
             assert_eq!(v, vec![6u8; 32], "slot {i}");
         }
+        let _ = db.root();
+    }
+
+    /// Freed regions must not be reusable while read-ahead entries could
+    /// alias their units: prefetch caches record bytes BY UNIT between
+    /// applies, and a region freed then reused within the next apply would
+    /// serve the old record's bytes to the new pointer's read (the
+    /// r142/r147/r153 live flat divergences — offline replays, with no
+    /// prefetcher, never reproduced them).
+    #[test]
+    fn freed_regions_stage_until_read_ahead_clears() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let mut db = FlatMpt::create(&path, Config::default()).unwrap();
+
+        let n: u64 = 40_000;
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![1u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+
+        // Cache live: prefetch a block touching every key.
+        let ops: Vec<(Key, StateOp)> = (0..n)
+            .map(|i| {
+                (
+                    hashed_key(i.to_le_bytes()),
+                    StateOp::SetAccount { nonce: 2, balance: U256::from(2u64), code_hash: [7u8; 32] },
+                )
+            })
+            .collect();
+        db.prefetch_block(&ops).unwrap();
+        assert!(db.prefetch_entries() > 0, "prefetch cached nothing — test lost its teeth");
+
+
+        // Rewrite everything: old (fresh) regions go fully dead. With the
+        // cache live they must stage, not free.
+        let free_before = db.free_regions();
+        for chunk in (0..n).step_by(10_000) {
+            let batch: Vec<(Key, Vec<u8>)> = (chunk..(chunk + 10_000).min(n))
+                .map(|i| (hashed_key(i.to_le_bytes()), vec![2u8; 32]))
+                .collect();
+            db.insert_batch(batch).unwrap();
+        }
+        // The pool may only shrink (reuse of pre-staged regions) — nothing
+        // freed under the live cache may re-enter it.
+        assert!(
+            db.free_regions() <= free_before,
+            "dead regions re-entered circulation under a live read-ahead cache"
+        );
+        let free_mid = db.free_regions();
+
+        // Boundary: clearing the cache releases the staged regions.
+        db.prefetch_clear();
+        assert!(
+            db.free_regions() > free_mid,
+            "staged regions were not released at the read-ahead boundary"
+        );
         let _ = db.root();
     }
 
@@ -10387,7 +10484,7 @@ mod tests {
         // older pin drops (generation-aware release).
         let g2 = ra.pin();
         ra.unpin(g1);
-        assert_eq!(ra.free_regions, vec![region_a], "newer pin must not hold older frees");
+        assert_eq!(ra.staged_free, vec![region_a], "newer pin must not hold older frees");
         assert!(ra.snap_hold.is_empty());
         ra.unpin(g2);
 
@@ -10409,6 +10506,9 @@ mod tests {
         ra.unpin(g4);
         assert_eq!(ra.quarantine, vec![region_b]);
         ra.on_persisted();
+        assert!(ra.staged_free.contains(&region_b));
+        // The read-ahead boundary is what returns staged regions to service.
+        ra.drain_staged();
         assert!(ra.free_regions.contains(&region_b));
     }
 }
