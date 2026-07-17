@@ -2713,13 +2713,21 @@ impl FlatMpt {
                 discarded += 1;
             }
         }
-        // Victims still live after the install hold unrelocatable or
-        // just-rewritten records: pin them out of selection (same progress
-        // rule as gc_step).
+        // Victims still live after the install hold records the collect walk
+        // could not see — on a properly-built tree that must not happen
+        // (every live record's stored prefix is a full frontier path), so
+        // MPT_GC_ASSERT_PATHS=1 turns it into a loud failure. Otherwise pin
+        // them out of selection (same progress rule as gc_step).
         {
             let mut seg = self.store.seg.lock().unwrap();
             for &r in &victims {
                 if seg.live.get(r as usize).copied().unwrap_or(0) > 0 {
+                    if std::env::var("MPT_GC_ASSERT_PATHS").is_ok() {
+                        panic!(
+                            "GC: victim region {r} holds {} live units invisible to the collect walk (wrong stored paths)",
+                            seg.live[r as usize]
+                        );
+                    }
                     seg.ensure_region(r);
                     seg.evac_pinned[r as usize] = true;
                 }
@@ -2763,6 +2771,82 @@ impl FlatMpt {
             }
         });
         Ok(())
+    }
+
+    /// Read-only GC diagnostic: classify every record in up to `n` victim
+    /// regions — parse failure / resolvable-live / resolvable-dead (frontier
+    /// holds a different ptr) / unresolvable (find fails) — with a prefix
+    /// length histogram. No writes, no frees.
+    pub fn gc_probe(&self, n: usize) -> Result<String> {
+        let victims = self.store.seg.lock().unwrap().select_victims(n, BG_EVAC_MAX_UTIL);
+        let (mut parse_fail, mut live, mut dead, mut unresolvable, mut total) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut mismatched_regions = 0u64;
+        let mut invisible_units = 0u64;
+        let mut plen: std::collections::BTreeMap<usize, u64> = Default::default();
+        let mut sample_unres: Vec<String> = Vec::new();
+        for &region in &victims {
+            let buf = self.store.read_region(region)?;
+            let base_unit = region * REGION_UNITS;
+            let mut walk_live_units = 0u64;
+            let mut p = 0usize;
+            while p + 4 <= buf.len() {
+                let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+                if len == 0 {
+                    let next = (p / ADDR_UNIT as usize + 1) * ADDR_UNIT as usize;
+                    if next <= p { break; }
+                    p = next;
+                    continue;
+                }
+                let rec_units = units_for(RECORD_HDR + len) as usize;
+                let end = p + 4 + len as usize;
+                if end > buf.len() { break; }
+                let unit = (base_unit + (p / ADDR_UNIT as usize) as u64) as u32;
+                total += 1;
+                match parse_prefix(&buf[p + 4..end]) {
+                    Err(_) => parse_fail += 1,
+                    Ok(prefix) => {
+                        *plen.entry(prefix.len()).or_default() += 1;
+                        match find_disk_ptr(&self.upper, &prefix, 0) {
+                            Some(cur) if cur == (DiskPtr { unit, len }) => {
+                                live += 1;
+                                walk_live_units += units_for(RECORD_HDR + len) as u64;
+                            }
+                            Some(_) => dead += 1,
+                            None => {
+                                unresolvable += 1;
+                                if sample_unres.len() < 3 {
+                                    sample_unres.push(format!(
+                                        "len={} nibbles={}",
+                                        prefix.len(),
+                                        prefix.iter().map(|n| format!("{n:x}")).collect::<String>()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                p += rec_units * ADDR_UNIT as usize;
+            }
+            let counted = self
+                .store
+                .seg
+                .lock()
+                .unwrap()
+                .live
+                .get(region as usize)
+                .copied()
+                .unwrap_or(0) as u64;
+            if counted > walk_live_units {
+                mismatched_regions += 1;
+                invisible_units += counted - walk_live_units;
+            }
+        }
+        Ok(format!(
+            "victims={} records={total} parse_fail={parse_fail} live={live} dead={dead} unresolvable={unresolvable} mismatched_regions={mismatched_regions} invisible_units={invisible_units}
+prefix_lens={plen:?}
+sample_unresolvable={sample_unres:?}",
+            victims.len()
+        ))
     }
 
     /// Read-ahead entry count (diagnostics/tests).
@@ -10420,6 +10504,57 @@ mod tests {
             "staged regions were not released at the read-ahead boundary"
         );
         let _ = db.root();
+    }
+
+    /// Range-seeded builds (the golden path: insert_batch_accounts with
+    /// nested storage, spill, promotion) must store full frontier paths in
+    /// every record — otherwise a rebuilt golden is as GC-blind as the old
+    /// one. Probes victims and asserts zero unresolvable prefixes.
+    #[test]
+    fn seeded_build_records_resolve_by_stored_path() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let cfg = Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut db = FlatMpt::create(&path, cfg).unwrap();
+
+        // 300 EOAs + one large contract (promoted storage), seeded like the
+        // golden builder does.
+        let mut entries: Vec<(Key, AccountSeed)> = (0..300u64)
+            .map(|i| {
+                (
+                    hashed_key((500 + i).to_le_bytes()),
+                    AccountSeed { nonce: i, balance: U256::from(i), code_hash: [7u8; 32], slots: Vec::new() },
+                )
+            })
+            .collect();
+        let slots: Vec<(Key, Vec<u8>)> =
+            (0..30_000u64).map(|i| (hashed_key((i + 10).to_le_bytes()), vec![1u8; 32])).collect();
+        entries.push((
+            hashed_key(1u64.to_le_bytes()),
+            AccountSeed { nonce: 1, balance: U256::from(1u64), code_hash: [7u8; 32], slots },
+        ));
+        db.insert_batch_accounts(entries).unwrap();
+        // Churn so regions decay under the victim cap, then probe.
+        for round in 0..3u8 {
+            let ops: Vec<(Key, StateOp)> = (0..30_000u64)
+                .map(|i| {
+                    (
+                        hashed_key(1u64.to_le_bytes()),
+                        StateOp::SetStorage { slot: hashed_key((i + 10).to_le_bytes()), value: vec![2 + round; 32] },
+                    )
+                })
+                .collect();
+            db.apply_block(ops).unwrap();
+        }
+        let report = db.gc_probe(4096).unwrap();
+        assert!(
+            report.contains("mismatched_regions=0"),
+            "seeded build has live records invisible to the collect walk:\n{report}"
+        );
+        assert!(!report.contains("records=0"), "probe found nothing — no victims decayed");
     }
 
     /// The live node keeps one published read snapshot pinned at ALL times
