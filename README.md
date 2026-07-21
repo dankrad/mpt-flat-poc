@@ -195,6 +195,52 @@ I/O and the device's random-read bandwidth (~5 GB/s at these block sizes) is the
 ceiling. The knobs below target that — a deep read queue, tight reads, and moving
 the value write and append contention off the read path.
 
+### End-to-end results — tempo node, 1B-account random workload (July 2026)
+
+Full-node comparison on the truly-random workload: 1B keccak-signable
+accounts, sender AND recipient uniformly random, single token, 30k offered
+TPS, identical clean-golden datadir and node args. "Flat" = this engine as
+the node's single state store (`TEMPO_NO_STATE_KV=1`, EVM reads + sparse
+commitment + persistence all through the flat MPT); "stock" = unmodified
+MDBX path. Worst persist = longest Saving->Saved engine-persistence span.
+
+20-minute legs (r150/r151):
+
+| | avg tps | p50 / p99 block | worst persist | write IOPS |
+|---|---|---|---|---|
+| flat (gc off) | **12,852** | 2.2 s / 9.0 s | 17.6 s | ~2.5k |
+| stock         | 8,879      | 1.9 s / 5.7 s | **229 s** | ~14k |
+
+30-minute writer-stress legs (r157/r158/r159):
+
+| | avg tps | worst persist | notes |
+|---|---|---|---|
+| flat + gc  | **10,729** | **13.4 s** | 4,473 gc cycles, 12.6M relocations, 0.08% discards |
+| flat, no gc | 11,583    | 11.2 s     | file balloons (~90G -> ~400G+); tps decays on long runs |
+| stock       | 4,374     | **947 s**  | collapses to half its 20-min tps; 20k write IOPS |
+
+Flat is 1.45x stock at 20 minutes and 2.5-2.6x on the long run, with 13-70x
+lower worst-case persist stalls. Every flat leg ran with the flat/sparse
+root cross-check enabled and zero mismatches; the ops dumps replay-verify
+offline (`replay_ops`).
+
+Correctness batting order behind these numbers (all root-caused, fixed, and
+regression-tested): a sparse-side stale-reveal on a freshly recreated pooled
+trie under follower lag; a flat-side read-ahead unit-alias on region reuse
+(freed regions now stage until the read-ahead boundary); GC blindness to
+composite-prefix records; and storage-frontier writers baking storage-local
+(GC-invisible) record paths — all storage records now store their full
+frontier path, asserted by `MPT_GC_ASSERT_PATHS=1` and `gc_probe`.
+
+GC is a split design: lock-free background collect (snapshot-pinned,
+parallel victim reads, liveness-filtered) + brief re-verified installs
+under the writer; scheduled into follower idle windows, with an emergency
+mode below `TEMPO_FLATMPT_GC_FORCE_UTIL` (default 0.45). Known limit: at
+sustained flood saturation on a single NVMe, gc reclaim (~75 MB/s) trails
+garbage production (~100-125 MB/s) while costing ~7% tps — the follower
+apply cost is the structural bottleneck (see the hash-transplant note in
+the plan doc).
+
 ### Tuning knobs (environment variables)
 
 | Var | Default | Effect |
