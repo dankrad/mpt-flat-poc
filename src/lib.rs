@@ -3596,7 +3596,7 @@ fn insert_into_child(
             let nibbles = key_nibbles(&key);
             let (common, path_len) = match slot.as_ref() {
                 Some(RamChild::Account(a)) => {
-                    (common_prefix(&a.path, &nibbles[child_prefix.len()..]), a.path.len())
+                    (common_prefix(&a.path, &nibbles[walk_depth(&child_prefix)..]), a.path.len())
                 }
                 _ => unreachable!(),
             };
@@ -3606,9 +3606,13 @@ fn insert_into_child(
                 let a = Arc::make_mut(a);
                 match op {
                     LeafOp::Storage { slot: skey, value } => {
-                        // Descend the account's RAM storage frontier with the slot key
-                        // (storage records are Disk, so ram=false).
-                        insert_ram(store, cfg, Arc::make_mut(&mut a.storage), Vec::new(), skey, LeafOp::Value(value), false)?;
+                        // Descend the account's RAM storage frontier with the slot
+                        // key (storage records are Disk, so ram=false). The walk
+                        // prefix seeds with the account's FULL 64 key nibbles so
+                        // every record written below bakes a composite path —
+                        // storage-local prefixes are invisible to GC relocation
+                        // (walk_depth maps the 64-nibble base to storage depth 0).
+                        insert_ram(store, cfg, Arc::make_mut(&mut a.storage), nibbles.clone(), skey, LeafOp::Value(value), false)?;
                     }
                     LeafOp::Account { nonce: n, balance: b, code_hash: ch } => {
                         a.nonce = n;
@@ -3629,11 +3633,11 @@ fn insert_into_child(
                 let split_path = a.path[..common].to_vec();
                 Arc::make_mut(&mut a).path = rehomed_path;
                 children[old_idx] = Some(RamChild::Account(a));
-                let new_idx = nibbles[child_prefix.len() + common] as usize;
+                let new_idx = nibbles[walk_depth(&child_prefix) + common] as usize;
                 let mut new_prefix = child_prefix.clone();
                 new_prefix
-                    .extend_from_slice(&nibbles[child_prefix.len()..child_prefix.len() + common + 1]);
-                let node = place_new(store, cfg, key, op, new_prefix.len())?;
+                    .extend_from_slice(&nibbles[walk_depth(&child_prefix)..walk_depth(&child_prefix) + common + 1]);
+                let node = place_new(store, cfg, key, op, walk_depth(&new_prefix))?;
                 children[new_idx] =
                     Some(make_leaf_child(store, ram, DiskSubtree { prefix: new_prefix, node })?);
                 let branch = RamNode::Branch { children, hash: HashCell::new(None) };
@@ -3650,7 +3654,7 @@ fn insert_into_child(
             }
         }
         None => {
-            let node = place_new(store, cfg, key, op, child_prefix.len())?;
+            let node = place_new(store, cfg, key, op, walk_depth(&child_prefix))?;
             let subtree = DiskSubtree { prefix: child_prefix, node };
             *slot = Some(make_leaf_child(store, ram, subtree)?);
             Ok(())
@@ -3672,13 +3676,13 @@ fn insert_ram(
     invalidate_ram(node);
     match node {
         RamNode::Empty => {
-            let idx = nibbles[prefix.len()] as usize;
+            let idx = nibbles[walk_depth(&prefix)] as usize;
             // Build the leaf at the branch-slot depth (prefix + slot nibble), the
             // same depth every other code path uses, so the representation — and
             // therefore the hash — is independent of how the leaf was created.
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
-            let node_new = place_new(store, cfg, key, op, child_prefix.len())?;
+            let node_new = place_new(store, cfg, key, op, walk_depth(&child_prefix))?;
             let subtree = DiskSubtree { prefix: child_prefix, node: node_new };
             let mut children = empty_children();
             children[idx] = Some(make_leaf_child(store, ram, subtree)?);
@@ -3689,7 +3693,7 @@ fn insert_ram(
             Ok(())
         }
         RamNode::Extension { path, child, .. } => {
-            let common = common_prefix(path, &nibbles[prefix.len()..]);
+            let common = common_prefix(path, &nibbles[walk_depth(&prefix)..]);
             if common < path.len() {
                 let old = std::mem::replace(node, RamNode::Empty);
                 let RamNode::Extension {
@@ -3713,11 +3717,11 @@ fn insert_ram(
                     })
                 }));
 
-                let new_idx = nibbles[prefix.len() + common] as usize;
+                let new_idx = nibbles[walk_depth(&prefix) + common] as usize;
                 let mut new_prefix = prefix.clone();
                 new_prefix.extend_from_slice(&old_path[..common]);
                 new_prefix.push(new_idx as u8);
-                let node_new = place_new(store, cfg, key, op, new_prefix.len())?;
+                let node_new = place_new(store, cfg, key, op, walk_depth(&new_prefix))?;
                 let subtree = DiskSubtree { prefix: new_prefix, node: node_new };
                 children[new_idx] = Some(make_leaf_child(store, ram, subtree)?);
 
@@ -3742,10 +3746,10 @@ fn insert_ram(
             }
         }
         RamNode::Branch { children, .. } => {
-            if prefix.len() == nibbles.len() {
+            if walk_depth(&prefix) == nibbles.len() {
                 bail!("key terminates at a frontier branch; keys must be distinct and fixed-length");
             }
-            let idx = nibbles[prefix.len()] as usize;
+            let idx = nibbles[walk_depth(&prefix)] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
             insert_into_child(store, cfg, &mut children[idx], child_prefix, key, op, ram)
@@ -3788,7 +3792,7 @@ fn delete_ram(
     match std::mem::replace(node, RamNode::Empty) {
         RamNode::Empty => Ok(RamDelete::Absent),
         RamNode::Extension { path, mut child, hash } => {
-            if !nibbles[prefix.len()..].starts_with(&path) {
+            if !nibbles[walk_depth(&prefix)..].starts_with(&path) {
                 *node = RamNode::Extension { path, child, hash };
                 return Ok(RamDelete::Absent);
             }
@@ -3826,7 +3830,7 @@ fn delete_ram(
             }
         }
         RamNode::Branch { mut children, mut hash } => {
-            let idx = nibbles[prefix.len()] as usize;
+            let idx = nibbles[walk_depth(&prefix)] as usize;
             let mut child_prefix = prefix;
             child_prefix.push(idx as u8);
             let out = delete_in_child(store, cfg, &mut children[idx], child_prefix, key, op, ram)?;
@@ -3967,7 +3971,7 @@ fn delete_in_child(
             let nibbles = key_nibbles(key);
             {
                 let Some(RamChild::Account(a)) = slot.as_ref() else { unreachable!() };
-                if nibbles[child_prefix.len()..] != a.path[..] {
+                if nibbles[walk_depth(&child_prefix)..] != a.path[..] {
                     return Ok(RamDelete::Absent);
                 }
             }
@@ -3998,7 +4002,8 @@ fn delete_in_child(
                     let storage_out = {
                         let Some(RamChild::Account(a)) = slot.as_mut() else { unreachable!() };
                         let a = Arc::make_mut(a);
-                        delete_ram(store, cfg, Arc::make_mut(&mut a.storage), Vec::new(), &skey, DeleteOp::Value, false)?
+                        // Composite walk base — see the insert-side Storage arm.
+                        delete_ram(store, cfg, Arc::make_mut(&mut a.storage), nibbles.clone(), &skey, DeleteOp::Value, false)?
                     };
                     match storage_out {
                         RamDelete::Absent => Ok(RamDelete::Absent),
@@ -5098,11 +5103,13 @@ fn apply_group_child(
                 }
                 match val {
                     Some(v) => {
+                        // Composite walk base (account's 64 key nibbles): every
+                        // record written below bakes a GC-resolvable full path.
                         insert_ram(
                             store,
                             cfg,
                             Arc::make_mut(&mut Arc::make_mut(a).storage),
-                            Vec::new(),
+                            key_nibbles(key),
                             *skey,
                             LeafOp::Value(v.clone()),
                             false,
@@ -5114,7 +5121,7 @@ fn apply_group_child(
                             store,
                             cfg,
                             Arc::make_mut(&mut Arc::make_mut(a).storage),
-                            Vec::new(),
+                            key_nibbles(key),
                             skey,
                             DeleteOp::Value,
                             false,
@@ -7486,6 +7493,16 @@ fn process_fold_gc(
 /// and composite prefixes are always >= 65 (the 64-nibble account seed is
 /// never serialized itself — promotion writes its children, each adding at
 /// least one storage nibble) — so length disambiguates.
+/// Key-depth of an in-walk prefix. Walk prefixes enter storage space by
+/// extending the account's full 64 key nibbles, so exactly-64 means the
+/// storage ROOT (depth 0) — unlike serialized prefixes (`local_depth`),
+/// where 64 is still account space (serialized composites are >= 65).
+/// Account walks never reach depth 64 in practice (frontier depth is a
+/// few nibbles at 1B keys).
+fn walk_depth(prefix: &[u8]) -> usize {
+    if prefix.len() >= 64 { prefix.len() - 64 } else { prefix.len() }
+}
+
 fn local_depth(prefix: &[u8]) -> usize {
     if prefix.len() > 64 { prefix.len() - 64 } else { prefix.len() }
 }
@@ -10553,6 +10570,67 @@ mod tests {
         assert!(
             report.contains("mismatched_regions=0"),
             "seeded build has live records invisible to the collect walk:\n{report}"
+        );
+        assert!(!report.contains("records=0"), "probe found nothing — no victims decayed");
+    }
+
+    /// Same oracle as seeded_build_records_resolve_by_stored_path but through
+    /// the RAM build + spill path (the golden builder's actual route at 1B):
+    /// records created as Mem leaves and spilled must ALSO bake the full
+    /// frontier path. The 87G golden-rand2 rebuild failed exactly here —
+    /// storage-relative prefixes were baked at Mem-leaf creation.
+    #[test]
+    fn ram_seeded_build_records_resolve_by_stored_path() {
+        let _mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap_serial = SNAP.lock().unwrap_or_else(|e| e.into_inner());
+        set_hot_records(false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.flat");
+        let cfg = Config { target_leaf_bytes: 512, max_leaf_bytes: 1024, min_promote_bytes: 256 };
+        let mut db = FlatMpt::create(&path, cfg).unwrap();
+        db.ram_mode = true;
+
+        let mut entries: Vec<(Key, AccountSeed)> = (0..300u64)
+            .map(|i| {
+                (
+                    hashed_key((500 + i).to_le_bytes()),
+                    AccountSeed { nonce: i, balance: U256::from(i), code_hash: [7u8; 32], slots: Vec::new() },
+                )
+            })
+            .collect();
+        db.insert_batch_accounts(entries).unwrap();
+        // The golden builder seeds ONE account across many calls (sorted
+        // disjoint slot ranges), spilling between them — the revisit/merge
+        // path extends an already-spilled storage subtree.
+        let mut range_slots = |lo: u64, hi: u64| -> Vec<(Key, AccountSeed)> {
+            let mut sl: Vec<(Key, Vec<u8>)> =
+                (lo..hi).map(|i| (hashed_key((i + 10).to_le_bytes()), vec![1u8; 32])).collect();
+            sl.sort_by(|a, b| a.0.cmp(&b.0));
+            vec![(
+                hashed_key(1u64.to_le_bytes()),
+                AccountSeed { nonce: 1, balance: U256::from(1u64), code_hash: [7u8; 32], slots: sl },
+            )]
+        };
+        for r in 0..3u64 {
+            db.insert_batch_accounts(range_slots(r * 10_000, (r + 1) * 10_000)).unwrap();
+            db.spill_mem().unwrap();
+        }
+
+        for round in 0..3u8 {
+            let ops: Vec<(Key, StateOp)> = (0..30_000u64)
+                .map(|i| {
+                    (
+                        hashed_key(1u64.to_le_bytes()),
+                        StateOp::SetStorage { slot: hashed_key((i + 10).to_le_bytes()), value: vec![2 + round; 32] },
+                    )
+                })
+                .collect();
+            db.apply_block(ops).unwrap();
+        }
+        let report = db.gc_probe(4096).unwrap();
+        assert!(
+            report.contains("mismatched_regions=0"),
+            "RAM-seeded build has live records invisible to the collect walk:\n{report}"
         );
         assert!(!report.contains("records=0"), "probe found nothing — no victims decayed");
     }
