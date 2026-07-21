@@ -14,25 +14,30 @@ OUT="${2:?usage: reth-export.sh <reth-datadir> <out-dir>}"
 RD=(reth db --datadir "$DD" --log.stdout.filter error list)
 CHUNK=20000000
 
-dump() { # <table> <total> <jq-filter> <outfile>
-  local table=$1 total=$2 filter=$3 out=$4
+dump() { # <table> <jq-filter> <outfile>
+  local table=$1 filter=$2 out=$3
   : > "$out"
-  local skip=0
-  while [ "$skip" -lt "$total" ]; do
+  local skip=0 before after added
+  while :; do
+    before=$(wc -l < "$out")
     echo "  $table skip=$skip len=$CHUNK -> $out" >&2
     "${RD[@]}" "$table" --json --skip "$skip" --len "$CHUNK" 2>/dev/null \
       | jq -rc "$filter" >> "$out"
+    after=$(wc -l < "$out")
+    added=$((after - before))
+    # A short (or empty) chunk means we hit the end of the table.
+    [ "$added" -lt "$CHUNK" ] && break
     skip=$((skip + CHUNK))
   done
 }
 
 echo "exporting accounts..." >&2
-dump HashedAccounts 46000000 \
+dump HashedAccounts \
   '.[] | [.[0], (.[1].nonce|tostring), .[1].balance, (.[1].bytecode_hash // "null")] | @tsv' \
   "$OUT/accounts.tsv"
 
 echo "exporting storages..." >&2
-dump HashedStorages 134000000 \
+dump HashedStorages \
   '.[] | [.[0], .[1].key, .[1].value] | @tsv' \
   "$OUT/storages.tsv"
 

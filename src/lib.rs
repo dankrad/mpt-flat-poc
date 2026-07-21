@@ -1881,8 +1881,8 @@ impl FlatMpt {
         let (live_units, free_units) = self.store.live_and_free_units();
         let active = (end * UNITS_PER_PAGE).saturating_sub(free_units).max(1);
         let u = live_units as f64 / active as f64;
-        let adj = ((TARGET_UTIL - u) * GC_GAIN).round() as i64;
-        let r = (self.gc_regions as i64 + adj).clamp(0, GC_R_MAX as i64) as usize;
+        let adj = ((TARGET_UTIL - u) * gc_gain()).round() as i64;
+        let r = (self.gc_regions as i64 + adj).clamp(0, gc_r_max() as i64) as usize;
         self.gc_regions = r;
         r
     }
@@ -3019,6 +3019,34 @@ fn gc_opp_util() -> f64 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.30)
+    })
+}
+
+/// Per-batch cap on regions the global reclaim controller may evacuate. Defaults
+/// to `GC_R_MAX`; raise via `MPT_GC_R_MAX` for high-write-amp bulk loads (e.g. a
+/// sorted mainnet reconstruction) where a batch creates more garbage than the
+/// default 1 GiB/batch cap can reclaim, so the file would otherwise grow unbounded.
+fn gc_r_max() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPT_GC_R_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GC_R_MAX)
+    })
+}
+
+/// Proportional gain for the GC rate controller. Defaults to `GC_GAIN`; raise via
+/// `MPT_GC_GAIN` to ramp the cleaning rate to its cap in fewer batches.
+fn gc_gain() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MPT_GC_GAIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GC_GAIN)
     })
 }
 
