@@ -241,6 +241,58 @@ garbage production (~100-125 MB/s) while costing ~7% tps — the follower
 apply cost is the structural bottleneck (see the hash-transplant note in
 the plan doc).
 
+### End-to-end results — Ethereum mainnet, stock vs flat commitment (July 2026)
+
+Same engine as the tempo integration, replicated on a reth 2.3 fork
+following Ethereum mainnet at the tip (blocks ~25.60M, ~400M accounts /
+1.6B slots, single NVMe, 62 GB box). "Flat" = `RETH_FLATMPT_ROOT=1`: the
+engine's payload validation computes the state root from the flat MPT
+(strict header comparison — a mismatch rejects the block), hashing/merkle
+stages disabled, ExEx feeds committed ranges; "stock" = vanilla reth on the
+same datadir (hashed-state mode: execution maintains `HashedAccounts`/
+`HashedStorages`; merkle is the commitment work on top). Both legs followed
+the same wss consensus feed; every flat block was root-validated in the
+engine with zero divergences.
+
+Commitment cost per block (the work stock does in `MerkleExecute` and flat
+does in `apply_block`), measured over the same 4,947-block range
+(25,597,823-25,602,769) via a pipeline run, plus live-at-tip latency:
+
+| | pipeline commitment | live p50 / p90 / p99 | live IOPS (r + w) |
+|---|---|---|---|
+| flat  | **~7 ms/block** (~35 s) | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s |
+| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms**\* | 233 + 505 /s |
+
+Stock's `MerkleExecute` costs 1.6x execution itself (271.5 s for the same
+range) — flat does the equivalent commitment ~12x cheaper and with 6.4x
+fewer live write IOPS. \*The stock live number is the engine's
+`root_elapsed` — the final await of a root task that overlaps execution
+across many multiproof/sparse-trie workers, so it hides most of the work
+the pipeline number exposes; the flat number is the full single-threaded
+apply, taken after execution.
+
+Bootstrap and footprint go the other way — an honest trade:
+
+| | bootstrap (full state) | on-disk commitment |
+|---|---|---|
+| flat  | ~3.8 h (TSV export 52 min + sorted load 2 h 58 m, root-verified) | one 188 GiB file replacing hashed state + trie (153.4 GiB combined) |
+| stock | **45.4 min** (`stage run merkle` full rebuild, root-verified) | 31.3 GiB trie (fresh; 42.1 GiB aged) on top of 111.3 GiB hashed state |
+
+Long-run file growth is the flat side's open cost: months of appends + the
+GC-era bugs left the working file at 503 GB vs 188 GiB fresh-built —
+bounded-GC/compaction on the follower is the standing answer (see above).
+
+Bring-up hardening that these runs flushed out (all committed): root-verified
+3-field checkpoints (torn-checkpoint detection), never persist on divergence
++ `FLATMPT_HEAL=1` converge-forward repair, `ExecutionOutcome::split_at`
+producing wrong suffix bundles (replaced by unwind-through-inverses +
+full-bundle apply), and live candidates racing the ExEx backfill after a
+restart (the hook now waits for the shadow to catch up instead of failing
+the engine). Two recovery tools fell out: `repair-from-rpc` (changeset
+suspects -> batched archive `eth_getProof` -> synthetic block, root-checked
+against the header) and `restore-hashed-from-flat` (rebuilds MDBX hashed
+state from the flat file; 404.4M accounts + 1.615B slots in 64 min).
+
 ### Tuning knobs (environment variables)
 
 | Var | Default | Effect |
