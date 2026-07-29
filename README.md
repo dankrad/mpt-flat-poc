@@ -1,8 +1,8 @@
 # mpt-flat-poc
 
-> **This branch (`reth-integration`): Ethereum mainnet pathway.** On top of the
-> base engine described below, this branch makes the trie Ethereum-*exact* and
-> turns it into reth's state commitment:
+> **Ethereum mainnet pathway.** On top of the base engine described below,
+> this makes the trie Ethereum-*exact* and turns it into reth's state
+> commitment:
 >
 > - `src/eth.rs` — keccak/RLP hashing identical to mainnet (validated against
 >   ethereum/tests), values stored in leaves (no separate KV store on this path);
