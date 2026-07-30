@@ -154,23 +154,25 @@ MDBX path. Worst persist = longest Saving->Saved engine-persistence span.
 
 20-minute legs (r150/r151):
 
-| | avg tps | p50 / p99 block | worst persist | write IOPS |
-|---|---|---|---|---|
-| flat (gc off) | **12,852** | 2.2 s / 9.0 s | 17.6 s | ~2.5k |
-| stock         | 8,879      | 1.9 s / 5.7 s | **229 s** | ~14k |
+| | avg tps | p50 / p99 block | worst persist | write IOPS | RAM frontier |
+|---|---|---|---|---|---|
+| flat (gc off) | **12,852** | 2.2 s / 9.0 s | 17.6 s | ~2.5k | 0.73 GiB |
+| stock         | 8,879      | 1.9 s / 5.7 s | **229 s** | ~14k | — |
 
 30-minute writer-stress legs (r157/r158/r159):
 
-| | avg tps | worst persist | notes |
-|---|---|---|---|
-| flat + gc  | **10,729** | **13.4 s** | 4,473 gc cycles, 12.6M relocations, 0.08% discards |
-| flat, no gc | 11,583    | 11.2 s     | file balloons (~90G -> ~400G+); tps decays on long runs |
-| stock       | 4,374     | **947 s**  | collapses to half its 20-min tps; 20k write IOPS |
+| | avg tps | worst persist | RAM frontier | notes |
+|---|---|---|---|---|
+| flat + gc  | **10,729** | **13.4 s** | 0.73 -> 0.75 GiB | 4,473 gc cycles, 12.6M relocations, 0.08% discards |
+| flat, no gc | 11,583    | 11.2 s     | 0.73 GiB | file balloons (~90G -> ~400G+); tps decays on long runs |
+| stock       | 4,374     | **947 s**  | — | collapses to half its 20-min tps; 20k write IOPS |
 
 Flat is 1.45x stock at 20 minutes and 2.5-2.6x on the long run, with 13-70x
 lower worst-case persist stalls. Every flat leg ran with the flat/sparse
 root cross-check enabled and zero mismatches; the ops dumps replay-verify
-offline.
+offline. RAM frontier = the in-RAM trie index (measured as the persisted
+manifest): ~0.78 B/account for the 1B-account state; stock has no
+equivalent resident index (its trie lives in MDBX pages).
 
 ### Ethereum mainnet, stock vs flat commitment (July 2026)
 
@@ -203,10 +205,10 @@ apply, taken after execution.
 
 Bootstrap and footprint go the other way — an honest trade:
 
-| | bootstrap (full state) | on-disk commitment |
-|---|---|---|
-| flat  | ~3.8 h (TSV export 52 min + sorted load 2 h 58 m, root-verified) | one 188 GiB file replacing hashed state + trie (153.4 GiB combined) |
-| stock | **45.4 min** (`stage run merkle` full rebuild, root-verified) | 31.3 GiB trie (fresh; 42.1 GiB aged) on top of 111.3 GiB hashed state |
+| | bootstrap (full state) | on-disk commitment | RAM frontier |
+|---|---|---|---|
+| flat  | ~3.8 h (TSV export 52 min + sorted load 2 h 58 m, root-verified) | one 188 GiB file replacing hashed state + trie (153.4 GiB combined) | 1.56 GiB at build; 1.73 GiB on the live follower |
+| stock | **45.4 min** (`stage run merkle` full rebuild, root-verified) | 31.3 GiB trie (fresh; 42.1 GiB aged) on top of 111.3 GiB hashed state | — (MDBX page cache) |
 
 Long-run file growth is the flat side's open cost: a long-lived follower
 file grows well past its live size (503 GB observed vs 188 GiB fresh-built)
