@@ -51,24 +51,24 @@ One unified secure trie, keyed by `keccak256(address)`:
 
 ```
                     FlatMpt (src/lib.rs)
-   ┌───────────────────────────────────────────────────────────┐
+   ┌─────────────────────────────────────────────────────────────┐
    │   upper: RamNode            ← in-RAM trie "frontier"        │
    │   ┌───────────┐               (Branch / Extension / Account,│
    │   │  Branch   │                each caching its own hash)   │
    │   └─────┬─────┘                                             │
-   │     ┌───┴────────────┬───────────────┐                     │
+   │     ┌───┴────────────┬───────────────┐                      │
    │  RamChild::Disk   RamChild::Ram   RamChild::Mem             │
    │   {ptr, root}     (Box<RamNode>)   (Arc<[u8]>, RAM-build    │
    │        │                            + hot-record cache)     │
-   └────────┼────────────────────────────────────────────────-─┘
+   └────────┼──────────────────────────────────────────────────-─┘
             │ DiskPtr { unit, len }   (256 B-aligned)
             ▼
    store: FlatFile                        state.rs code store
-   ┌──────────────────────────────┐       ┌──────────────────────┐
+   ┌───────────────────────────────┐       ┌───────────────────────┐
    │ 128 KiB regions of records    │       │ append log keyed by   │
    │ [len][compact subtree], dense │       │ code_hash (bytecode   │
    │ 256 B packing + region GC     │       │ only; not hashed)     │
-   └──────────────────────────────┘       └──────────────────────┘
+   └───────────────────────────────┘       └───────────────────────┘
 ```
 
 ### 1. The RAM frontier (`RamNode` / `upper`)
