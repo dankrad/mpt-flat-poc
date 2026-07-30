@@ -186,22 +186,30 @@ datadir (hashed-state mode: execution maintains `HashedAccounts`/
 the same wss consensus feed; every flat block was root-validated in the
 engine with zero divergences.
 
-Commitment cost per block (the work stock does in `MerkleExecute` and flat
-does in `apply_block`), measured over the same 4,947-block range
-(25,597,823-25,602,769) via a pipeline run, plus live-at-tip latency:
+Commitment cost per block — the work stock does in `MerkleExecute` and flat
+does in `apply_block`:
 
-| | pipeline commitment | live p50 / p90 / p99 | live IOPS (r + w) |
+| | batched commitment | live p50 / p90 / p99 | live IOPS (r + w) |
 |---|---|---|---|
-| flat  | **~7 ms/block** (~35 s) | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s |
+| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s |
 | stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms**\* | 233 + 505 /s |
 
-Stock's `MerkleExecute` costs 1.6x execution itself (271.5 s for the same
-range) — flat does the equivalent commitment ~12x cheaper and with 6.4x
-fewer live write IOPS. \*The stock live number is the engine's
-`root_elapsed` — the final await of a root task that overlaps execution
-across many multiproof/sparse-trie workers, so it hides most of the work
-the pipeline number exposes; the flat number is the full single-threaded
-apply, taken after execution.
+How each cell was measured. Stock batched: one `MerkleExecute` stage pass
+over blocks 25,597,823-25,602,769 (4,947 blocks) — the aggregated, sorted,
+amortized form of stock's commitment, cheaper per block than its live
+path; it cost 1.6x execution itself (271.5 s for the same range). Flat
+batched: the ExEx's 128-block-bundle replay covering the same range
+(8,033 blocks, 505.7 s of apply), on a freshly restarted process — empty
+frontier/hot-record caches against a GC-bloated 503 GB file, i.e. the
+worst case. Flat warm: mean per-block `apply_block` over the 1,200
+live-validated blocks immediately preceding the range (steady state for a
+synced follower, which is always warm). \*The stock live number is the
+engine's `root_elapsed` — the final await of a root task that overlaps
+execution across many multiproof/sparse-trie workers, so it hides most of
+the work the batched number exposes; the flat live number is the full
+single-threaded apply, taken after execution. Net: even cold-batch flat
+beats stock's batched commitment (1.4x), warm steady state is ~12x
+cheaper, with 6.4x fewer live write IOPS.
 
 Bootstrap and footprint go the other way — an honest trade:
 
