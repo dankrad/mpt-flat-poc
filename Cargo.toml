@@ -15,7 +15,6 @@ tempfile = "3"
 
 [dev-dependencies]
 serde_json = "1"
-criterion = "0.5"
 rand = "0.8"
 mimalloc = "0.1"
 
@@ -23,15 +22,3 @@ mimalloc = "0.1"
 # Opt-in wall-clock attribution (hashing vs IO vs serialization vs ...).
 # Off by default so the throughput benchmark carries no instrumentation cost.
 profiling = []
-
-[[bench]]
-name = "insert"
-harness = false
-
-[[bench]]
-name = "profile"
-harness = false
-
-[[bench]]
-name = "large"
-harness = false

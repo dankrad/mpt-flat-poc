@@ -270,6 +270,7 @@ To run that checkpoint under a live node, follow the
 | [`examples/readbench.rs`](examples/readbench.rs) | Point-read latency/throughput on a checkpoint. |
 | [`examples/gcprobe.rs`](examples/gcprobe.rs), [`gcdrain.rs`](examples/gcdrain.rs) | GC oracle (region/liveness audit) and offline drain-to-target-utilization. |
 | `examples/probe*.rs`, [`rootaudit.rs`](examples/rootaudit.rs), [`flatdump.rs`](examples/flatdump.rs), [`tsvdiff.rs`](examples/tsvdiff.rs) | Forensics: single-key/slot probes, root audits, record dumps, TSV diffing. |
+| [`examples/corpusdump.rs`](examples/corpusdump.rs), [`applydump.rs`](examples/applydump.rs), [`opdrop.rs`](examples/opdrop.rs), [`opsbisect.rs`](examples/opsbisect.rs), [`reprospill.rs`](examples/reprospill.rs), [`keccaklines.rs`](examples/keccaklines.rs) | Corpus forensics: dump/filter recorded op streams, bisect a diverging block's ops, spill repro, address hashing. |
 
 ### `src/lib.rs` component map
 
