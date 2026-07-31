@@ -152,13 +152,6 @@ the node's single state store (`TEMPO_NO_STATE_KV=1`, EVM reads + sparse
 commitment + persistence all through the flat MPT); "stock" = unmodified
 MDBX path. Worst persist = longest Saving->Saved engine-persistence span.
 
-20-minute legs (r150/r151):
-
-| | avg tps | p50 / p99 block | worst persist | write IOPS | RAM frontier |
-|---|---|---|---|---|---|
-| flat (gc off) | **12,852** | 2.2 s / 9.0 s | 17.6 s | ~2.5k | 0.73 GiB |
-| stock         | 8,879      | 1.9 s / 5.7 s | **229 s** | ~14k | — |
-
 30-minute writer-stress legs, plus a no-commitment ceiling: "stock,
 no commitment" runs `--debug.skip-state-root` — no state root computed, no
 sparse-trie/proof work spawned, no trie writes; the header carries the
