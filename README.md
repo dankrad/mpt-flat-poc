@@ -159,20 +159,39 @@ MDBX path. Worst persist = longest Saving->Saved engine-persistence span.
 | flat (gc off) | **12,852** | 2.2 s / 9.0 s | 17.6 s | ~2.5k | 0.73 GiB |
 | stock         | 8,879      | 1.9 s / 5.7 s | **229 s** | ~14k | — |
 
-30-minute writer-stress legs (r157/r158/r159):
+30-minute writer-stress legs, plus a no-commitment ceiling: "stock,
+no commitment" runs `--debug.skip-state-root` — no state root computed, no
+sparse-trie/proof work spawned, no trie writes; the header carries the
+parent's root. It bounds what ANY commitment scheme could achieve on this
+box (r160-r163, 2026-07-31; reproduces the r157-r159 numbers within 1%):
 
-| | avg tps | worst persist | RAM frontier | notes |
+| | avg tps | p50 / p99 block | worst persist | RAM frontier |
 |---|---|---|---|---|
-| flat + gc  | **10,729** | **13.4 s** | 0.73 -> 0.75 GiB | 4,473 gc cycles, 12.6M relocations, 0.08% discards |
-| flat, no gc | 11,583    | 11.2 s     | 0.73 GiB | file balloons (~90G -> ~400G+); tps decays on long runs |
-| stock       | 4,374     | **947 s**  | — | collapses to half its 20-min tps; 20k write IOPS |
+| stock, no commitment | 14,680 | **0.38 s / 1.6 s** | 244 s | — |
+| flat, no gc | 11,465 | 2.4 s / 9.6 s | 31 s | 0.73 GiB |
+| flat + gc   | 10,791 | 2.7 s / 9.4 s | **34 s** | 0.73 -> 0.75 GiB |
+| stock       | 4,687  | 2.1 s / 20.4 s | **847 s** | — |
 
-Flat is 1.45x stock at 20 minutes and 2.5-2.6x on the long run, with 13-70x
-lower worst-case persist stalls. Every flat leg ran with the flat/sparse
-root cross-check enabled and zero mismatches; the ops dumps replay-verify
-offline. RAM frontier = the in-RAM trie index (measured as the persisted
-manifest): ~0.78 B/account for the 1B-account state; stock has no
+Read against the ceiling: stock's commitment costs it 68% of the
+achievable throughput; flat's costs 22-27% — flat delivers 73-78% of the
+no-commitment maximum while root-checking every block (flat/sparse
+cross-check, zero mismatches; ops dumps replay-verify offline). The
+persist column shows a second, commitment-independent stock bottleneck:
+even with commitment off, MDBX hashed-state writes stall persistence for
+244 s worst-case, while the flat legs (which replace those writes too,
+`TEMPO_NO_STATE_KV=1`) stay at ~30 s. RAM frontier = the in-RAM trie
+index (measured as the persisted manifest): ~0.78 B/account; stock has no
 equivalent resident index (its trie lives in MDBX pages).
+
+Margin note from the re-run: at this load both state pipelines run near
+block-production speed, and one attempt of each comparison leg failed
+before its clean pass — stock OOM-killed at minute 5 (55 GB anon RSS:
+cold-start trie work lagged, persistence backed up, executed blocks piled
+in RAM), and flat+gc aborted at minute 28 when a production burst put the
+builder 64 blocks ahead of the shadow and overflowed the retained-overlay
+window (apply pace was identical to its passing run — 2.30 vs 2.23 s per
+~162k-op block). The flat-side fix is the hash-transplant follower (persist
+sparse-computed hashes instead of re-deriving them in the apply).
 
 ### Ethereum mainnet, stock vs flat commitment (July 2026)
 
