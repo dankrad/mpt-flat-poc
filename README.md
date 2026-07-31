@@ -199,6 +199,37 @@ window (apply pace was identical to its passing run — 2.30 vs 2.23 s per
 ~162k-op block). The flat-side fix is the hash-transplant follower (persist
 sparse-computed hashes instead of re-deriving them in the apply).
 
+### tempo node, 1B-account cold workload (July 2026)
+
+The original 1B benchmark shape for comparison: **4,000 sender accounts**
+(vs ~1B random senders above), recipients uniformly random over a 250M
+cold range, block-0 golden datadir, 4-token bloat; same 30-min protocol,
+node args, and binary as the random suite (r164-r167, 2026-07-31):
+
+| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) |
+|---|---|---|---|---|
+| stock, no commitment | 27,708 | **1.0 s / 1.6 s** | 20 s | 41.9k + 46.9k |
+| flat, no gc | 16,500 | 1.7 s / 5.0 s | 53 s | 49.3k + **1.9k** |
+| flat + gc   | 16,209 | 1.7 s / 4.0 s | **59 s** | 49.2k + **2.1k** |
+| stock       | 6,487  | 1.6 s / 9.3 s | **408 s** | 79.6k + 22.8k |
+
+With the lighter sender set the execution ceiling nearly doubles (27,708,
+near-saturating the 30k offered rate) — and the commitment gap WIDENS:
+stock keeps only 23% of the achievable throughput (vs 32% on the random
+workload), flat keeps 58-60% and stays 2.5x stock. The gc tax is ~2% here
+(vs ~6% random): fewer unique writers per block means less record churn
+to reclaim. Same write-shape story as the random suite: flat moves ~420
+MB/s through ~2k writes/s of large appends; the no-commitment ceiling
+does 46.9k/s of small MDBX page writes for 250 MB/s.
+
+One caveat on the flat+gc leg: the cold golden (`golden-1b.flat`, built
+July 5) predates the composite-prefix fix, so its records carry old
+storage-local paths the GC collect walk cannot see. The leg runs with
+`MPT_GC_ASSERT_PATHS` off — the GC pins such regions instead of
+relocating them (the designed graceful path), slightly understating
+reclaim vs a freshly built tree. Root cross-checks passed on every block
+in both flat legs.
+
 ### Ethereum mainnet, stock vs flat commitment (July 2026)
 
 Same engine on a reth 2.3 fork following Ethereum mainnet at the tip
