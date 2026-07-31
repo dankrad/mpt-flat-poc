@@ -245,10 +245,10 @@ engine with zero divergences.
 Commitment cost per block — the work stock does in `MerkleExecute` and flat
 does in `apply_block`:
 
-| | batched commitment | live p50 / p90 / p99 | live IOPS (r + w) | live MB/s (r + w) |
+| | total commitment work | live critical-path latency p50 / p90 / p99 | live IOPS (r + w) | live MB/s (r + w) |
 |---|---|---|---|---|
-| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s | 16.1 + 3.2 |
-| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms**\* | 233 + 505 /s | 1.1 + 3.4 |
+| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms (= the full work, serial) | 284 + **79** /s | 16.1 + 3.2 |
+| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms** (await only\*) | 233 + 505 /s | 1.1 + 3.4 |
 
 How each cell was measured. Stock batched: one `MerkleExecute` stage pass
 over blocks 25,597,823-25,602,769 (4,947 blocks) — the aggregated, sorted,
@@ -263,7 +263,10 @@ synced follower, which is always warm). \*The stock live number is the
 engine's `root_elapsed` — the final await of a root task that overlaps
 execution across many multiproof/sparse-trie workers, so it hides most of
 the work the batched number exposes; the flat live number is the full
-single-threaded apply, taken after execution. Net: even cold-batch flat
+single-threaded apply, taken after execution — for flat the two columns
+measure the same thing, which is why they agree (~7 vs 6.8 ms); for stock
+they measure total work vs critical-path remainder, which is why 88.4
+ms/block coexists with a 0.66 ms live p50. Net: even cold-batch flat
 beats stock's batched commitment (1.4x), warm steady state is ~12x
 cheaper, with 6.4x fewer live write IOPS.
 
