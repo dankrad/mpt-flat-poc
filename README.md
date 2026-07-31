@@ -158,12 +158,12 @@ sparse-trie/proof work spawned, no trie writes; the header carries the
 parent's root. It bounds what ANY commitment scheme could achieve on this
 box (r160-r163, 2026-07-31; reproduces the r157-r159 numbers within 1%):
 
-| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) | RAM frontier |
-|---|---|---|---|---|---|
-| stock, no commitment | 14,680 | **0.38 s / 1.6 s** | 244 s | 75.5k + 58.8k | — |
-| flat, no gc | 11,465 | 2.4 s / 9.6 s | 31 s | 99.6k + **2.3k** | 0.73 GiB |
-| flat + gc   | 10,791 | 2.7 s / 9.4 s | **34 s** | 97.8k + **2.2k** | 0.73 -> 0.75 GiB |
-| stock       | 4,687  | 2.1 s / 20.4 s | **847 s** | 126.9k + 13.5k | — |
+| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) | MB/s (r + w) | RAM frontier |
+|---|---|---|---|---|---|---|
+| stock, no commitment | 14,680 | **0.38 s / 1.6 s** | 244 s | 75.5k + 58.8k | 427 + 327 | — |
+| flat, no gc | 11,465 | 2.4 s / 9.6 s | 31 s | 99.6k + **2.3k** | 962 + 475 | 0.73 GiB |
+| flat + gc   | 10,791 | 2.7 s / 9.4 s | **34 s** | 97.8k + **2.2k** | 947 + 474 | 0.73 -> 0.75 GiB |
+| stock       | 4,687  | 2.1 s / 20.4 s | **847 s** | 126.9k + 13.5k | 565 + 375 | — |
 
 Read against the ceiling: stock's commitment costs it 68% of the
 achievable throughput; flat's costs 22-27% — flat delivers 73-78% of the
@@ -206,12 +206,12 @@ The original 1B benchmark shape for comparison: **4,000 sender accounts**
 cold range, block-0 golden datadir, 4-token bloat; same 30-min protocol,
 node args, and binary as the random suite (r164-r167, 2026-07-31):
 
-| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) |
-|---|---|---|---|---|
-| stock, no commitment | 27,708 | **1.0 s / 1.6 s** | 20 s | 41.9k + 46.9k |
-| flat, no gc | 16,500 | 1.7 s / 5.0 s | 53 s | 49.3k + **1.9k** |
-| flat + gc   | 16,209 | 1.7 s / 4.0 s | **59 s** | 49.2k + **2.1k** |
-| stock       | 6,487  | 1.6 s / 9.3 s | **408 s** | 79.6k + 22.8k |
+| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) | MB/s (r + w) |
+|---|---|---|---|---|---|
+| stock, no commitment | 27,708 | **1.0 s / 1.6 s** | 20 s | 41.9k + 46.9k | 253 + 250 |
+| flat, no gc | 16,500 | 1.7 s / 5.0 s | 53 s | 49.3k + **1.9k** | 399 + 384 |
+| flat + gc   | 16,209 | 1.7 s / 4.0 s | **59 s** | 49.2k + **2.1k** | 406 + 423 |
+| stock       | 6,487  | 1.6 s / 9.3 s | **408 s** | 79.6k + 22.8k | 407 + 188 |
 
 With the lighter sender set the execution ceiling nearly doubles (27,708,
 near-saturating the 30k offered rate) — and the commitment gap WIDENS:
@@ -245,10 +245,10 @@ engine with zero divergences.
 Commitment cost per block — the work stock does in `MerkleExecute` and flat
 does in `apply_block`:
 
-| | batched commitment | live p50 / p90 / p99 | live IOPS (r + w) |
-|---|---|---|---|
-| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s |
-| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms**\* | 233 + 505 /s |
+| | batched commitment | live p50 / p90 / p99 | live IOPS (r + w) | live MB/s (r + w) |
+|---|---|---|---|---|
+| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms | 284 + **79** /s | 16.1 + 3.2 |
+| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms**\* | 233 + 505 /s | 1.1 + 3.4 |
 
 How each cell was measured. Stock batched: one `MerkleExecute` stage pass
 over blocks 25,597,823-25,602,769 (4,947 blocks) — the aggregated, sorted,
