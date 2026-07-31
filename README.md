@@ -165,12 +165,12 @@ sparse-trie/proof work spawned, no trie writes; the header carries the
 parent's root. It bounds what ANY commitment scheme could achieve on this
 box (r160-r163, 2026-07-31; reproduces the r157-r159 numbers within 1%):
 
-| | avg tps | p50 / p99 block | worst persist | RAM frontier |
-|---|---|---|---|---|
-| stock, no commitment | 14,680 | **0.38 s / 1.6 s** | 244 s | — |
-| flat, no gc | 11,465 | 2.4 s / 9.6 s | 31 s | 0.73 GiB |
-| flat + gc   | 10,791 | 2.7 s / 9.4 s | **34 s** | 0.73 -> 0.75 GiB |
-| stock       | 4,687  | 2.1 s / 20.4 s | **847 s** | — |
+| | avg tps | p50 / p99 block | worst persist | IOPS (r + w) | RAM frontier |
+|---|---|---|---|---|---|
+| stock, no commitment | 14,680 | **0.38 s / 1.6 s** | 244 s | 75.5k + 58.8k | — |
+| flat, no gc | 11,465 | 2.4 s / 9.6 s | 31 s | 99.6k + **2.3k** | 0.73 GiB |
+| flat + gc   | 10,791 | 2.7 s / 9.4 s | **34 s** | 97.8k + **2.2k** | 0.73 -> 0.75 GiB |
+| stock       | 4,687  | 2.1 s / 20.4 s | **847 s** | 126.9k + 13.5k | — |
 
 Read against the ceiling: stock's commitment costs it 68% of the
 achievable throughput; flat's costs 22-27% — flat delivers 73-78% of the
@@ -182,6 +182,14 @@ even with commitment off, MDBX hashed-state writes stall persistence for
 `TEMPO_NO_STATE_KV=1`) stay at ~30 s. RAM frontier = the in-RAM trie
 index (measured as the persisted manifest): ~0.78 B/account; stock has no
 equivalent resident index (its trie lives in MDBX pages).
+
+IOPS = device ops/s on the working NVMe over each leg's first 200 s (the
+sampling protocol behind the earlier tables). The write *shape* is the
+story: the flat legs push ~475 MB/s through ~2.2k writes/s (large
+sequential appends), the no-commitment leg pushes 327 MB/s through 58.8k
+writes/s (small random MDBX pages) — flat writes ~26x fewer, ~30x larger
+ops for more bandwidth. Committed stock is read-dominated (126.9k r/s):
+trie-node lookups on top of state reads.
 
 Margin note from the re-run: at this load both state pipelines run near
 block-production speed, and one attempt of each comparison leg failed
