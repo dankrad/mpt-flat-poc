@@ -270,6 +270,29 @@ ms/block coexists with a 0.66 ms live p50. Net: even cold-batch flat
 beats stock's batched commitment (1.4x), warm steady state is ~12x
 cheaper, with 6.4x fewer live write IOPS.
 
+**10,000-block replay, end to end (August 2026).** The direct head-to-head:
+the same node synced the same 10,000 mainnet blocks
+(25,642,905-25,652,904) twice from the same starting state — once with
+flat as the commitment backend, once as vanilla stock — via
+`--debug.tip/--debug.max-block` fixed-range sync, caches dropped before
+each leg, every leg root-verified (flat: each ExEx batch against its tip
+header; stock: `MerkleExecute` against the target header):
+
+| | total wall | execution | commitment | history indexes |
+|---|---|---|---|---|
+| flat  | **871 s** | 668 s | **60.5 s** (4.73M ops, 6.1 ms/block) | 135 s |
+| stock | 939 s | 420 s | 489 s (48.9 ms/block incremental) | 25 s |
+
+Flat syncs the range 7% faster end to end — while doing MORE work (its
+leg also re-downloaded bodies + senders, 26 s, which stock's leg
+skipped). The commitment itself is 8.1x cheaper (60.5 vs 489 s), matching
+the live-leg 6-7 ms/block. The interesting asymmetry: flat's execution
+and index stages run SLOWER (668 vs 420 s, 135 vs 25 s) because the flat
+applies overlap them and compete for the same NVMe — flat spends its
+savings buying back contention, and still nets ahead. (A second-pass
+MDBX page-reuse effect may also flatter stock's execution: its leg
+re-executed into pages the flat leg had already allocated.)
+
 Bootstrap and footprint go the other way — an honest trade:
 
 | | bootstrap (full state) | on-disk commitment | RAM frontier |
