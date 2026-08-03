@@ -1,261 +1,175 @@
-# Paged-node storage design
+# Flat-file trie storage design
 
-Status: **proposal** (no code yet). Branch `paged-nodes`, forked from
-`ram-optimization` @ `691ac51`.
+Status: **implemented** — this describes the engine as it exists on the
+mainline. It descends from the earlier *paged-node storage* proposal (see
+**History** at the end for what shipped and what diverged).
 
-## 1. Why
+## 1. The problem
 
-The current design stores each disk subtree as one monolithic blob (`DiskSubtree`)
-and pushes a per-leaf reference (`RamChild::Disk { ptr, root }`) into the RAM
-frontier. At scale this hits a **radix-16 split cascade**:
+A Merkle Patricia Trie over billions of keys cannot keep its nodes
+individually addressable on disk without paying O(depth) random IOs per
+update (the conventional trie-on-pages design), and cannot keep them all in
+RAM. The design goal: **one random read per accessed key** — the same read
+execution needs for the value — with commitment recomputed from that read,
+and RAM bounded by the count of *records*, not keys.
 
-- When a leaf reaches `max_leaf_bytes` it splits into **all 16** next-nibble
-  children at once. A whole generation of leaves does this ~simultaneously
-  (`leaves` jumps to 16ⁿ).
-- Each split mints a swarm of tiny children. Measured at 8 KiB:
-  `split: 1,067,705 new @ 555 B` — ~3 keys each.
-- Page-aligned, each ~555 B child grabs a full 4 KiB page → ~86% padding waste.
-- Each tiny child is also a frontier entry → RAM balloons (11.8 GiB observed
-  at 870M vs ~0.5–1.5 GiB ideal; flat file ~5× ideal).
+## 2. The unit: a `DiskSubtree` record
 
-The byte-granular variant avoids padding but fragments the free list
-(6.5M regions at 480M) and eventually needs compaction. Neither is good.
+A record is one subtree, compact-serialized as `[u32 len][payload]` and
+placed at a 256 B-aligned offset (`DiskPtr { unit, len }`) inside a sequence
+of 128 KiB regions. A record's payload is its node tree, recursively:
 
-## 2. Goal / non-goals
+- `Leaf { path, value }` — values live **in** the trie (Ethereum leaf RLP);
+  there is no external value store. Bytecode is the one exception
+  (content-addressed code store, never read during hashing).
+- `Extension` / `Branch` — interior structure, each carrying its node
+  reference (`NodeRef`: hash, or the RLP itself when < 32 bytes, per
+  Ethereum's inline-node rule).
+- `Overflow { ptr, root }` — a child subtree living in its **own** record.
+  Hash-transparent: a branch hashes identically whether a child is inline
+  or overflowed, so layout never affects the root.
+- `Account { fields, storage }` — a state-trie account leaf with its
+  **storage subtree nested inline**: the account's `storage_root` is
+  computed from the nested tree, never fetched. Records inside a storage
+  subtree are addressed by **composite paths** (64 account nibbles ‖
+  storage nibbles).
 
-**Goal:** bound RAM ~independently of key count (target ~0.5–1.5 GiB at 1B),
-kill the cascade and the padding swarm, while keeping ~1 read per lookup and
-the same Merkle root as the canonical radix-16 MPT.
+Every record stores its **full composite frontier path**, so any record is
+independently relocatable — the property the garbage collector's
+verify-then-install step depends on (asserted by `MPT_GC_ASSERT_PATHS=1`).
 
-**Non-goals:** changing the *logical* trie (the radix-16 structure is fixed),
-changing the value store (RocksDB unchanged), unbounded-RAM full-index designs.
+Defaults: `max_leaf_bytes` 16 KiB (hard cap), `target_leaf_bytes` 8 KiB.
+(`min_promote_bytes` survives in `Config` but is vestigial — nothing in the
+operative path reads it; kept only by legacy tests.)
 
-> **Phase 2a finding (done, `c05d971`).** The root was *not* storage-independent:
-> RAM and disk hashed the same node type with different domain tags (ext 1 vs 4,
-> branch 2 vs 5), so the root secretly depended on `max_leaf_bytes` / where the
-> RAM–disk boundary fell. Since the paged design *moves* that boundary, the tags
-> were unified (ext=4, branch=5 everywhere) so the root is a pure function of the
-> key set — order-, config-, and layout-independent. This **changes the absolute
-> root vs `ram-optimization`** (different tags); both stay internally consistent.
-> Locked in by `root_is_independent_of_leaf_size`.
+## 3. The RAM frontier
 
-## 3. The unit: a *page node* record
+The frontier holds every node whose subtree exceeds one record, as
+`RamNode::{Branch, Extension}` plus promoted `Account` nodes. A branch slot
+(`RamChild`, size-guarded ≤ 56 B) is one of:
 
-Replaces `DiskSubtree`. A page node is a subtree rooted at a nibble-prefix,
-stored as one variable-size record laid out in three logical parts:
+- `Ram(Box<RamNode>)` — deeper frontier structure;
+- `Disk { ptr, root }` — a record pointer plus that record's own root
+  digest (what the parent needs to hash). Child digests *inside* a record
+  are **not** cached in RAM — they come along with the record read;
+- `Mem(Arc<[u8]>)` — an in-RAM record: RAM-build mode during bulk
+  bootstrap, and the hot-record cache (Mem-on-rewrite with deferred
+  write-back) in steady state.
 
-```
-+-----------------------------------------------------------+
-| (1) HEADER                                                |
-|     prefix nibbles (extension, if any)                    |
-|     for each of 16 branch slots:                          |
-|        child_digest : [u8;32]        (Merkle hash)        |
-|        locator      : Empty                               |
-|                     | Inline { off:u32, len:u32 }  -> (2) |
-|                     | Overflow { ptr:DiskPtr }     -> (3) |
-+-----------------------------------------------------------+
-| (2) INLINE AREA                                           |
-|     small child subtrees, packed back-to-back,            |
-|     each located by (off,len) from the header             |
-+-----------------------------------------------------------+
-```
+Because a frontier terminal covers a whole record (~10² keys), frontier
+size is Θ(n / record-capacity) — **linear in n with a sub-byte-per-key
+constant**, dominated by the one slot + amortized parent-branch share per
+record. The trie's log-depth does not multiply memory: node count per
+level shrinks geometrically going up, so the log-many upper levels sum to
+a constant factor.
 
-**(3) Overflow** is *not* bytes in this record — overflow children are their
-own page-node records elsewhere in the flat file, reached via `Overflow{ptr}`.
-Each is recursively a (1)/(2)/(3) page node.
+### The boundary: promote-on-max
 
-The header is small and bounded: ≤16×(32 + ~10) ≈ **~700 B**, regardless of how
-much data hangs below it. That bound is what makes the design work.
+There is no fixed-depth knob and no size-class rule. A record that exceeds
+`max_leaf_bytes` on rewrite **promotes**: its top branch is lifted into the
+frontier and its children become records (oversized children keep
+splitting). The boundary therefore tracks the data adaptively — dense
+subtrees push the frontier deeper, sparse ones stay packed. `Overflow`
+edges cover the remaining case of a fat child *below* a still-packed
+parent, keeping the parent record bounded without promoting it.
 
-## 4. RAM model — pointers, not digests
+## 4. The sibling-hash flow
 
-The RAM frontier holds, per page-node record, exactly what it holds today:
-`RamChild::Disk { ptr, root }` — a pointer plus the *record's own* root digest
-(needed by its parent to hash). It does **not** cache the header's 16 child
-digests; those live on disk in (1).
+The reason the whole design works: updating a key requires the sibling
+hashes along its path, and they are already in the bytes being read.
 
-Because small children are **packed** (many per record), the number of records
-is far below the number of leaves in the current design — so the frontier
-shrinks proportionally. RAM is bounded by the count of *records*, not *keys*.
+1. Route through the RAM frontier to `Disk { ptr, .. }`; read the record
+   (one IO — the same IO that fetches the value for execution).
+2. Parse **lazily**: only nodes on the touched path are expanded;
+   untouched sibling subtrees stay `Raw` (zero-copy slices of the shared
+   read buffer) with their cached `NodeRef`s, and are written back
+   verbatim.
+3. Re-hash only the touched path inside the record; recompute the record
+   root; splice the new `{ptr, root}` into the frontier and bubble the
+   root up through the frontier's cached hash cells (RAM-only).
 
-The split that matters:
-- **Navigation + parent-hashing** → RAM (`ptr` + `root`), small.
-- **Child digests (authentication within a record)** → disk header (1), read
-  on demand when we touch the record.
+No stored mid-tree hash pages, no extra reads, per-update hashing
+proportional to the touched path — independent of record size.
 
-### Where the RAM/disk boundary falls — adaptive, via `min_promote`
+## 5. The block API
 
-There is **no fixed-depth knob.** The boundary is the same kind of adaptive,
-data-driven boundary the engine already uses, refined by one rule:
+`apply_block(ops) -> (root, inverse_diff)` is the operative interface: a
+per-block batch of `SetAccount / DeleteAccount / WipeStorage / SetStorage /
+DeleteStorage`.
 
-> A branch lives in the **RAM frontier iff all its children are "fat"
-> (≥ `min_promote`)** — each child then deserves its own record, so the branch is
-> a RAM node whose children are records. A branch that has any **small** children
-> (< `min_promote`) is instead **packed into one disk record** (small children
-> inline; fat children as `Overflow` pointers).
+- **Phase A (route):** group ops per record via the frontier; an advisory
+  pre-read (`prefetch_block`) warms the records a pending block will touch.
+- **Phase B (parallel):** per-record reads fanned across the top branch's
+  16 disjoint subtrees and a deep pread queue; apply, re-hash, rewrite or
+  promote. Deletion re-folds structure canonically (a branch left with one
+  child merges into its survivor).
+- **Phase C (install):** splice results, recompute the root once, emit the
+  exact inverse ops for reorg rollback.
 
-Consequences, all desirable and all adaptive:
-- The frontier covers the **upper tree** (where subtrees are big → fat children)
-  and stops exactly where subtrees shrink below `min_promote` — which is *where
-  the old design's swarm began*. Instead of fanning that level into 16 tiny RAM
-  disk-leaves, we pack it into one record.
-- **Bounded RAM:** packed records hold ~`max/leaf` keys (~80 at 8 KiB) instead of
-  ~3, so ~15–25× fewer records ⇒ ~15–25× smaller frontier (~0.75 GB at 1B vs
-  11.8 GB). The frontier stays adaptive but small *because the leaves are fat*.
-- **~1 read** for the common case (RAM navigation down to the boundary record,
-  then one read). An overflow hop is added only for a fat child *below* the
-  boundary, and the chain there is short — its length is set by the
-  `min_promote : max_leaf` ratio (~1–2), and tunable.
-- `min_promote` is the single dial: bigger ⇒ frontier stops higher (less RAM,
-  slightly deeper disk chains); smaller ⇒ frontier reaches deeper (more RAM,
-  shallower chains).
+## 6. Writes, regions, GC
 
-## 5. The sibling-hash flow (the question that drove this design)
+Records are never updated in place: every rewrite **appends** — one
+batched sequential write per apply. Old copies become garbage inside
+their regions; per-region liveness is bookkept at write time, and freed
+regions **stage** until the current apply's read-ahead window closes
+before reuse (prevents read-after-free aliasing within a batch).
 
-When we update one child and must recompute the record's branch hash, we need
-the *other 15* child digests. They are in header (1), which we already read to
-get to the child. **No extra read, no RAM cache.** Concretely, an insert:
+The garbage collector runs **off the block critical path** as a split
+design: `gc_collect` on a pinned snapshot (lock-free: pick low-utilization
+regions, read victims in parallel, filter to live records) and
+`gc_install` under the writer (re-verify each candidate against the live
+frontier via its stored path; relocate or discard). Embedders schedule
+collect into idle windows. Known structural limit: at sustained
+device-saturating write load, reclaim competes with fresh appends for the
+same bandwidth — the space bound degrades gracefully (file grows) rather
+than stalling the block path.
 
-1. Navigate RAM frontier → reach `RamChild::Disk{ptr}` → read record `(1)+(2)`.
-2. Route by next nibble:
-   - `Inline` → the child subtree is in (2) we just read; insert into it.
-   - `Overflow{ptr}` → recurse into that record (its `(1)+(2)`).
-3. Recompute the touched child's digest; write it into header slot's
-   `child_digest`; recompute the header branch hash = this record's root.
-4. Persist: write `(1)+(2)` back; set the RAM `root` for this record.
-5. Bubble the new root up the RAM frontier (existing incremental re-hash).
+## 7. Persistence
 
-Sibling digests for step 3 come from the header read in step 1. ✔
+Checkpoint-based. The flat file holds the data; the index — frontier
+structure, pointers, cached hashes, allocator high-water — is RAM-only and
+serialized to the `.meta` manifest by `persist()` (spill in-RAM records,
+fsync the file, write the manifest atomically). A crash reopens at the
+last checkpoint; node integrations pair this with a root-verified
+`<flat>.height` sidecar so a torn checkpoint is detected rather than
+followed, and re-derive the gap from the chain.
 
-## 6. Migration (where `min_promote`/`target`/`max` finally do real work)
+## 8. Hashing
 
-Per-record budget, mapped onto the existing `Config`:
+Mainnet-exact keccak/RLP (`src/eth.rs`), validated against the official
+`ethereum/tests` vectors. The root is a pure function of the key set —
+independent of record size, promotion history, and layout — gated by
+`root_is_independent_of_leaf_size` and the batch-vs-one-by-one parity
+tests. (The PoC-era domain-tag scheme is gone; this trie hashes byte-for-
+byte like Ethereum's.)
 
-| Config field        | role in paged design                                        |
-|---------------------|-------------------------------------------------------------|
-| `max_leaf_bytes`    | hard cap on a record `(1)+(2)`; over it ⇒ migrate out       |
-| `target_leaf_bytes` | migrate inline children to overflow until back under this   |
-| `min_promote_bytes` | a child must be ≥ this to earn its *own* overflow record    |
+## 9. Known limits / future directions
 
-Two distinct triggers (do **not** conflate them):
+- **Write amplification** is the design's structural cost: a whole record
+  rewrites for any change inside it. It is paid deliberately — sequential
+  appends instead of random page writes — and the GC exists to reclaim it.
+  Record size (`MAX_LEAF_KIB`) is the tuning dial: bytes-per-write vs
+  frontier size vs read fatness.
+- **Hash-transplant follower** (planned): persist externally-computed
+  node hashes instead of re-deriving them in the apply, removing the
+  apply-side hashing from the follower's critical path.
+- **Two-level disk variant** (design sketch): for key counts where even
+  the linear frontier outgrows RAM, insert an intermediate disk record of
+  two 16-ary levels (256 record pointers, ~11 KiB — fits the same IO
+  unit). Exactly 2 IOs per accessed key; frontier constant divides by the
+  256 fanout; write bytes roughly 1.7× (the intermediate rewrites when a
+  child record's root changes). Extends the design by two orders of
+  magnitude of keys for one extra read.
 
-- **Proactive promotion — gated by `min_promote`.** When an inline child *grows*
-  to ≥ `min_promote`, give it its own overflow record promptly, even if the
-  record isn't full. These are the common, low-padding promotions (the child is
-  already sizeable, so its page is well-filled). Children below `min_promote`
-  stay packed in (2) — this is what avoids minting ~555 B records.
+## 10. History
 
-- **Forced shedding — ignores `min_promote`.** If a record still exceeds `max`
-  (only happens when it's packed with many *sub-`min_promote`* children), it
-  **must** shed: promote the **largest** child, then the next largest, until the
-  record is ≤ `target`. `min_promote` does *not* gate this — progress is
-  mandatory, so a full record is never stuck.
-
-  *Why this is safe (it was the obvious deadlock):*
-  - **Converges:** each forced promotion removes one child; header is bounded
-    (~700 B). Worst case, all 16 promote and the record becomes a *bare 16-way
-    branch header* (≤ `target`) — a normal MPT branch over 16 child records.
-  - **No swarm:** one child at a time, not 16-at-once — incremental, not a
-    synchronized cascade.
-  - **Transient padding amortizes:** a forced-promoted child starts ~`max/16`
-    but under uniform load grows toward `max` before *it* sheds, so a record
-    averages ~1 full page over its life. Padding is only on young records.
-  - **Skew** (all data under one nibble) pushes data down a level; hashed/uniform
-    keys diverge within a few nibbles, and key length (64 nibbles) + extension
-    compression bound the chain.
-
-- **Depth comes from overflow chains, not header splits.** The header branch is
-  always 16-way; a child that keeps growing becomes its own page node with its
-  own (1)/(2)/(3), recursively. No 16-at-once cascade — migration is incremental
-  (a few children per insert), spread over time.
-
-So `min_promote` is a *preference* for voluntary promotion, not a hard floor that
-can block a full record.
-
-This means we can **keep page-alignment** for low fragmentation: records are now
-either packed-full (inline) or ≥ `min_promote` (overflow), so padding is a small
-fraction instead of ~86%.
-
-## 7. Read amplification
-
-- **Inline-child lookup:** 1 read (the whole `(1)+(2)` record).
-- **Overflow-child lookup:** read this record (its (2) wasted), then recurse one
-  record deeper. The overflow chain depth ≈ how many size-bands the key passes;
-  shallow in practice. *(Open question 9.1: read header-only first to skip the
-  wasted (2) read when records are large.)*
-- **Update:** same record reads as the matching lookup, + the writes for the one
-  touched child and the (small) header. Less write-amp than today, since we
-  rewrite header + one child, not a whole monolithic leaf.
-
-## 8. Persistence
-
-Unchanged in shape: the RAM frontier (pointers + root digests) is checkpointed
-to `.meta` as today; page-node records are self-describing on disk (header
-carries digests + locators), values stay in the `.values` RocksDB. On reopen,
-restore the frontier from the manifest; page nodes load on demand. Invariant:
-a record's header branch hash == the root digest cached for it in RAM/manifest.
-
-## 9. Open questions
-
-1. **Header-only reads.** Read `(1)` alone (cheap) then `(2)` only if the routed
-   child is inline, vs always reading `(1)+(2)`? Depends on record size vs the
-   inline-hit rate. Start with always-`(1)+(2)`; measure.
-2. **Overflow allocation.** Each overflow child = its own record (simplest), vs a
-   managed shared overflow area. Start with own-record.
-3. **De-migration.** If an overflow child shrinks below `min_promote` (deletes),
-   pull it back inline? Defer — PoC is insert/overwrite-heavy.
-4. **Record size unit.** `max_leaf_bytes` default (8 KiB) vs larger. Larger ⇒
-   fewer records ⇒ smaller frontier, more bytes rewritten per insert. Re-sweep
-   once it runs.
-
-## 10. Correctness strategy
-
-The root must be a pure function of the key set — storage layout does not change
-the (logical) trie. Gates on every phase:
-- `examples/batchcheck.rs`: batch == one-by-one (root + ideally flat size).
-- `root_is_independent_of_leaf_size` (lib test): same keys, very different
-  `max_leaf_bytes`, identical root. This is the real layout-independence check —
-  it moves the boundary the most. (Supersedes the earlier "== `ram-optimization`
-  root" idea, which no longer holds after the 2a tag unification.)
-- For overflow specifically: an **all-inline build == a build that forces
-  overflow** (tiny `min_promote`) must give the same root.
-
-## 11. Phased plan
-
-1. **(this doc)** — format + invariants. ✔
-2a. **Storage-independent root.** Unify hash tags so the root doesn't depend on
-   the RAM/disk boundary. ✔ (`c05d971`, `root_is_independent_of_leaf_size`)
-2b. **`Node::Overflow` foundation.** Wire format + hash contract + round-trip
-   test. ✔ (`c35cb0c`)
-2c. **Record-crossing insert + overflow migration (always-pack).** ✔ (`7a48622`)
-   `record_node_insert` traverses overflow edges; `migrate_record` sheds
-   top-branch children (proactive ≥ `min_promote`, forced largest-first to
-   `target`). *Pure-paged* for now: no RAM-branch promotion, so the frontier
-   stays shallow (`ram_nodes=1` at 200k) and growth goes to disk overflow.
-   **Gate met:** overflow build == all-inline build, same root (200k, and
-   `root_is_independent_of_leaf_size`). `insert_batch` temporarily serial.
-2d. **RAM-branch promotion = the adaptive boundary.** ✔ (`6c382c9`) Promote a
-   packed record to a RAM branch once `PROMOTE_AT_OVERFLOW` (8/16) children are
-   externalized; overflow children become `RamChild::Disk`, leftover inline
-   children (now ~`min_promote`) are written out. Root-preserving. At 200k:
-   `ram_nodes` 1 → 273 (= 1+16+256, the complete top 3 levels) ⇒ lookups are RAM
-   nav + 1 read. The read-perf half of the boundary.
-4a. **Hot-path speedup.** ✔ (`7d66a96`) Non-allocating size pass in
-   `migrate_record` (no per-insert throwaway serialization). One-by-one 26 → 18
-   µs/key at 10M.
-4b. **Thread-safe FlatFile + parallel `insert_batch`.** ✔ (`95c04c2`) Free list
-   behind `Mutex`, `end_page` atomic, I/O via shared `&File`. Batch groups keys
-   by frontier leaf and runs each group's insert+migrate+promote on scoped
-   threads (disjoint subtrees), then splices results into the frontier. Verified
-   batch == one-by-one root at 1M; ~3× faster (15.6 → 5.1 µs/key).
-
-**Validated at 50M (one-by-one, 8 KiB):** the cascade is gone — vs the old design
-at the same point, flat 11.3 GiB (was 35.5), RAM 62 MiB (was 541), leaves stay at
-16⁵ and fatten instead of multiplying, `split: 0`, steady-state ops ~2× faster.
-
-5. **Scale (next).** With batch at ~5 µs/key a 1B run is ~1.4 h. Run
-   `benches/large.rs` through the old cascade points and confirm RAM stays bounded
-   (~1 GB predicted at 1B) and reads shallow.
-6. **Cleanup.** Delete the superseded serial machinery (`node_insert`,
-   `node_contains`, `split_subtree`, old batch fns) once Phase 5 confirms the new
-   path; they linger as dead-code warnings today.
+This document supersedes the *paged-node storage* proposal (the previous
+revision of this file). What survived from it: the `Overflow` edge and its
+hash-transparency contract, the pointers-not-digests RAM model, the
+sibling-hashes-from-the-record-read principle, and the bounded-RAM goal.
+What diverged: the header/inline-area/locator record format was never
+built — `DiskSubtree` remained, with lazy `Raw` parsing providing the
+sibling property; the `min_promote` adaptive boundary and two-trigger
+migration gave way to promote-on-max; the RocksDB value store was removed
+entirely (values moved into the leaves for the Ethereum-exact model); and
+PoC domain-tag hashing was replaced by mainnet keccak/RLP.
