@@ -177,17 +177,7 @@ index (measured as the persisted manifest): ~0.78 B/account; stock has no
 equivalent resident index (its trie lives in MDBX pages).
 
 IOPS = device ops/s on the working NVMe over each leg's first 200 s (the
-sampling protocol behind the earlier tables). The write *shape* is the
-story: the flat legs push ~475 MB/s through ~2.2k writes/s (large
-sequential appends), the no-commitment leg pushes 327 MB/s through 58.8k
-writes/s (small random MDBX pages) — flat writes ~26x fewer, ~30x larger
-ops for more bandwidth. Committed stock is read-dominated (126.9k r/s):
-trie-node lookups on top of state reads. Its low write-op rate is NOT
-commitment being write-cheap — normalized by throughput it writes ~80
-KB/tx vs the no-commitment leg's ~22 KB/tx (375 vs 327 MB/s absolute at a
-third of the tps); the ops are fewer and larger (~28 KB vs ~5.6 KB)
-because the lagging persist pipeline flushes big accumulated batches
-whose sorted trie/hashed updates coalesce into contiguous page runs.
+sampling protocol behind the earlier tables).
 
 ### tempo node, 1B-account cold workload (July 2026)
 
