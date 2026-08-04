@@ -77,7 +77,7 @@ The top of the trie is held in memory as `Branch` (16-way), `Extension`
 Merkle hash. A slot points to another in-RAM node (`RamChild::Ram`), to a
 disk-resident subtree (`RamChild::Disk { ptr, root }`), or to an in-RAM record
 (`RamChild::Mem` — RAM builds and the hot-record cache). The frontier stays
-bounded (~0.9 B/key at 1B keys): large subtrees live on disk behind a single
+bounded (~0.8 B/key, measured at both 1B and 2B keys): large subtrees live on disk behind a single
 pointer.
 
 ### 2. The flat file (`FlatFile` / `store`)
