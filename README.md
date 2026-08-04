@@ -264,10 +264,6 @@ The RAM frontier for the full mainnet state (400M accounts + 1.6B storage
 slots) is **1.56 GiB at build, 1.73 GiB on the live follower** — ~0.8 B
 per key, linear in key count (measured as the persisted manifest).
 
-Long-run file growth is the flat side's open cost: a long-lived follower
-file grows well past its live size (503 GB observed vs 188 GiB fresh-built)
-until GC/compaction keeps pace — see **Background GC** above.
-
 ---
 
 ## Bootstrapping a mainnet checkpoint
