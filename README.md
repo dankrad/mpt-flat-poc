@@ -1,8 +1,8 @@
 # mpt-flat-poc — flat-MPT Ethereum state commitment
 
-An Ethereum-**exact** Merkle Patricia Trie with a *flat* storage layout, built
+An Ethereum-equivalent Merkle Patricia Trie with a flat storage layout, built
 to serve as a node's state commitment: a small in-RAM trie "frontier" sits on
-top of larger subtrees packed into a **single flat file**. Account fields and
+top of larger subtrees packed into a single flat file. Account fields and
 storage slots live *in* the leaves — keccak/RLP identical to mainnet (validated
 against ethereum/tests and live mainnet headers) — so re-hashing never consults
 an external store. Bytecode is the one thing outside the trie: a
@@ -86,17 +86,14 @@ Disk subtrees are compact-encoded `DiskSubtree` records (`[u32 len][payload]`),
 addresses one). The file is a sequence of **128 KiB regions**; a
 log-structured allocator appends records densely, and every record stores its
 **full composite frontier path**, so any record is independently relocatable
-(asserted by `MPT_GC_ASSERT_PATHS=1`). Freed regions **stage** until the
-current apply's read-ahead window closes before they can be reused.
+(asserted by `MPT_GC_ASSERT_PATHS=1`).
 
 ### 3. Persistence (`persist` / `open`, the `.meta` manifest)
 The flat file holds the data; the *index* — frontier structure, disk pointers,
 cached hashes, allocator high-water — lives in RAM. `persist()` checkpoints
 it: spills any in-RAM records, fsyncs the flat file, then writes the bincode
 `Manifest` atomically (temp + rename). `open(path)` reattaches without
-truncating; a crash reopens at the last checkpoint. The node integrations
-store a root-verified `<flat>.height` beside it so a torn checkpoint is
-detected rather than followed.
+truncating; a crash reopens at the last checkpoint.
 
 ---
 
@@ -134,16 +131,13 @@ bounded **off the block critical path**, as a split design:
 
 The embedders schedule collect into idle windows (tempo: between-block dead
 time; reth fork: a 500 ms try-lock loop) with an emergency mode when file
-utilization drops too low. Known limit: at sustained flood saturation on a
-single NVMe, reclaim (~75 MB/s) trails garbage production (~100–125 MB/s)
-while costing ~7% tps — bounding a long-lived follower file remains the open
-engineering front (see results below).
+utilization drops too low.
 
 ---
 
 ## End-to-end results
 
-### tempo node, 1B-account random workload (July 2026)
+### tempo node, 1B-account random workload
 
 Full-node comparison on the truly-random workload: 1B keccak-signable
 accounts, sender AND recipient uniformly random, single token, 30k offered
@@ -156,7 +150,7 @@ MDBX path. Worst persist = longest Saving->Saved engine-persistence span.
 no commitment" runs `--debug.skip-state-root` — no state root computed, no
 sparse-trie/proof work spawned, no trie writes; the header carries the
 parent's root. It bounds what ANY commitment scheme could achieve on this
-box (r160-r163, 2026-07-31; reproduces the r157-r159 numbers within 1%):
+box:
 
 | | avg tps | p50 / p99 block | worst persist | IOPS (r + w) | MB/s (r + w) | RAM frontier |
 |---|---|---|---|---|---|---|
@@ -173,13 +167,13 @@ persist column shows a second, commitment-independent stock bottleneck:
 even with commitment off, MDBX hashed-state writes stall persistence for
 244 s worst-case, while the flat legs (which replace those writes too,
 `TEMPO_NO_STATE_KV=1`) stay at ~30 s. RAM frontier = the in-RAM trie
-index (measured as the persisted manifest): ~0.78 B/account; stock has no
+index (measured as the persisted manifest): ~0.8 B/account; stock has no
 equivalent resident index (its trie lives in MDBX pages).
 
 IOPS = device ops/s on the working NVMe over each leg's first 200 s (the
 sampling protocol behind the earlier tables).
 
-### tempo node, 1B-account cold workload (July 2026)
+### tempo node, 1B-account cold workload
 
 The original 1B benchmark shape for comparison: **4,000 sender accounts**
 (vs ~1B random senders above), recipients uniformly random over a 250M
@@ -198,7 +192,7 @@ near-saturating the 30k offered rate) — and the commitment gap WIDENS:
 stock keeps only 23% of the achievable throughput (vs 32% on the random
 workload), flat keeps 58-60% and stays 2.5x stock.
 
-### Ethereum mainnet: 10,000-block replay, flat vs stock (August 2026)
+### Ethereum mainnet: 10,000-block replay, flat vs stock
 
 The direct head-to-head on a reth 2.3 fork (mainnet at ~block 25.67M,
 ~400M accounts / 1.6B slots, single NVMe, 62 GB box): the same node
@@ -328,22 +322,3 @@ cargo test          # unit + equivalence tests (eth hashing vectors, apply/inver
 Pure Rust — no external toolchain dependencies.
 
 ---
-
-## Known limitations / non-goals
-
-- **Persistence is checkpoint-based.** The frontier/index is durable only as
-  of the last `persist()`; a crash reopens at the previous checkpoint (the
-  node integrations pair this with a root-verified height file and
-  re-backfill the gap).
-- **Append-only garbage, not write volume.** Each op rewrites its whole
-  ~16 KiB record, but the measured write bytes per state op (~8 KB) are on
-  par with a page-granular store's own no-commitment baseline (~7 KB: 4 KiB
-  pages + COW internals) — and they land as large sequential appends
-  rather than random page writes. The actual cost is the consequence:
-  rewrites never overwrite, so every one strands its old copy as garbage,
-  making the file's space bound depend on the background GC.
-- **GC vs sustained flood.** At single-NVMe write saturation, reclaim can
-  trail garbage production; bounding a long-lived follower file without
-  touching the block critical path is the active engineering front.
-- **Single-process, single-writer.** One writer owns the trie; concurrent
-  access is snapshot-based (GC collect, prefetch, cursors).
