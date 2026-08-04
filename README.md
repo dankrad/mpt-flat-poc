@@ -260,12 +260,9 @@ buying back contention, and still nets ahead. (A second-pass MDBX
 page-reuse effect may also flatter stock's execution: its leg re-executed
 into pages the flat leg had already allocated.)
 
-Bootstrap and footprint go the other way — an honest trade:
-
-| | bootstrap (full state) | on-disk commitment | RAM frontier |
-|---|---|---|---|
-| flat  | ~3.8 h (TSV export 52 min + sorted load 2 h 58 m, root-verified) | one 188 GiB file replacing hashed state + trie (153.4 GiB combined) | 1.56 GiB at build; 1.73 GiB on the live follower |
-| stock | **45.4 min** (`stage run merkle` full rebuild, root-verified) | 31.3 GiB trie (fresh; 42.1 GiB aged) on top of 111.3 GiB hashed state | — (MDBX page cache) |
+The RAM frontier for the full mainnet state (400M accounts + 1.6B storage
+slots) is **1.56 GiB at build, 1.73 GiB on the live follower** — ~0.8 B
+per key, linear in key count (measured as the persisted manifest).
 
 Long-run file growth is the flat side's open cost: a long-lived follower
 file grows well past its live size (503 GB observed vs 188 GiB fresh-built)
