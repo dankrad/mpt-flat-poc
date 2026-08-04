@@ -230,53 +230,19 @@ relocating them (the designed graceful path), slightly understating
 reclaim vs a freshly built tree. Root cross-checks passed on every block
 in both flat legs.
 
-### Ethereum mainnet, stock vs flat commitment (July 2026)
+### Ethereum mainnet: 10,000-block replay, flat vs stock (August 2026)
 
-Same engine on a reth 2.3 fork following Ethereum mainnet at the tip
-(blocks ~25.60M, ~400M accounts / 1.6B slots, single NVMe, 62 GB box).
-"Flat" = `RETH_FLATMPT_ROOT=1`: payload validation computes the state root
-from the flat MPT (strict header comparison), hashing/merkle stages
-disabled, ExEx feeds committed ranges; "stock" = vanilla reth on the same
-datadir (hashed-state mode: execution maintains `HashedAccounts`/
-`HashedStorages`; merkle is the commitment work on top). Both legs followed
-the same wss consensus feed; every flat block was root-validated in the
-engine with zero divergences.
-
-Commitment cost per block — the work stock does in `MerkleExecute` and flat
-does in `apply_block`:
-
-| | total commitment work | live critical-path latency p50 / p90 / p99 | live IOPS (r + w) | live MB/s (r + w) |
-|---|---|---|---|---|
-| flat  | 62.9 ms/block cold / **~7 ms/block warm** | 6.8 / 9.1 / 18.0 ms (= the full work, serial) | 284 + **79** /s | 16.1 + 3.2 |
-| stock | 88.4 ms/block (437.2 s) | **0.66 / 2.2 / 12.3 ms** (await only\*) | 233 + 505 /s | 1.1 + 3.4 |
-
-How each cell was measured. Stock batched: one `MerkleExecute` stage pass
-over blocks 25,597,823-25,602,769 (4,947 blocks) — the aggregated, sorted,
-amortized form of stock's commitment, cheaper per block than its live
-path; it cost 1.6x execution itself (271.5 s for the same range). Flat
-batched: the ExEx's 128-block-bundle replay covering the same range
-(8,033 blocks, 505.7 s of apply), on a freshly restarted process — empty
-frontier/hot-record caches against a GC-bloated 503 GB file, i.e. the
-worst case. Flat warm: mean per-block `apply_block` over the 1,200
-live-validated blocks immediately preceding the range (steady state for a
-synced follower, which is always warm). \*The stock live number is the
-engine's `root_elapsed` — the final await of a root task that overlaps
-execution across many multiproof/sparse-trie workers, so it hides most of
-the work the batched number exposes; the flat live number is the full
-single-threaded apply, taken after execution — for flat the two columns
-measure the same thing, which is why they agree (~7 vs 6.8 ms); for stock
-they measure total work vs critical-path remainder, which is why 88.4
-ms/block coexists with a 0.66 ms live p50. Net: even cold-batch flat
-beats stock's batched commitment (1.4x), warm steady state is ~12x
-cheaper, with 6.4x fewer live write IOPS.
-
-**10,000-block replay, end to end (August 2026).** The direct head-to-head:
-the same node synced the same 10,000 mainnet blocks
-(25,642,905-25,652,904) twice from the same starting state — once with
-flat as the commitment backend, once as vanilla stock — via
-`--debug.tip/--debug.max-block` fixed-range sync, caches dropped before
-each leg, every leg root-verified (flat: each ExEx batch against its tip
-header; stock: `MerkleExecute` against the target header):
+The direct head-to-head on a reth 2.3 fork (mainnet at ~block 25.65M,
+~400M accounts / 1.6B slots, single NVMe, 62 GB box): the same node
+synced the same 10,000 mainnet blocks (25,642,905-25,652,904) twice from
+the same starting state — once with flat as the commitment backend
+(`RETH_FLATMPT_ROOT=1`: state roots computed from the flat MPT with a
+strict header comparison, hashing/merkle stages disabled), once as
+vanilla stock (hashed-state mode: execution maintains `HashedAccounts`/
+`HashedStorages`; incremental `MerkleExecute` is the commitment work on
+top). Fixed-range `--debug.tip/--debug.max-block` sync, caches dropped
+before each leg, every leg root-verified (flat: each batch against its
+tip header; stock: `MerkleExecute` against the target header):
 
 | | total wall | execution | commitment | history indexes |
 |---|---|---|---|---|
@@ -285,13 +251,14 @@ header; stock: `MerkleExecute` against the target header):
 
 Flat syncs the range 7% faster end to end — while doing MORE work (its
 leg also re-downloaded bodies + senders, 26 s, which stock's leg
-skipped). The commitment itself is 8.1x cheaper (60.5 vs 489 s), matching
-the live-leg 6-7 ms/block. The interesting asymmetry: flat's execution
-and index stages run SLOWER (668 vs 420 s, 135 vs 25 s) because the flat
-applies overlap them and compete for the same NVMe — flat spends its
-savings buying back contention, and still nets ahead. (A second-pass
-MDBX page-reuse effect may also flatter stock's execution: its leg
-re-executed into pages the flat leg had already allocated.)
+skipped). The commitment itself is 8.1x cheaper (60.5 vs 489 s), and the
+6.1 ms/block batch figure matches the ~7 ms/block the engine sustains
+live at the tip. The interesting asymmetry: flat's execution and index
+stages run SLOWER (668 vs 420 s, 135 vs 25 s) because the flat applies
+overlap them and compete for the same NVMe — flat spends its savings
+buying back contention, and still nets ahead. (A second-pass MDBX
+page-reuse effect may also flatter stock's execution: its leg re-executed
+into pages the flat leg had already allocated.)
 
 Bootstrap and footprint go the other way — an honest trade:
 
