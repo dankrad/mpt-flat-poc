@@ -363,10 +363,13 @@ Pure Rust — no external toolchain dependencies.
   of the last `persist()`; a crash reopens at the previous checkpoint (the
   node integrations pair this with a root-verified height file and
   re-backfill the gap).
-- **Write amplification.** Each op into a disk record rewrites the whole
-  compact record; dense packing, batched appends, and the hot-record cache
-  keep it cheap, but it remains the design's central write cost — and the
-  source of the GC's work.
+- **Append-only garbage, not write volume.** Each op rewrites its whole
+  ~16 KiB record, but the measured write bytes per state op (~8 KB) are on
+  par with a page-granular store's own no-commitment baseline (~7 KB: 4 KiB
+  pages + COW internals) — and they land as large sequential appends
+  rather than random page writes. The actual cost is the consequence:
+  rewrites never overwrite, so every one strands its old copy as garbage,
+  making the file's space bound depend on the background GC.
 - **GC vs sustained flood.** At single-NVMe write saturation, reclaim can
   trail garbage production; bounding a long-lived follower file without
   touching the block critical path is the active engineering front.

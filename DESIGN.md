@@ -145,11 +145,14 @@ byte like Ethereum's.)
 
 ## 9. Known limits / future directions
 
-- **Write amplification** is the design's structural cost: a whole record
-  rewrites for any change inside it. It is paid deliberately — sequential
-  appends instead of random page writes — and the GC exists to reclaim it.
-  Record size (`MAX_LEAF_KIB`) is the tuning dial: bytes-per-write vs
-  frontier size vs read fatness.
+- **Append-only garbage** is the design's structural cost. A whole record
+  rewrites for any change inside it, but the resulting write volume per
+  state op is comparable to a page-granular store's own baseline (page +
+  COW internals) and lands sequentially instead of as random page writes;
+  the real cost is that rewrites never overwrite, so old copies accumulate
+  as garbage and the space bound depends on the GC keeping pace. Record
+  size (`MAX_LEAF_KIB`) is the tuning dial: bytes-per-write vs frontier
+  size vs read fatness.
 - **Hash-transplant follower** (planned): persist externally-computed
   node hashes instead of re-deriving them in the apply, removing the
   apply-side hashing from the follower's critical path.
