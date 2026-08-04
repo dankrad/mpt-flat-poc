@@ -189,16 +189,6 @@ third of the tps); the ops are fewer and larger (~28 KB vs ~5.6 KB)
 because the lagging persist pipeline flushes big accumulated batches
 whose sorted trie/hashed updates coalesce into contiguous page runs.
 
-Margin note from the re-run: at this load both state pipelines run near
-block-production speed, and one attempt of each comparison leg failed
-before its clean pass — stock OOM-killed at minute 5 (55 GB anon RSS:
-cold-start trie work lagged, persistence backed up, executed blocks piled
-in RAM), and flat+gc aborted at minute 28 when a production burst put the
-builder 64 blocks ahead of the shadow and overflowed the retained-overlay
-window (apply pace was identical to its passing run — 2.30 vs 2.23 s per
-~162k-op block). The flat-side fix is the hash-transplant follower (persist
-sparse-computed hashes instead of re-deriving them in the apply).
-
 ### tempo node, 1B-account cold workload (July 2026)
 
 The original 1B benchmark shape for comparison: **4,000 sender accounts**
