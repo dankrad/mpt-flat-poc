@@ -202,29 +202,29 @@ the same starting state — once with flat as the commitment backend
 strict header comparison, hashing/merkle stages disabled), once as
 vanilla stock (hashed-state mode: execution maintains `HashedAccounts`/
 `HashedStorages`; incremental `MerkleExecute` is the commitment work on
-top). Fully symmetric protocol: the flat file was freshly built from the
-datadir's own hashed state and root-verified at the starting block, the
-trie tables were freshly rebuilt at the same block, each leg starts from
-identical stage checkpoints after a full unwind (so both re-download
-bodies, re-run sender recovery, and execute into equally recycled MDBX
-pages), caches dropped before each leg, every leg root-verified (flat:
-each batch against its tip header; stock: `MerkleExecute` against the
-target header):
+top). Fully symmetric, network-free protocol: headers, bodies, and
+recovered senders for the whole range are already on disk (the node had
+synced past the target; `stage unwind --offline` rewinds only the
+state-side stages), both legs run with discovery disabled, the flat file
+was freshly built from the datadir's own hashed state and root-verified
+at the starting block, the trie tables were freshly rebuilt at the same
+block, each leg starts from identical stage checkpoints and executes
+into equally recycled MDBX pages, caches dropped before each leg, every
+leg root-verified (flat: each batch against its tip header; stock:
+`MerkleExecute` against the target header):
 
-| | total wall | bodies download | execution | commitment | history indexes |
-|---|---|---|---|---|---|
-| flat  | 978 s | 210 s | 581 s | **69.2 s** (3.68M ops, 6.9 ms/block) | 25 s |
-| stock | 907 s | 62 s | 373 s | 439 s (43.9 ms/block incremental) | 16 s |
+| | total wall | execution | commitment | history indexes |
+|---|---|---|---|---|
+| flat  | **585 s** | 516 s\* | **55.2 s** (3.68M ops, 5.5 ms/block) | 24 s |
+| stock | 848 s | 375 s | 448 s (44.8 ms/block incremental) | 15 s |
 
-The identical ~2 GB of bodies happened to download 148 s slower in the
-flat leg (peer luck — the one number the backend does not control). On
-the state pipeline — everything after download — **flat is 768 s vs
-stock's 846 s (9% faster), with the commitment itself 6.3x cheaper**
-(69.2 vs 439 s; 6.9 ms/block, matching what the engine sustains live at
-the tip). The interesting asymmetry is real and by design: flat's
-execution runs slower (581 vs 373 s) because the flat applies overlap it
-and compete for the same NVMe — flat spends part of its commitment
-savings buying back contention, and still nets ahead.
+**Flat syncs the same 10,000 blocks 31% faster end to end** (stock takes
+45% longer), with the commitment itself **8.1x cheaper** (55.2 vs 448 s;
+5.5 ms/block, consistent with what the engine sustains live at the tip).
+\*Flat's execution span is longer (516 vs 375 s) because the flat
+applies run overlapped inside it and compete for the same NVMe — the
+55.2 s of commitment work hides almost entirely inside execution, at the
+price of slowing it; the deliberate trade nets out well ahead.
 
 The RAM frontier for the full mainnet state (400M accounts + 1.6B storage
 slots) is **1.56 GiB at build, 1.73 GiB on the live follower** — ~0.8 B
